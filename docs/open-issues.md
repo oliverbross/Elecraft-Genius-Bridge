@@ -12,7 +12,8 @@
 ## Must Fix Before Public Release
 
 - Validate against current AetherSDR builds on macOS.
-- Resolve applet activation path: AetherSDR currently appears to require radio-side `amplifier` presence records before showing AMP/TUN applets, even when direct PGXL/TGXL sockets are connected.
+- Resolve PGXL applet activation path: AetherSDR requires radio-side `amplifier` presence for AMP visibility in the inspected source.
+- Resolve TGXL binary/source mismatch: inspected AetherSDR source supports direct TGXL presence, but the tested binary reportedly did not show the TUN applet.
 - Validate real KPA500/KAT500 command mappings against official references or hardware transcripts.
 - Replace placeholder Elecraft parsers with confirmed response parsing.
 - Add installer or service deployment path.
@@ -24,7 +25,8 @@
 - Exact real PGXL `info` response body.
 - Exact real TGXL `info` response body.
 - Whether richer direct `firmware` and `capabilities` fields affect AetherSDR UI behaviour.
-- Whether applet visibility should be solved by an AetherSDR patch, a Flex radio API presence proxy, or another documented SmartSDR-compatible path.
+- Whether PGXL applet visibility should be solved by native Flex radio configuration, an AetherSDR patch, a Flex API proxy, or another documented SmartSDR-compatible path.
+- Whether the user's AetherSDR build includes the `TunerModel::m_directPresence` fallback for TGXL.
 - Whether AetherSDR tolerates extra `connection_state` and `fault` fields in status responses.
 - Exact PGXL direct TCP command set for operate/standby, if any.
 - Exact error codes used by real PGXL/TGXL devices.
@@ -52,6 +54,13 @@
 - Validate whether SmartSDR for macOS uses the same direct PGXL/TGXL behaviour.
 - Capture any differences in polling, handshake, or required fields.
 - Investigate SmartSDR Windows and Maestro expectations.
+
+## Applet Activation
+
+- Determine whether Flex can be configured to advertise synthetic PGXL/TGXL amplifier records without real Genius hardware.
+- Validate candidate injected `amplifier` status records against AetherSDR in mock mode.
+- Keep Flex API proxy mode separate from direct PGXL/TGXL emulation.
+- Decide whether to propose an AetherSDR patch for PGXL direct-presence fallback analogous to TGXL.
 
 ## Security/TLS/Auth
 
