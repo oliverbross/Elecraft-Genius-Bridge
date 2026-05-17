@@ -151,6 +151,15 @@ R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_t
 
 The direct connection emits these response key/value maps as `statusUpdated`.
 
+Phase 5 compatibility enrichment adds these direct `info` keys in EGB:
+
+```text
+firmware=<bridge-version>
+capabilities=direct_tcp,status,autotune,ant,manual_tune
+```
+
+These fields are TODO/UNVERIFIED and exist to make transcript differences explicit while investigating applet activation. They are not yet known real TGXL fields.
+
 ## Status And State Push Format
 
 AetherSDR distinguishes the object name in `S` lines:
@@ -276,3 +285,6 @@ Minimum to make AetherSDR show a connected TGXL telemetry source:
 8. Implement `tune relay=<0|1|2> move=<+1|-1>`, `autotune`, and `activate ant=<1..3>` as state-changing commands.
 9. Emit `S0|state ...` after state changes so the UI updates without waiting for the next poll.
 
+## Phase 5 Applet Visibility Finding
+
+Successful direct TGXL connection and polling do not by themselves make the AetherSDR TUN applet tray button visible in the inspected build. The applet visibility path is driven by `TunerModel::presenceChanged`, which is set from Flex radio API `amplifier` status records with `model=TunerGeniusXL`. See `docs/analysis/aethersdr-session-sequence.md`.

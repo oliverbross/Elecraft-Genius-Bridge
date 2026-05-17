@@ -17,11 +17,17 @@ Default is loopback for safety. Use a LAN IP for AetherSDR on another machine. A
 pgxl:
   enabled: true
   port: 9008
+  strict_emulation: false
+  startup_delay_ms: 0
 
 tgxl:
   enabled: true
   port: 9010
+  strict_emulation: false
+  startup_delay_ms: 0
 ```
+
+Set `strict_emulation: true` in mock mode to simulate a more realistic device startup sequence. The emulator sends the required `V` greeting immediately, but shared mock state reports transitional readiness until `startup_delay_ms` expires.
 
 ## Elecraft Devices
 
@@ -85,6 +91,6 @@ When enabled, `GET /status` returns localhost-only JSON with connection states, 
 
 ## Profiles
 
-- `config.mock.yaml`: no hardware required, protocol trace enabled.
+- `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation enabled.
 - `config.hardware-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true`.
 - `config.hardware-control-local-only.yaml`: COM8/COM21 hardware mode with `dry_run: false`, loopback bind by default. Use only locally or on a private LAN after read-only validation.

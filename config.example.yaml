@@ -5,10 +5,14 @@ server:
 pgxl:
   enabled: true
   port: 9008
+  strict_emulation: false
+  startup_delay_ms: 0
 
 tgxl:
   enabled: true
   port: 9010
+  strict_emulation: false
+  startup_delay_ms: 0
 
 kpa500:
   enabled: true

@@ -17,6 +17,8 @@ const VERSION: &str = "0.1.0-egb-tgxl";
 pub struct EmulatorOptions {
     pub protocol_trace: bool,
     pub transcript_dir: Option<PathBuf>,
+    pub strict_emulation: bool,
+    pub startup_delay: Duration,
 }
 
 pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()> {
@@ -67,6 +69,7 @@ async fn handle_client(
         guard.clients.tgxl_connected = true;
         guard.clients.tgxl_client_count += 1;
     }
+    maybe_start_strict_startup(&state, &options).await;
     info!(event_id = "client_connected", protocol = "TGXL", connection_id = %peer, "TGXL client connected");
 
     let result = async {
@@ -224,11 +227,7 @@ impl CommandOutcome {
 
 async fn handle_command(seq: u32, command: &str, state: &SharedState) -> CommandOutcome {
     match command {
-        "info" => CommandOutcome::ok(response_line(
-            seq,
-            0,
-            format!("model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} one_by_three=1"),
-        )),
+        "info" => CommandOutcome::ok(response_line(seq, 0, info_body())),
         "status" => CommandOutcome::ok(response_line(seq, 0, status_body(state).await)),
         "autotune" => {
             {
@@ -287,6 +286,43 @@ async fn handle_command(seq: u32, command: &str, state: &SharedState) -> Command
     }
 }
 
+async fn maybe_start_strict_startup(state: &SharedState, options: &EmulatorOptions) {
+    if !options.strict_emulation || options.startup_delay.is_zero() {
+        return;
+    }
+
+    {
+        let mut guard = state.write().await;
+        guard.tuner.connection_state = ConnectionState::Connecting;
+        guard.tuner.connected = false;
+        guard.tuner.tuning = true;
+        guard.tuner.fault = None;
+    }
+
+    let state = state.clone();
+    let delay = options.startup_delay;
+    tokio::spawn(async move {
+        sleep(delay).await;
+        let mut guard = state.write().await;
+        guard.tuner.connection_state = ConnectionState::Connected;
+        guard.tuner.connected = true;
+        guard.tuner.tuning = false;
+        guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+        info!(
+            event_id = "strict_startup_complete",
+            protocol = "TGXL",
+            startup_delay_ms = delay.as_millis(),
+            "TGXL strict emulation startup complete"
+        );
+    });
+}
+
+fn info_body() -> String {
+    format!(
+        "model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} firmware={VERSION} one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune"
+    )
+}
+
 async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &'static str> {
     let mut relay = None;
     let mut movement = None;
@@ -317,7 +353,10 @@ async fn status_body(state: &SharedState) -> String {
 fn status_body_from_tuner(tuner: &bridge_core::TunerState) -> String {
     let fwd = watts_to_dbm(tuner.forward_power_watts);
     let swr = -swr_to_return_loss_db(tuner.swr);
-    let degraded = tuner.connection_state != ConnectionState::Connected;
+    let degraded = matches!(
+        tuner.connection_state,
+        ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
+    );
     format!(
         "operate={} bypass={} tuning={} relayC1={} relayL={} relayC2={} antA={} one_by_three=1 fwd={fwd:.4} swr={swr:.4} connection_state={} fault={}",
         bool_int(tuner.operate),
@@ -357,6 +396,10 @@ struct SessionStats {
     status_poll_count: u64,
     total_status_poll_gap: Duration,
     last_status_poll_at: Option<Instant>,
+    last_command_at: Option<Instant>,
+    max_command_gap: Duration,
+    idle_gap_count: u64,
+    first_commands: Vec<String>,
     last_sequence: Option<u32>,
 }
 
@@ -374,13 +417,29 @@ impl SessionStats {
             status_poll_count: 0,
             total_status_poll_gap: Duration::ZERO,
             last_status_poll_at: None,
+            last_command_at: None,
+            max_command_gap: Duration::ZERO,
+            idle_gap_count: 0,
+            first_commands: Vec::new(),
             last_sequence: None,
         }
     }
 
     fn observe_command(&mut self, command: &str) {
+        let now = Instant::now();
+        if self.first_commands.len() < 8 {
+            self.first_commands.push(command.to_string());
+        }
+        if let Some(previous) = self.last_command_at {
+            let gap = now.saturating_duration_since(previous);
+            self.max_command_gap = self.max_command_gap.max(gap);
+            if gap >= Duration::from_secs(2) {
+                self.idle_gap_count += 1;
+            }
+        }
+        self.last_command_at = Some(now);
+
         if command == "status" {
-            let now = Instant::now();
             if let Some(previous) = self.last_status_poll_at {
                 self.total_status_poll_gap += now.saturating_duration_since(previous);
             }
@@ -410,6 +469,9 @@ impl SessionStats {
             unsupported_features = self.unsupported_features,
             unexpected_sequences = self.unexpected_sequences,
             average_poll_interval_ms = self.average_poll_interval_ms().unwrap_or_default(),
+            max_command_gap_ms = self.max_command_gap.as_millis(),
+            idle_gap_count = self.idle_gap_count,
+            first_commands = ?self.first_commands,
             "client session summary"
         );
     }
@@ -569,6 +631,14 @@ mod tests {
         assert_eq!(
             response_line(2, 0, body),
             "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-32.2557 connection_state=connected fault=\n"
+        );
+    }
+
+    #[test]
+    fn golden_tgxl_info_response_is_stable() {
+        assert_eq!(
+            response_line(1, 0, info_body()),
+            "R1|0|model=TunerGeniusXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl firmware=0.1.0-egb-tgxl one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune\n"
         );
     }
 }

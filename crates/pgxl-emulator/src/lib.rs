@@ -1,11 +1,14 @@
 use anyhow::Context;
-use bridge_core::{parse_client_command, response_line, ConnectionState, SharedState};
+use bridge_core::{
+    parse_client_command, response_line, AmpOperatingState, ConnectionState, SharedState,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 const VERSION: &str = "0.1.0-egb-pgxl";
@@ -14,6 +17,8 @@ const VERSION: &str = "0.1.0-egb-pgxl";
 pub struct EmulatorOptions {
     pub protocol_trace: bool,
     pub transcript_dir: Option<PathBuf>,
+    pub strict_emulation: bool,
+    pub startup_delay: Duration,
 }
 
 pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()> {
@@ -61,6 +66,7 @@ async fn handle_client(
         guard.clients.pgxl_connected = true;
         guard.clients.pgxl_client_count += 1;
     }
+    maybe_start_strict_startup(&state, &options).await;
     info!(event_id = "client_connected", protocol = "PGXL", connection_id = %peer, "PGXL client connected");
 
     let result = async {
@@ -194,11 +200,7 @@ impl CommandOutcome {
 
 async fn handle_command(seq: u32, command: &str, state: &SharedState) -> CommandOutcome {
     match command {
-        "info" => CommandOutcome::ok(response_line(
-            seq,
-            0,
-            format!("model=PowerGeniusXL serial_num=EGB-PGXL version={VERSION}"),
-        )),
+        "info" => CommandOutcome::ok(response_line(seq, 0, info_body())),
         "status" => CommandOutcome::ok(response_line(seq, 0, status_body(state).await)),
         // AetherSDR currently routes PGXL operate/standby through the Flex radio
         // amplifier API, not direct TCP. These direct commands are accepted only
@@ -221,13 +223,55 @@ async fn handle_command(seq: u32, command: &str, state: &SharedState) -> Command
     }
 }
 
+async fn maybe_start_strict_startup(state: &SharedState, options: &EmulatorOptions) {
+    if !options.strict_emulation || options.startup_delay.is_zero() {
+        return;
+    }
+
+    {
+        let mut guard = state.write().await;
+        guard.amp.connection_state = ConnectionState::Connecting;
+        guard.amp.connected = false;
+        guard.amp.state = AmpOperatingState::PowerUp;
+        guard.amp.fault = None;
+    }
+
+    let state = state.clone();
+    let delay = options.startup_delay;
+    tokio::spawn(async move {
+        sleep(delay).await;
+        let mut guard = state.write().await;
+        guard.amp.connection_state = ConnectionState::Connected;
+        guard.amp.connected = true;
+        if guard.amp.state == AmpOperatingState::PowerUp {
+            guard.amp.state = AmpOperatingState::Standby;
+        }
+        guard.amp.last_successful_poll_at = Some(SystemTime::now());
+        info!(
+            event_id = "strict_startup_complete",
+            protocol = "PGXL",
+            startup_delay_ms = delay.as_millis(),
+            "PGXL strict emulation startup complete"
+        );
+    });
+}
+
+fn info_body() -> String {
+    format!(
+        "model=PowerGeniusXL serial_num=EGB-PGXL version={VERSION} firmware={VERSION} capabilities=direct_tcp,status"
+    )
+}
+
 async fn status_body(state: &SharedState) -> String {
     let guard = state.read().await;
     status_body_from_amp(&guard.amp)
 }
 
 fn status_body_from_amp(amp: &bridge_core::AmpState) -> String {
-    let degraded = amp.connection_state != ConnectionState::Connected;
+    let degraded = matches!(
+        amp.connection_state,
+        ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
+    );
     let state = if degraded {
         "FAULT"
     } else {
@@ -261,6 +305,10 @@ struct SessionStats {
     status_poll_count: u64,
     total_status_poll_gap: Duration,
     last_status_poll_at: Option<Instant>,
+    last_command_at: Option<Instant>,
+    max_command_gap: Duration,
+    idle_gap_count: u64,
+    first_commands: Vec<String>,
     last_sequence: Option<u32>,
 }
 
@@ -278,13 +326,29 @@ impl SessionStats {
             status_poll_count: 0,
             total_status_poll_gap: Duration::ZERO,
             last_status_poll_at: None,
+            last_command_at: None,
+            max_command_gap: Duration::ZERO,
+            idle_gap_count: 0,
+            first_commands: Vec::new(),
             last_sequence: None,
         }
     }
 
     fn observe_command(&mut self, command: &str) {
+        let now = Instant::now();
+        if self.first_commands.len() < 8 {
+            self.first_commands.push(command.to_string());
+        }
+        if let Some(previous) = self.last_command_at {
+            let gap = now.saturating_duration_since(previous);
+            self.max_command_gap = self.max_command_gap.max(gap);
+            if gap >= Duration::from_secs(2) {
+                self.idle_gap_count += 1;
+            }
+        }
+        self.last_command_at = Some(now);
+
         if command == "status" {
-            let now = Instant::now();
             if let Some(previous) = self.last_status_poll_at {
                 self.total_status_poll_gap += now.saturating_duration_since(previous);
             }
@@ -314,6 +378,9 @@ impl SessionStats {
             unsupported_features = self.unsupported_features,
             unexpected_sequences = self.unexpected_sequences,
             average_poll_interval_ms = self.average_poll_interval_ms().unwrap_or_default(),
+            max_command_gap_ms = self.max_command_gap.as_millis(),
+            idle_gap_count = self.idle_gap_count,
+            first_commands = ?self.first_commands,
             "client session summary"
         );
     }
@@ -449,6 +516,14 @@ mod tests {
         assert_eq!(
             response_line(2, 0, body),
             "R2|0|state=STANDBY peakfwd=0.0000 swr=32.2557 temp=32.0 id=0.0 vac=230 meffa=OK fault= connection_state=connected\n"
+        );
+    }
+
+    #[test]
+    fn golden_pgxl_info_response_is_stable() {
+        assert_eq!(
+            response_line(1, 0, info_body()),
+            "R1|0|model=PowerGeniusXL serial_num=EGB-PGXL version=0.1.0-egb-pgxl firmware=0.1.0-egb-pgxl capabilities=direct_tcp,status\n"
         );
     }
 }

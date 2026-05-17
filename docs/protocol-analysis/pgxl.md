@@ -107,6 +107,15 @@ R2|0|state=IDLE peakfwd=30.0 swr=-30.0 temp=32 id=0.0 vac=230 meffa=OK
 
 Unknown keys are ignored.
 
+Phase 5 compatibility enrichment adds these direct `info` keys in EGB:
+
+```text
+firmware=<bridge-version>
+capabilities=direct_tcp,status
+```
+
+These fields are TODO/UNVERIFIED and exist to make transcript differences explicit while investigating applet activation. They are not yet known real PGXL fields.
+
 ## Status Push Format
 
 AetherSDR parses an `S` line by skipping an object prefix and consuming `key=value` tokens after the last space before the first `=`.
@@ -211,3 +220,6 @@ Minimum to make AetherSDR show a connected PGXL telemetry source:
 6. Include at least `state`, `peakfwd`, `swr`, `temp`, `id`, `vac`, and `meffa` in status bodies.
 7. Do not block or close on unknown commands; return a structured error or empty success until real behavior is known.
 
+## Phase 5 Applet Visibility Finding
+
+Successful direct PGXL connection and polling do not by themselves make the AetherSDR AMP applet tray button visible in the inspected build. The applet visibility path is driven by `RadioModel::amplifierChanged`, which depends on Flex radio API `amplifier` status records. See `docs/analysis/aethersdr-session-sequence.md`.

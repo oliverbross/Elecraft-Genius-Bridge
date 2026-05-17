@@ -12,6 +12,7 @@
 ## Must Fix Before Public Release
 
 - Validate against current AetherSDR builds on macOS.
+- Resolve applet activation path: AetherSDR currently appears to require radio-side `amplifier` presence records before showing AMP/TUN applets, even when direct PGXL/TGXL sockets are connected.
 - Validate real KPA500/KAT500 command mappings against official references or hardware transcripts.
 - Replace placeholder Elecraft parsers with confirmed response parsing.
 - Add installer or service deployment path.
@@ -22,6 +23,8 @@
 
 - Exact real PGXL `info` response body.
 - Exact real TGXL `info` response body.
+- Whether richer direct `firmware` and `capabilities` fields affect AetherSDR UI behaviour.
+- Whether applet visibility should be solved by an AetherSDR patch, a Flex radio API presence proxy, or another documented SmartSDR-compatible path.
 - Whether AetherSDR tolerates extra `connection_state` and `fault` fields in status responses.
 - Exact PGXL direct TCP command set for operate/standby, if any.
 - Exact error codes used by real PGXL/TGXL devices.

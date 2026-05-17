@@ -175,6 +175,8 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 .protocol_transcript_dir
                 .as_ref()
                 .map(PathBuf::from),
+            strict_emulation: cfg.pgxl.strict_emulation,
+            startup_delay: Duration::from_millis(cfg.pgxl.startup_delay_ms),
         };
         tokio::spawn(async move {
             if let Err(err) = pgxl_emulator::run_with_options(addr, state, options).await {
@@ -193,6 +195,8 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 .protocol_transcript_dir
                 .as_ref()
                 .map(PathBuf::from),
+            strict_emulation: cfg.tgxl.strict_emulation,
+            startup_delay: Duration::from_millis(cfg.tgxl.startup_delay_ms),
         };
         tokio::spawn(async move {
             if let Err(err) = tgxl_emulator::run_with_options(addr, state, options).await {
