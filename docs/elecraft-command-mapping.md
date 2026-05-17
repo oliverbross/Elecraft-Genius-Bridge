@@ -15,11 +15,11 @@ Primary references:
 | --- | --- | --- | --- |
 | Read firmware | `^RVM;` | `read_only` | Hardware verified on COM21 at 38400: `^RVM01.54;` |
 | Read serial number | `^SN;` | `read_only` | Programmer Reference |
-| Read operate/standby | `^OS;` | `read_only` | Programmer Reference |
-| Read power/SWR | `^WS;` | `read_only` | Programmer Reference |
-| Read temperature | `^TM;` | `read_only` | Programmer Reference |
-| Read volts/current | `^VI;` | `read_only` | Programmer Reference |
-| Read fault | `^FL;` | `read_only` | Programmer Reference |
+| Read operate/standby | `^OS;` | `read_only` | Hardware verified on COM21: `^OS0;` |
+| Read power/SWR | `^WS;` | `read_only` | Hardware verified on COM21: `^WS000 000;` |
+| Read temperature | `^TM;` | `read_only` | Hardware verified on COM21: `^TM030;` |
+| Read PA volts/current | `^VI;` | `read_only` | Hardware verified on COM21: `^VI689 000;` / `^VI690 000;` |
+| Read fault | `^FL;` | `read_only` | Hardware verified on COM21: `^FL00;` |
 | Standby | `^OS0;` | `state_change_safe` | Programmer Reference, still gated |
 | Operate | `^OS1;` | `rf_risk` | Programmer Reference, still gated |
 | Clear fault | `^FLC;` | `destructive_or_unknown` | Programmer Reference, not sent by test CLI |
@@ -33,6 +33,8 @@ Confirmed hardware baseline:
 - no CR/LF terminator
 - probe `^RVM;`
 - response `^RVM01.54;`
+
+`^VIvvv iii;` reports PA voltage/current in tenths. `^VI689 000;` means `68.9 V` and `0.0 A`; it is not AC mains voltage and is not published as PGXL `vac`.
 
 ## KAT500
 
@@ -48,7 +50,7 @@ The KAT500 uses ordinary ASCII commands and may sleep. Wake discovery sends sing
 | Read mode | `MD;` | `read_only` | Hardware verified on COM8: `MDA;` |
 | Read tune progress | `TP;` | `read_only` | Hardware verified on COM8: `TP0;` |
 | Read fault | `FLT;` | `read_only` | Hardware verified on COM8: `FLT0;` |
-| Read VSWR | `VSWR;` | `read_only` | Hardware verified on COM8: `VSWR 1.00;` |
+| Read VSWR | `VSWR;` | `read_only` | Hardware verified on COM8: `VSWR 1.11;` |
 | Read forward ADC | `VFWD;` | `read_only` | Hardware verified on COM8: `VFWD 0;` |
 | Bypass on | `BYPB;` | `state_change_safe` | KAT500 Serial Command Reference, still gated |
 | Bypass off | `BYPN;` | `state_change_safe` | KAT500 Serial Command Reference, still gated |

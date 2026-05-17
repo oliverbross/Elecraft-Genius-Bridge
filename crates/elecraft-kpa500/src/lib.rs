@@ -172,13 +172,13 @@ impl Kpa500Driver {
                 }
                 if !skip_until_next_poll && guard.amp.operate {
                     guard.amp.state = AmpOperatingState::Idle;
-                    guard.amp.mains_volts = 230;
+                    guard.amp.pa_voltage_volts = 68.0;
                     guard.amp.temperature_c = (guard.amp.temperature_c + 0.1).min(45.0);
                     guard.amp.meffa = "OK".to_string();
                 } else if !skip_until_next_poll {
                     guard.amp.state = AmpOperatingState::Standby;
                     guard.amp.forward_power_watts = 0.0;
-                    guard.amp.drain_current_amps = 0.0;
+                    guard.amp.pa_current_amps = 0.0;
                 }
             }
             sleep(self.settings.polling_interval).await;
@@ -664,12 +664,12 @@ fn parse_volts_current(raw: &str, response: &str, amp: &mut bridge_core::AmpStat
         return;
     };
     match volts_raw.parse::<u16>() {
-        Ok(value) if value <= 300 => amp.mains_volts = value,
-        _ => warn_invalid("mains_volts", volts_raw, response),
+        Ok(value) if value <= 999 => amp.pa_voltage_volts = f32::from(value) / 10.0,
+        _ => warn_invalid("pa_voltage_volts", volts_raw, response),
     }
     match current_raw.parse::<u16>() {
-        Ok(value) if value <= 1000 => amp.drain_current_amps = f32::from(value) / 10.0,
-        _ => warn_invalid("drain_current_amps", current_raw, response),
+        Ok(value) if value <= 999 => amp.pa_current_amps = f32::from(value) / 10.0,
+        _ => warn_invalid("pa_current_amps", current_raw, response),
     }
 }
 
@@ -808,7 +808,7 @@ mod tests {
         parse_kpa500_response("^OS1;", &mut amp);
         parse_kpa500_response("^WS500 150;", &mut amp);
         parse_kpa500_response("^TM034;", &mut amp);
-        parse_kpa500_response("^VI230 125;", &mut amp);
+        parse_kpa500_response("^VI689 125;", &mut amp);
         parse_kpa500_response("^FL07;", &mut amp);
         assert_eq!(amp.firmware_version.as_deref(), Some("01.23"));
         assert_eq!(amp.serial_number.as_deref(), Some("12345"));
@@ -816,8 +816,8 @@ mod tests {
         assert_eq!(amp.forward_power_watts, 500.0);
         assert_eq!(amp.swr, 1.5);
         assert_eq!(amp.temperature_c, 34.0);
-        assert_eq!(amp.mains_volts, 230);
-        assert_eq!(amp.drain_current_amps, 12.5);
+        assert_eq!(amp.pa_voltage_volts, 68.9);
+        assert_eq!(amp.pa_current_amps, 12.5);
         assert_eq!(amp.state, AmpOperatingState::Fault);
         assert_eq!(amp.fault.as_deref(), Some("KPA500 fault 7"));
     }
@@ -830,6 +830,23 @@ mod tests {
             parse_kpa500_response(line, &mut amp);
         }
         assert_eq!(amp.firmware_version.as_deref(), Some("01.54"));
+    }
+
+    #[test]
+    fn parser_handles_real_com21_readonly_fixture() {
+        let fixture = include_str!("../../../tests/fixtures/kpa500-readonly-com21.txt");
+        let mut amp = bridge_core::AmpState::default();
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            parse_kpa500_response(line, &mut amp);
+        }
+        assert!(!amp.operate);
+        assert_eq!(amp.state, AmpOperatingState::Standby);
+        assert_eq!(amp.forward_power_watts, 0.0);
+        assert_eq!(amp.swr, 1.0);
+        assert_eq!(amp.temperature_c, 30.0);
+        assert_eq!(amp.pa_voltage_volts, 68.9);
+        assert_eq!(amp.pa_current_amps, 0.0);
+        assert_eq!(amp.fault, None);
     }
 
     #[test]

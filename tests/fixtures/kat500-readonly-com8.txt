@@ -6,5 +6,5 @@ BYPN;
 MDA;
 TP0;
 FLT0;
-VSWR 1.00;
+VSWR 1.11;
 VFWD 0;

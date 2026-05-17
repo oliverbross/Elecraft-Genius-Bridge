@@ -12,8 +12,8 @@ async fn pgxl_polling_replay_is_stable() {
         output.concat(),
         concat!(
             "R1|0|model=PowerGeniusXL serial_num=EGB-PGXL version=0.1.0-egb-pgxl firmware=0.1.0-egb-pgxl capabilities=direct_tcp,status\n",
-            "R2|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=230 meffa=OK fault= connection_state=connected\n",
-            "R3|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=230 meffa=OK fault= connection_state=connected\n",
+            "R2|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n",
+            "R3|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n",
         )
     );
 }

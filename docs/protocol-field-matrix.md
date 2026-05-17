@@ -21,7 +21,7 @@ Status labels:
 | `status` | `swr` | `MainWindow.cpp` treats value as return loss | High | Yes | Mandatory for SWR display | Implemented |
 | `status` | `temp` | `MainWindow.cpp` PGXL telemetry handling | High | Yes | Expected | Implemented |
 | `status` | `id` | `MainWindow.cpp` PGXL telemetry handling | High | Yes | Expected | Implemented |
-| `status` | `vac` | `MainWindow.cpp` PGXL telemetry handling | High | Yes | Expected | Implemented |
+| `status` | `vac` | `MainWindow.cpp` PGXL telemetry handling | High | Yes | Expected | Implemented as `0` for KPA500 hardware until a safe AC-mains equivalent is validated; KPA500 `^VI` is PA supply voltage, not VAC |
 | `status` | `meffa` | `MainWindow.cpp` PGXL telemetry handling | High | Yes | Expected | Implemented |
 | `status` | `fault` | Bridge degraded-state reporting | Low | Yes, tolerated by parser | Optional | Implemented |
 | `status` | `connection_state` | Bridge degraded-state reporting | Low | Yes, tolerated by parser | Optional | Implemented |

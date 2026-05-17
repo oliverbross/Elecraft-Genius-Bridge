@@ -73,6 +73,8 @@ amplifier <handle> model=TunerGeniusXL ip=<addr> ...
 
 This explains why stable direct polling can coexist with hidden applets. The bridge is not yet injecting or proxying Flex radio-side presence, and doing so is a separate design decision from PGXL/TGXL direct socket emulation.
 
+Phase 11 update: this remains true after real KPA500/KAT500 read-only polling succeeded. AetherSDR accepts and polls both direct sockets, but applet windows are still not visible. Treat applet activation as a radio-side presence/layout/binary issue, not as proof that the direct PGXL/TGXL serial-backed polling path is broken.
+
 ## Phase 5 Emulator Changes
 
 - PGXL/TGXL `info` responses now include explicit `firmware` and `capabilities` fields. These are marked inferred in the protocol field matrix until validated against real devices or AetherSDR UI behaviour.

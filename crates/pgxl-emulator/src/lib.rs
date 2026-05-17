@@ -286,11 +286,22 @@ fn status_body_from_amp(amp: &bridge_core::AmpState) -> String {
     format!(
         "state={state} peakfwd={peakfwd:.4} swr={swr:.4} temp={:.1} id={:.1} vac={} meffa={} fault={fault} connection_state={}",
         amp.temperature_c,
-        amp.drain_current_amps,
-        amp.mains_volts,
+        amp.pa_current_amps,
+        pgxl_vac_value(amp),
         amp.meffa,
         amp.connection_state.as_str()
     )
+}
+
+fn pgxl_vac_value(amp: &bridge_core::AmpState) -> u16 {
+    // KPA500 ^VI reports internal PA supply voltage, not AC mains voltage.
+    // Avoid publishing values such as 68.9 as PGXL VAC until a validated
+    // PGXL mapping exists.
+    if amp.pa_voltage_volts >= 100.0 {
+        amp.pa_voltage_volts.round().clamp(0.0, f32::from(u16::MAX)) as u16
+    } else {
+        0
+    }
 }
 
 struct SessionStats {
@@ -514,7 +525,7 @@ mod tests {
         let body = status_body(&state).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=230 meffa=OK fault= connection_state=connected\n"
+            "R2|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n"
         );
     }
 

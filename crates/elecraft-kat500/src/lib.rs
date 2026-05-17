@@ -957,7 +957,7 @@ mod tests {
         assert!(!tuner.bypass);
         assert!(tuner.operate);
         assert_eq!(tuner.fault, None);
-        assert_eq!(tuner.swr, 1.0);
+        assert_eq!(tuner.swr, 1.11);
         assert_eq!(tuner.forward_power_watts, 0.0);
         assert!(tuner.capabilities.iter().any(|value| value == "mode=auto"));
         assert!(tuner

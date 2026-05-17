@@ -35,8 +35,8 @@
 
 ## Elecraft Command Unknowns
 
-- KPA500 active mapping was corrected to caret-prefixed Programmer Reference commands, but still needs COM21 transcript validation.
-- KAT500 active mapping was corrected to documented read-only GETs and wake/baud discovery, but still needs COM8 transcript validation.
+- KPA500 active read-only mapping is hardware-validated except `^SN;`, which still needs transcript evidence.
+- KAT500 active read-only mapping is hardware-validated on COM8.
 - KAT500 read-only commands beyond `RV;`, `SN;`, `AN;`, `BYP;`, `MD;`, `TP;`, `FLT;`, `VSWR;`, and `VFWD;` are not implemented.
 - Real serial response variants need captures from Oliver's firmware versions.
 - Serial transcript capture is implemented but needs real KPA500/KAT500 validation.
