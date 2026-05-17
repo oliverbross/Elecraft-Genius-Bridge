@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bridge-core",
+    "crates/config",
+    "crates/pgxl-emulator",
+    "crates/tgxl-emulator",
+    "crates/elecraft-kpa500",
+    "crates/elecraft-kat500",
+    "crates/test-harness",
+    "crates/egb",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/oliverbross/elecraft-genius-bridge"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-serial = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
