@@ -16,60 +16,80 @@ const CMD_FIRMWARE: ElecraftCommand = ElecraftCommand {
     wire: "^RVM;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_SERIAL_NUMBER: ElecraftCommand = ElecraftCommand {
     label: "read_serial_number",
     wire: "^SN;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_OPERATE_STATUS: ElecraftCommand = ElecraftCommand {
     label: "read_operate_status",
     wire: "^OS;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_POWER_SWR: ElecraftCommand = ElecraftCommand {
     label: "read_power_swr",
     wire: "^WS;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_TEMPERATURE: ElecraftCommand = ElecraftCommand {
     label: "read_temperature",
     wire: "^TM;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_VOLTS_CURRENT: ElecraftCommand = ElecraftCommand {
     label: "read_volts_current",
     wire: "^VI;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_FAULT: ElecraftCommand = ElecraftCommand {
     label: "read_fault",
     wire: "^FL;",
     safety: CommandSafety::ReadOnly,
     verified: true,
+    expects_response: true,
+    requires_post_verify: false,
 };
 const CMD_OPERATE: ElecraftCommand = ElecraftCommand {
     label: "set_operate",
     wire: "^OS1;",
     safety: CommandSafety::RfRisk,
     verified: true,
+    expects_response: false,
+    requires_post_verify: true,
 };
 const CMD_STANDBY: ElecraftCommand = ElecraftCommand {
     label: "set_standby",
     wire: "^OS0;",
     safety: CommandSafety::StateChangeSafe,
     verified: true,
+    expects_response: false,
+    requires_post_verify: true,
 };
 const CMD_CLEAR_FAULT: ElecraftCommand = ElecraftCommand {
     label: "clear_fault",
     wire: "^FLC;",
     safety: CommandSafety::DestructiveOrUnknown,
     verified: true,
+    expects_response: false,
+    requires_post_verify: true,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +106,8 @@ pub struct ElecraftCommand {
     pub wire: &'static str,
     pub safety: CommandSafety,
     pub verified: bool,
+    pub expects_response: bool,
+    pub requires_post_verify: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +115,25 @@ pub struct CommandOutcome {
     pub command: ElecraftCommand,
     pub response: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandResultState {
+    Acknowledged,
+    Verified,
+    SentNoAck,
+    VerifyFailed,
+    Timeout,
+    ParseFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlCommandResult {
+    pub command: ElecraftCommand,
+    pub send_result: CommandResultState,
+    pub verify_result: Option<CommandResultState>,
+    pub verification_response: Option<String>,
+    pub final_state: Option<AmpOperatingState>,
 }
 
 pub fn command_map() -> &'static [ElecraftCommand] {
@@ -131,6 +172,7 @@ pub struct Kpa500Settings {
     pub polling_interval: Duration,
     pub mock: bool,
     pub dry_run: bool,
+    pub control_verify_delay: Duration,
     pub transcript_dir: Option<PathBuf>,
 }
 
@@ -338,14 +380,20 @@ impl Kpa500Driver {
         Ok(())
     }
 
-    pub async fn set_standby(&self) -> Result<()> {
+    pub async fn set_standby(&self) -> Result<ControlCommandResult> {
         self.ensure_can_send(CMD_STANDBY)?;
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.amp.operate = false;
             guard.amp.state = AmpOperatingState::Standby;
             guard.amp.forward_power_watts = 0.0;
-            return Ok(());
+            return Ok(ControlCommandResult {
+                command: CMD_STANDBY,
+                send_result: CommandResultState::SentNoAck,
+                verify_result: Some(CommandResultState::Verified),
+                verification_response: Some("^OS0;".to_string()),
+                final_state: Some(AmpOperatingState::Standby),
+            });
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
@@ -361,14 +409,48 @@ impl Kpa500Driver {
             &self.settings.transcript_dir,
         )
         .await;
-        send_command(
+        send_no_ack_command(&mut port, CMD_STANDBY, &mut transcript).await?;
+        sleep(self.settings.control_verify_delay).await;
+        match send_command(
             &mut port,
-            CMD_STANDBY,
-            Duration::from_millis(750),
+            CMD_OPERATE_STATUS,
+            Duration::from_millis(1000),
             &mut transcript,
         )
-        .await?;
-        Ok(())
+        .await
+        {
+            Ok(response) => {
+                let mut amp = bridge_core::AmpState::default();
+                parse_kpa500_response(&response, &mut amp);
+                let verified = !amp.operate && matches!(amp.state, AmpOperatingState::Standby);
+                if verified {
+                    let mut guard = self.state.write().await;
+                    parse_kpa500_response(&response, &mut guard.amp);
+                    Ok(ControlCommandResult {
+                        command: CMD_STANDBY,
+                        send_result: CommandResultState::SentNoAck,
+                        verify_result: Some(CommandResultState::Verified),
+                        verification_response: Some(response),
+                        final_state: Some(AmpOperatingState::Standby),
+                    })
+                } else {
+                    Ok(ControlCommandResult {
+                        command: CMD_STANDBY,
+                        send_result: CommandResultState::SentNoAck,
+                        verify_result: Some(CommandResultState::VerifyFailed),
+                        verification_response: Some(response),
+                        final_state: Some(amp.state),
+                    })
+                }
+            }
+            Err(err) => Ok(ControlCommandResult {
+                command: CMD_STANDBY,
+                send_result: CommandResultState::SentNoAck,
+                verify_result: Some(CommandResultState::Timeout),
+                verification_response: Some(err.to_string()),
+                final_state: None,
+            }),
+        }
     }
 
     pub async fn clear_fault(&self) -> Result<()> {
@@ -738,6 +820,19 @@ async fn send_command(
     Ok(response)
 }
 
+async fn send_no_ack_command(
+    port: &mut SerialStream,
+    command: ElecraftCommand,
+    transcript: &mut SerialTranscript,
+) -> Result<()> {
+    transcript.write_line("TX", command.wire).await;
+    port.write_all(command.wire.as_bytes())
+        .await
+        .with_context(|| format!("failed to write serial command {}", command.label))?;
+    port.flush().await.context("failed to flush serial port")?;
+    Ok(())
+}
+
 struct SerialTranscript {
     file: Option<File>,
 }
@@ -900,5 +995,30 @@ mod tests {
             assert!(!line.contains("^OS1;"));
             assert!(!line.contains("^FLC;"));
         }
+    }
+
+    #[test]
+    fn standby_noack_fixture_uses_post_verify() {
+        let fixture = include_str!("../../../tests/fixtures/kpa500-standby-noack-verify-com21.txt");
+        assert!(fixture.contains("TX ^OS0;"));
+        assert!(fixture.contains("RX <no ack>"));
+        assert!(fixture.contains("TX ^OS;"));
+        assert!(fixture.contains("RX ^OS0;"));
+        assert!(!fixture.contains("^OS1;"));
+    }
+
+    #[test]
+    fn standby_command_metadata_is_ackless_and_verified() {
+        let standby = command_map()
+            .iter()
+            .find(|command| command.label == "set_standby")
+            .unwrap();
+        let operate_status = command_map()
+            .iter()
+            .find(|command| command.label == "read_operate_status")
+            .unwrap();
+        assert!(!standby.expects_response);
+        assert!(standby.requires_post_verify);
+        assert!(operate_status.expects_response);
     }
 }

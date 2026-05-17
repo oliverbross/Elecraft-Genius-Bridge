@@ -11,7 +11,8 @@ use elecraft_kat500::{
 use elecraft_kpa500::{
     command_map as kpa_command_map, read_only_discovery_commands as kpa_discovery_commands,
     read_only_poll_commands as kpa_poll_commands, CommandOutcome as KpaCommandOutcome,
-    CommandSafety as KpaCommandSafety, Kpa500Driver, Kpa500Settings,
+    CommandResultState as KpaCommandResultState, CommandSafety as KpaCommandSafety,
+    ControlCommandResult as KpaControlCommandResult, Kpa500Driver, Kpa500Settings,
 };
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -233,6 +234,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
                 mock: cfg.kpa500.mock,
                 dry_run: cfg.kpa500.dry_run,
+                control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
                 transcript_dir: cfg
                     .logging
                     .serial_transcript_dir
@@ -912,6 +914,7 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
             mock: cfg.kpa500.mock,
             dry_run: cfg.kpa500.dry_run,
+            control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_dir: cfg
                 .logging
                 .serial_transcript_dir
@@ -938,18 +941,25 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         println!("  allow_rf_risk={allow_rf_risk}");
         println!("  WILL SEND: set_standby wire=^OS0; safety=StateChangeSafe");
         println!("  WILL NOT SEND without --allow-rf-risk: set_operate wire=^OS1; safety=RfRisk");
-        println!("  rollback: force standby (^OS0;) after control test");
+        println!(
+            "  verify_delay_ms={} verification=^OS; expects=^OS0;",
+            cfg.control.verify_delay_ms
+        );
+        println!("  rollback: verify-or-force standby (^OS0;) after control test");
         println!("KPA500 control test: sending set_standby wire=^OS0; safety=StateChangeSafe");
-        driver.set_standby().await?;
+        let result = driver.set_standby().await?;
+        print_kpa_control_result("set_standby", &result);
         println!("KPA500 rollback: sending set_standby wire=^OS0; safety=StateChangeSafe");
-        driver.set_standby().await?;
+        let rollback = driver.set_standby().await?;
+        print_kpa_control_result("rollback_standby", &rollback);
     }
     if allow_rf_risk {
         ensure_local_or_lan_bind(cfg)?;
         println!("KPA500 RF-risk test: sending set_operate wire=^OS1; safety=RfRisk");
         driver.set_operate().await?;
         println!("KPA500 rollback: sending set_standby wire=^OS0; safety=StateChangeSafe");
-        driver.set_standby().await?;
+        let rollback = driver.set_standby().await?;
+        print_kpa_control_result("rollback_standby", &rollback);
     }
     Ok(())
 }
@@ -992,7 +1002,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         },
         state.clone(),
     );
-    driver.connect().await?;
+    driver.discover_once().await?;
     println!(
         "KAT500 read-only test: wake/baud discovery, then RV;, SN;, AN;, BYP;, MD;, TP;, FLT;, VSWR;, VFWD;"
     );
@@ -1131,6 +1141,44 @@ fn print_kpa_outcome_summary(outcomes: &[KpaCommandOutcome]) {
             ),
             _ => {}
         }
+    }
+}
+
+fn print_kpa_control_result(label: &str, result: &KpaControlCommandResult) {
+    println!("{label}:");
+    println!(
+        "  command={} wire={}",
+        result.command.label, result.command.wire
+    );
+    println!("  send_result={}", control_state_label(result.send_result));
+    println!(
+        "  verify_result={}",
+        result
+            .verify_result
+            .map(control_state_label)
+            .unwrap_or("none")
+    );
+    println!(
+        "  verification_response={}",
+        result.verification_response.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  final_state={}",
+        result
+            .final_state
+            .map(|state| format!("{state:?}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+}
+
+fn control_state_label(state: KpaCommandResultState) -> &'static str {
+    match state {
+        KpaCommandResultState::Acknowledged => "acknowledged",
+        KpaCommandResultState::Verified => "verified",
+        KpaCommandResultState::SentNoAck => "sent_no_ack",
+        KpaCommandResultState::VerifyFailed => "verify_failed",
+        KpaCommandResultState::Timeout => "timeout",
+        KpaCommandResultState::ParseFailed => "parse_failed",
     }
 }
 

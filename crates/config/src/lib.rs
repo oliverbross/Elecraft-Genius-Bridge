@@ -33,6 +33,7 @@ pub struct BridgeConfig {
     pub security: SecurityConfig,
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
+    pub control: ControlConfig,
     pub mock: MockConfig,
 }
 
@@ -72,6 +73,11 @@ impl BridgeConfig {
         }
         self.kpa500.validate("kpa500")?;
         self.kat500.validate("kat500")?;
+        if self.control.verify_delay_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "control.verify_delay_ms must be > 0".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -101,6 +107,7 @@ impl Default for BridgeConfig {
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
+            control: ControlConfig::default(),
             mock: MockConfig::default(),
         }
     }
@@ -253,6 +260,20 @@ impl Default for MetricsConfig {
             enabled: false,
             bind_ip: "127.0.0.1".to_string(),
             port: 9160,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlConfig {
+    pub verify_delay_ms: u64,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            verify_delay_ms: 200,
         }
     }
 }

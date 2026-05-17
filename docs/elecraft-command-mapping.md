@@ -74,6 +74,8 @@ With `dry_run: true`, the serial drivers permit only `read_only` commands. They 
 
 The `egb test-kpa` and `egb test-kat` commands default to read-only tests. `--allow-control` is required before state-changing control tests are attempted. `--allow-rf-risk` is required before RF-risk tests are attempted. `destructive_or_unknown` commands are not sent by these test commands.
 
+Command ACK and verification semantics are tracked in `docs/elecraft-command-semantics.md`.
+
 ## Rule For Future Work
 
 Do not silently change these mappings based on memory or guesswork. Add either:

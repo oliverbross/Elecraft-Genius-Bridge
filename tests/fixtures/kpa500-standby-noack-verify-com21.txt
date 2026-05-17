@@ -1,0 +1,4 @@
+TX ^OS0;
+RX <no ack>
+TX ^OS;
+RX ^OS0;

@@ -300,6 +300,21 @@ impl Kat500Driver {
         Ok(())
     }
 
+    pub async fn discover_once(&self) -> Result<()> {
+        if self.settings.mock {
+            return Ok(());
+        }
+        let mut transcript = SerialTranscript::open(
+            "KAT500",
+            &self.settings.com_port,
+            &self.settings.transcript_dir,
+        )
+        .await;
+        let (mut port, _) = self.open_with_discovery(&mut transcript).await?;
+        self.discover_capabilities(&mut port, &mut transcript).await;
+        Ok(())
+    }
+
     pub async fn disconnect(&self) {
         let mut guard = self.state.write().await;
         guard.tuner.connected = false;

@@ -103,6 +103,15 @@ mock:
 
 These flags only affect mock-mode state. Use them later for degraded UI testing, not for first applet activation tests.
 
+## Control Verification
+
+```yaml
+control:
+  verify_delay_ms: 200
+```
+
+No-ACK control commands use this delay before a follow-up verification query. KPA500 standby sends `^OS0;`, waits, then verifies with `^OS;` expecting `^OS0;`.
+
 ## Profiles
 
 - `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation and TGXL direct-presence diagnostics enabled.

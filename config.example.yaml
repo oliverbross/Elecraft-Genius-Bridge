@@ -48,6 +48,9 @@ metrics:
   bind_ip: 127.0.0.1
   port: 9160
 
+control:
+  verify_delay_ms: 200
+
 mock:
   pgxl_fault: false
   tgxl_fault: false

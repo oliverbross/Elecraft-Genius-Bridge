@@ -138,11 +138,39 @@ Expected safe-control test:
 
 Rollback behaviour: the test sends standby `^OS0;`, then sends standby `^OS0;` again as a safe rollback. It does not send operate.
 
+Phase 13 update: `^OS0;` is treated as an ACK-less command. Success is determined by:
+
+1. write `^OS0;`
+2. wait `control.verify_delay_ms`
+3. send `^OS;`
+4. require `^OS0;`
+
+Expected CLI result:
+
+```text
+set_standby:
+  send_result=sent_no_ack
+  verify_result=verified
+  final_state=Standby
+```
+
 Regression fixture:
 
 ```text
 tests/fixtures/kpa500-standby-control-com21.txt
+tests/fixtures/kpa500-standby-noack-verify-com21.txt
 ```
+
+## Operational Status
+
+- KPA500 read-only: verified except `^SN;` pending transcript.
+- KPA500 standby command: ACK-less, verified by follow-up `^OS;`.
+- KPA500 operate/RF-risk: not ready.
+- KAT500 read-only: verified.
+- KAT500 control: intentionally blocked.
+- AetherSDR direct sockets: stable polling.
+- WAN: not ready.
+- Applet visibility: unresolved separately.
 
 ## 2026-05-17 Phase 9
 
