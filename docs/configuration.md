@@ -25,9 +25,12 @@ tgxl:
   port: 9010
   strict_emulation: false
   startup_delay_ms: 0
+  force_presence_test: false
 ```
 
 Set `strict_emulation: true` in mock mode to simulate a more realistic device startup sequence. The emulator sends the required `V` greeting immediately, but shared mock state reports transitional readiness until `startup_delay_ms` expires.
+
+Set `tgxl.force_presence_test: true` only for AetherSDR TUN applet activation testing. It makes the direct TGXL emulator publish the richest safe direct state currently understood, without changing KAT500 serial behaviour.
 
 ## Elecraft Devices
 
@@ -89,8 +92,19 @@ metrics:
 
 When enabled, `GET /status` returns localhost-only JSON with connection states, poll timestamps, firmware/capability fields, protocol counters, and client counts. The endpoint refuses non-loopback binds.
 
+## Mock Fault Simulation
+
+```yaml
+mock:
+  pgxl_fault: false
+  tgxl_fault: false
+  high_swr: false
+```
+
+These flags only affect mock-mode state. Use them later for degraded UI testing, not for first applet activation tests.
+
 ## Profiles
 
-- `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation enabled.
+- `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation and TGXL direct-presence diagnostics enabled.
 - `config.hardware-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true`.
 - `config.hardware-control-local-only.yaml`: COM8/COM21 hardware mode with `dry_run: false`, loopback bind by default. Use only locally or on a private LAN after read-only validation.

@@ -89,6 +89,8 @@ TGXL strict startup can report: tuning=1 connection_state=connecting fault=
 
 No new AetherSDR command types were observed before these changes; the next macOS run must confirm whether AetherSDR tolerates the enriched `info` lines.
 
+Phase 7 changed mock no-RF status output to report `swr=1.0000` instead of return-loss-style values. The older transcript snippets above remain useful as historical evidence of what AetherSDR accepted during the first stable polling session.
+
 ## Next Evidence Needed
 
 1. Capture an AetherSDR session after the richer `info` responses and strict mock startup mode.

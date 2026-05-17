@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
-use bridge_core::{ConnectionState, SharedState};
+use bridge_core::{AmpOperatingState, ConnectionState, SharedState};
 use clap::{Parser, Subcommand};
 use egb_config::BridgeConfig;
 use elecraft_kat500::{
@@ -120,6 +120,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
     } else {
         shared_default_state()
     };
+    apply_mock_config(&cfg, &state).await;
 
     if cfg.kpa500.enabled {
         let driver = Kpa500Driver::new(
@@ -197,6 +198,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 .map(PathBuf::from),
             strict_emulation: cfg.tgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.tgxl.startup_delay_ms),
+            force_presence_test: cfg.tgxl.force_presence_test,
         };
         tokio::spawn(async move {
             if let Err(err) = tgxl_emulator::run_with_options(addr, state, options).await {
@@ -240,6 +242,36 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
         .context("failed waiting for Ctrl+C")?;
     info!("shutdown requested");
     Ok(())
+}
+
+async fn apply_mock_config(cfg: &BridgeConfig, state: &SharedState) {
+    if !(cfg.kpa500.mock || cfg.kat500.mock) {
+        return;
+    }
+
+    let mut guard = state.write().await;
+    if cfg.kpa500.mock {
+        if cfg.mock.pgxl_fault {
+            guard.amp.state = AmpOperatingState::Fault;
+            guard.amp.connection_state = ConnectionState::Degraded;
+            guard.amp.connected = false;
+            guard.amp.fault = Some("mock_pgxl_fault".to_string());
+        }
+        if cfg.mock.high_swr {
+            guard.amp.swr = 8.0;
+            guard.amp.warning = Some("mock_high_swr".to_string());
+        }
+    }
+    if cfg.kat500.mock {
+        if cfg.mock.tgxl_fault {
+            guard.tuner.connection_state = ConnectionState::Degraded;
+            guard.tuner.connected = false;
+            guard.tuner.fault = Some("mock_tgxl_fault".to_string());
+        }
+        if cfg.mock.high_swr {
+            guard.tuner.swr = 8.0;
+        }
+    }
 }
 
 async fn stale_state_watchdog(
@@ -389,6 +421,14 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         "  port={} baud={} mock={} dry_run={}",
         cfg.kpa500.com_port, cfg.kpa500.baud, cfg.kpa500.mock, cfg.kpa500.dry_run
     );
+    println!(
+        "  transcript_dir={}",
+        cfg.logging
+            .serial_transcript_dir
+            .as_deref()
+            .unwrap_or("(disabled)")
+    );
+    println!("  planned sequence: connect -> poll_status/read-only; optional controls only when flags permit");
     print_kpa_command_summary(
         kpa_command_map(),
         allow_control,
@@ -412,13 +452,14 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         shared_default_state(),
     );
     driver.connect().await?;
+    println!("KPA500 read-only test: sending poll_status wire=ST; safety=ReadOnly");
     driver.poll_status().await?;
     if allow_control {
-        println!("KPA500 control test: set_standby is allowed by flag");
+        println!("KPA500 control test: sending set_standby wire=OP0; safety=StateChangeSafe");
         driver.set_standby().await?;
     }
     if allow_rf_risk {
-        println!("KPA500 RF-risk test: set_operate requested");
+        println!("KPA500 RF-risk test: sending set_operate wire=OP1; safety=RfRisk");
         driver.set_operate().await?;
     }
     Ok(())
@@ -430,6 +471,14 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         "  port={} baud={} mock={} dry_run={}",
         cfg.kat500.com_port, cfg.kat500.baud, cfg.kat500.mock, cfg.kat500.dry_run
     );
+    println!(
+        "  transcript_dir={}",
+        cfg.logging
+            .serial_transcript_dir
+            .as_deref()
+            .unwrap_or("(disabled)")
+    );
+    println!("  planned sequence: connect -> poll_status/read-only; optional controls only when flags permit");
     print_kat_command_summary(
         kat_command_map(),
         allow_control,
@@ -453,13 +502,14 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         shared_default_state(),
     );
     driver.connect().await?;
+    println!("KAT500 read-only test: sending poll_status wire=ST; safety=ReadOnly");
     driver.poll_status().await?;
     if allow_control {
-        println!("KAT500 control test: set_bypass(true) is allowed by flag");
+        println!("KAT500 control test: sending set_bypass_on wire=BP1; safety=StateChangeSafe");
         driver.set_bypass(true).await?;
     }
     if allow_rf_risk {
-        println!("KAT500 RF-risk test: autotune requested");
+        println!("KAT500 RF-risk test: sending autotune wire=T; safety=RfRisk");
         driver.autotune().await?;
     }
     Ok(())

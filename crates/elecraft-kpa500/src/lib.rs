@@ -99,21 +99,27 @@ impl Kpa500Driver {
     async fn run_mock(self) {
         info!("KPA500 mock driver started");
         loop {
+            let mut skip_until_next_poll = false;
             {
                 let mut guard = self.state.write().await;
                 guard.amp.connected = true;
                 guard.amp.connection_state = ConnectionState::Connected;
                 guard.amp.last_serial_response_at = Some(SystemTime::now());
                 guard.amp.last_successful_poll_at = Some(SystemTime::now());
-                if let Some(operate) = guard.desired.amp_operate {
+                if guard.amp.fault.as_deref() == Some("mock_pgxl_fault") {
+                    guard.amp.connected = false;
+                    guard.amp.connection_state = ConnectionState::Degraded;
+                    guard.amp.state = AmpOperatingState::Fault;
+                    skip_until_next_poll = true;
+                } else if let Some(operate) = guard.desired.amp_operate {
                     guard.amp.operate = operate;
                 }
-                if guard.amp.operate {
+                if !skip_until_next_poll && guard.amp.operate {
                     guard.amp.state = AmpOperatingState::Idle;
                     guard.amp.mains_volts = 230;
                     guard.amp.temperature_c = (guard.amp.temperature_c + 0.1).min(45.0);
                     guard.amp.meffa = "OK".to_string();
-                } else {
+                } else if !skip_until_next_poll {
                     guard.amp.state = AmpOperatingState::Standby;
                     guard.amp.forward_power_watts = 0.0;
                     guard.amp.drain_current_amps = 0.0;
@@ -431,6 +437,36 @@ fn parse_unverified_status(response: &str, amp: &mut bridge_core::AmpState) {
         amp.state = AmpOperatingState::Fault;
         amp.fault = Some(response.to_string());
     }
+    if let Some(swr) = parse_swr_ratio(response) {
+        amp.swr = swr;
+    }
+}
+
+fn parse_swr_ratio(response: &str) -> Option<f32> {
+    for token in response.split([';', ' ', ',', '|']) {
+        let Some(raw) = token
+            .strip_prefix("SWR=")
+            .or_else(|| token.strip_prefix("swr="))
+            .or_else(|| token.strip_prefix("SWR"))
+        else {
+            continue;
+        };
+        let Ok(value) = raw.parse::<f32>() else {
+            continue;
+        };
+        if (1.0..=99.0).contains(&value) {
+            return Some(value);
+        }
+        warn!(
+            event_id = "invalid_serial_value",
+            device = "KPA500",
+            field = "swr",
+            value,
+            response,
+            "rejected impossible KPA500 SWR value"
+        );
+    }
+    None
 }
 
 async fn send_command(
@@ -537,6 +573,17 @@ mod tests {
         parse_unverified_status("FAULT;", &mut amp);
         assert_eq!(amp.state, AmpOperatingState::Fault);
         assert!(amp.fault.is_some());
+    }
+
+    #[test]
+    fn parser_rejects_impossible_swr_values() {
+        let mut amp = bridge_core::AmpState::default();
+        parse_unverified_status("SWR=-1.0;", &mut amp);
+        assert_eq!(amp.swr, 1.0);
+        parse_unverified_status("SWR=1000.0;", &mut amp);
+        assert_eq!(amp.swr, 1.0);
+        parse_unverified_status("SWR=1.4;", &mut amp);
+        assert_eq!(amp.swr, 1.4);
     }
 
     #[test]

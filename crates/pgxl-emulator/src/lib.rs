@@ -278,13 +278,13 @@ fn status_body_from_amp(amp: &bridge_core::AmpState) -> String {
         amp.state.pgxl_state()
     };
     let peakfwd = watts_to_dbm(amp.forward_power_watts);
-    let swr_rl = swr_to_return_loss_db(amp.swr);
+    let swr = protocol_swr_value(amp.swr);
     let fault = amp
         .fault
         .as_deref()
         .unwrap_or(if degraded { "device_degraded" } else { "" });
     format!(
-        "state={state} peakfwd={peakfwd:.4} swr={swr_rl:.4} temp={:.1} id={:.1} vac={} meffa={} fault={fault} connection_state={}",
+        "state={state} peakfwd={peakfwd:.4} swr={swr:.4} temp={:.1} id={:.1} vac={} meffa={} fault={fault} connection_state={}",
         amp.temperature_c,
         amp.drain_current_amps,
         amp.mains_volts,
@@ -486,12 +486,11 @@ fn watts_to_dbm(watts: f32) -> f32 {
     }
 }
 
-fn swr_to_return_loss_db(swr: f32) -> f32 {
-    if swr <= 1.0 {
-        30.0
+fn protocol_swr_value(swr: f32) -> f32 {
+    if swr.is_finite() && swr >= 1.0 {
+        swr
     } else {
-        let rho = ((swr - 1.0) / (swr + 1.0)).clamp(0.000_001, 0.999_999);
-        -20.0 * rho.log10()
+        1.0
     }
 }
 
@@ -515,8 +514,16 @@ mod tests {
         let body = status_body(&state).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|state=STANDBY peakfwd=0.0000 swr=32.2557 temp=32.0 id=0.0 vac=230 meffa=OK fault= connection_state=connected\n"
+            "R2|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=230 meffa=OK fault= connection_state=connected\n"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_status_never_reports_extreme_swr() {
+        let state = shared_mock_state();
+        let body = status_body(&state).await;
+        assert!(body.contains("swr=1.0000"));
+        assert!(!body.contains("swr=32."));
     }
 
     #[test]

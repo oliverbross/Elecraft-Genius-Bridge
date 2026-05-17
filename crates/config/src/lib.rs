@@ -33,6 +33,7 @@ pub struct BridgeConfig {
     pub security: SecurityConfig,
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
+    pub mock: MockConfig,
 }
 
 impl BridgeConfig {
@@ -100,6 +101,7 @@ impl Default for BridgeConfig {
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
+            mock: MockConfig::default(),
         }
     }
 }
@@ -145,6 +147,7 @@ pub struct TgxlConfig {
     pub port: u16,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
+    pub force_presence_test: bool,
 }
 
 impl Default for TgxlConfig {
@@ -154,8 +157,17 @@ impl Default for TgxlConfig {
             port: 9010,
             strict_emulation: false,
             startup_delay_ms: 0,
+            force_presence_test: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MockConfig {
+    pub pgxl_fault: bool,
+    pub tgxl_fault: bool,
+    pub high_swr: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

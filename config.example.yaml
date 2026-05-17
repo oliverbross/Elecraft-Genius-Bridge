@@ -13,6 +13,7 @@ tgxl:
   port: 9010
   strict_emulation: false
   startup_delay_ms: 0
+  force_presence_test: false
 
 kpa500:
   enabled: true
@@ -46,3 +47,8 @@ metrics:
   enabled: false
   bind_ip: 127.0.0.1
   port: 9160
+
+mock:
+  pgxl_fault: false
+  tgxl_fault: false
+  high_swr: false

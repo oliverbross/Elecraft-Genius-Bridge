@@ -26,6 +26,9 @@ logging:
   level: debug
   protocol_trace: true
   protocol_transcript_dir: logs/protocol
+
+tgxl:
+  force_presence_test: true
 ```
 
 3. Start EGB:
@@ -63,7 +66,7 @@ PGXL RX < C2|status
 10. Verify displayed amp values:
    - State: STANDBY or equivalent idle display.
    - Forward power: near zero.
-   - SWR: sane low value.
+   - SWR: around `1.0` in no-RF mock mode.
    - Temperature: around `32 C`.
    - Mains voltage: `230 V`.
 
@@ -86,7 +89,7 @@ TGXL RX < C2|status
 6. Verify displayed tuner values:
    - OPERATE/STANDBY/BYPASS state is coherent.
    - Forward power near zero.
-   - SWR sane low value.
+   - SWR around `1.0` in no-RF mock mode.
    - Relay bars show C1/L/C2 values.
    - ANT 1/2/3 buttons appear if AetherSDR exposes them for mock TGXL.
 
@@ -133,3 +136,5 @@ scripts\windows\run-mock.ps1
 6. Save screenshots showing PGXL and TGXL connected.
 7. Save transcript files from `logs/protocol/`.
 8. Copy `docs/validation/aethersdr-session-report-template.md` into a session-specific report and fill in mismatches.
+9. Fill out `docs/validation/aethersdr-applet-visibility-test.md`.
+10. If TUN remains hidden, follow `docs/validation/aethersdr-binary-source-match.md` and `docs/validation/aethersdr-layout-reset.md`.

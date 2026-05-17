@@ -113,35 +113,44 @@ impl Kat500Driver {
     async fn run_mock(self) {
         info!("KAT500 mock driver started");
         loop {
+            let mut skip_until_next_poll = false;
             {
                 let mut guard = self.state.write().await;
                 guard.tuner.connected = true;
                 guard.tuner.connection_state = ConnectionState::Connected;
                 guard.tuner.last_serial_response_at = Some(SystemTime::now());
                 guard.tuner.last_successful_poll_at = Some(SystemTime::now());
-                if let Some(antenna) = guard.desired.tuner_selected_antenna {
+                if guard.tuner.fault.as_deref() == Some("mock_tgxl_fault") {
+                    guard.tuner.connected = false;
+                    guard.tuner.connection_state = ConnectionState::Degraded;
+                    skip_until_next_poll = true;
+                } else if let Some(antenna) = guard.desired.tuner_selected_antenna {
                     guard.tuner.selected_antenna = Some(antenna.saturating_sub(1));
                 }
-                if let Some(bypass) = guard.desired.tuner_bypass {
-                    guard.tuner.bypass = bypass;
+                if !skip_until_next_poll {
+                    if let Some(bypass) = guard.desired.tuner_bypass {
+                        guard.tuner.bypass = bypass;
+                    }
                 }
-                if guard.desired.tuner_autotune_requested {
+                if !skip_until_next_poll && guard.desired.tuner_autotune_requested {
                     guard.tuner.tuning = true;
                     guard.desired.tuner_autotune_requested = false;
                 }
-                if let Some(manual) = guard.desired.tuner_manual_tune.take() {
-                    let step = if manual.movement >= 0 { 1 } else { -1 };
-                    let target = match manual.relay {
-                        0 => Some(&mut guard.tuner.relay_c1),
-                        1 => Some(&mut guard.tuner.relay_l),
-                        2 => Some(&mut guard.tuner.relay_c2),
-                        _ => None,
-                    };
-                    if let Some(target) = target {
-                        *target = (*target + step).clamp(0, 255);
+                if !skip_until_next_poll {
+                    if let Some(manual) = guard.desired.tuner_manual_tune.take() {
+                        let step = if manual.movement >= 0 { 1 } else { -1 };
+                        let target = match manual.relay {
+                            0 => Some(&mut guard.tuner.relay_c1),
+                            1 => Some(&mut guard.tuner.relay_l),
+                            2 => Some(&mut guard.tuner.relay_c2),
+                            _ => None,
+                        };
+                        if let Some(target) = target {
+                            *target = (*target + step).clamp(0, 255);
+                        }
                     }
                 }
-                if guard.tuner.tuning {
+                if !skip_until_next_poll && guard.tuner.tuning {
                     guard.tuner.swr = 1.15;
                     guard.tuner.tuning = false;
                 }
@@ -447,6 +456,36 @@ fn parse_unverified_status(response: &str, tuner: &mut bridge_core::TunerState) 
     if response.contains("BYP") {
         tuner.bypass = true;
     }
+    if let Some(swr) = parse_swr_ratio(response) {
+        tuner.swr = swr;
+    }
+}
+
+fn parse_swr_ratio(response: &str) -> Option<f32> {
+    for token in response.split([';', ' ', ',', '|']) {
+        let Some(raw) = token
+            .strip_prefix("SWR=")
+            .or_else(|| token.strip_prefix("swr="))
+            .or_else(|| token.strip_prefix("SWR"))
+        else {
+            continue;
+        };
+        let Ok(value) = raw.parse::<f32>() else {
+            continue;
+        };
+        if (1.0..=99.0).contains(&value) {
+            return Some(value);
+        }
+        warn!(
+            event_id = "invalid_serial_value",
+            device = "KAT500",
+            field = "swr",
+            value,
+            response,
+            "rejected impossible KAT500 SWR value"
+        );
+    }
+    None
 }
 
 async fn send_command(
@@ -586,6 +625,17 @@ mod tests {
         let mut tuner = bridge_core::TunerState::default();
         parse_unverified_status("BYP;", &mut tuner);
         assert!(tuner.bypass);
+    }
+
+    #[test]
+    fn parser_rejects_impossible_swr_values() {
+        let mut tuner = bridge_core::TunerState::default();
+        parse_unverified_status("SWR=-1.0;", &mut tuner);
+        assert_eq!(tuner.swr, 1.0);
+        parse_unverified_status("SWR=1000.0;", &mut tuner);
+        assert_eq!(tuner.swr, 1.0);
+        parse_unverified_status("SWR=1.3;", &mut tuner);
+        assert_eq!(tuner.swr, 1.3);
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub struct EmulatorOptions {
     pub transcript_dir: Option<PathBuf>,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
+    pub force_presence_test: bool,
 }
 
 pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()> {
@@ -70,6 +71,15 @@ async fn handle_client(
         guard.clients.tgxl_client_count += 1;
     }
     maybe_start_strict_startup(&state, &options).await;
+    if options.force_presence_test {
+        info!(
+            event_id = "tgxl_direct_presence_test",
+            protocol = "TGXL",
+            connection_id = %peer,
+            "TGXL direct presence test mode enabled"
+        );
+        apply_direct_presence_test_state(&state).await;
+    }
     info!(event_id = "client_connected", protocol = "TGXL", connection_id = %peer, "TGXL client connected");
 
     let result = async {
@@ -196,6 +206,34 @@ async fn handle_client(
     }
     info!(event_id = "client_disconnected", protocol = "TGXL", connection_id = %peer, "TGXL client disconnected");
     result
+}
+
+async fn apply_direct_presence_test_state(state: &SharedState) {
+    let mut guard = state.write().await;
+    guard.tuner.connected = true;
+    guard.tuner.connection_state = ConnectionState::Connected;
+    guard.tuner.operate = true;
+    guard.tuner.bypass = false;
+    guard.tuner.tuning = false;
+    guard.tuner.selected_antenna = Some(0);
+    guard.tuner.relay_c1 = 20;
+    guard.tuner.relay_l = 35;
+    guard.tuner.relay_c2 = 20;
+    guard.tuner.forward_power_watts = 0.0;
+    guard.tuner.swr = 1.0;
+    guard.tuner.fault = None;
+    guard.tuner.firmware_version = Some(VERSION.to_string());
+    for capability in ["direct-presence-test", "direct-tcp", "one-by-three"] {
+        if !guard
+            .tuner
+            .capabilities
+            .iter()
+            .any(|existing| existing == capability)
+        {
+            guard.tuner.capabilities.push(capability.to_string());
+        }
+    }
+    guard.tuner.last_successful_poll_at = Some(SystemTime::now());
 }
 
 struct CommandOutcome {
@@ -352,7 +390,7 @@ async fn status_body(state: &SharedState) -> String {
 
 fn status_body_from_tuner(tuner: &bridge_core::TunerState) -> String {
     let fwd = watts_to_dbm(tuner.forward_power_watts);
-    let swr = -swr_to_return_loss_db(tuner.swr);
+    let swr = protocol_swr_value(tuner.swr);
     let degraded = matches!(
         tuner.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
@@ -585,12 +623,11 @@ fn watts_to_dbm(watts: f32) -> f32 {
     }
 }
 
-fn swr_to_return_loss_db(swr: f32) -> f32 {
-    if swr <= 1.0 {
-        30.0
+fn protocol_swr_value(swr: f32) -> f32 {
+    if swr.is_finite() && swr >= 1.0 {
+        swr
     } else {
-        let rho = ((swr - 1.0) / (swr + 1.0)).clamp(0.000_001, 0.999_999);
-        -20.0 * rho.log10()
+        1.0
     }
 }
 
@@ -630,8 +667,17 @@ mod tests {
         let body = status_body(&state).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-32.2557 connection_state=connected fault=\n"
+            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=1.0000 connection_state=connected fault=\n"
         );
+    }
+
+    #[tokio::test]
+    async fn mock_status_never_reports_negative_or_extreme_swr() {
+        let state = shared_mock_state();
+        let body = status_body(&state).await;
+        assert!(body.contains("swr=1.0000"));
+        assert!(!body.contains("swr=-"));
+        assert!(!body.contains("swr=32."));
     }
 
     #[test]
