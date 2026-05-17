@@ -75,6 +75,7 @@ egb run --config config.yaml
 
 ```powershell
 .\target-msvc\debug\egb.exe baud-scan --port COM8
+.\target-msvc\debug\egb.exe serial-probe-batch --port COM8 --baud 38400 --send ";,RV;,SN;,AN;,BYP;,MD;,TP;,FLT;,VSWR;,VFWD;" --timeout-ms 1000
 ```
 
 3. Run:

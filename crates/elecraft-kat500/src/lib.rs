@@ -120,6 +120,13 @@ pub struct ElecraftCommand {
     pub verified: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutcome {
+    pub command: ElecraftCommand,
+    pub response: Option<String>,
+    pub error: Option<String>,
+}
+
 pub fn command_map() -> &'static [ElecraftCommand] {
     &[
         CMD_NULL,
@@ -137,6 +144,22 @@ pub fn command_map() -> &'static [ElecraftCommand] {
         CMD_BYPASS_OFF,
         CMD_ANTENNA_SELECT,
         CMD_MANUAL_TUNE,
+    ]
+}
+
+pub fn read_only_discovery_commands() -> &'static [ElecraftCommand] {
+    &[CMD_FIRMWARE, CMD_SERIAL_NUMBER]
+}
+
+pub fn read_only_poll_commands() -> &'static [ElecraftCommand] {
+    &[
+        CMD_ANTENNA_STATUS,
+        CMD_BYPASS_STATUS,
+        CMD_MODE,
+        CMD_TUNE_POLL,
+        CMD_FAULT,
+        CMD_VSWR,
+        CMD_FORWARD_ADC,
     ]
 }
 
@@ -284,13 +307,34 @@ impl Kat500Driver {
     }
 
     pub async fn poll_status(&self) -> Result<()> {
+        let outcomes = self.poll_status_outcomes().await?;
+        if outcomes.iter().any(|outcome| outcome.error.is_some()) {
+            let failed = outcomes
+                .iter()
+                .filter(|outcome| outcome.error.is_some())
+                .map(|outcome| outcome.command.label)
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!("KAT500 read-only poll had failed commands: {failed}");
+        }
+        Ok(())
+    }
+
+    pub async fn poll_status_outcomes(&self) -> Result<Vec<CommandOutcome>> {
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.tuner.connected = true;
             guard.tuner.connection_state = ConnectionState::Connected;
             guard.tuner.last_serial_response_at = Some(SystemTime::now());
             guard.tuner.last_successful_poll_at = Some(SystemTime::now());
-            return Ok(());
+            return Ok(read_only_poll_commands()
+                .iter()
+                .map(|command| CommandOutcome {
+                    command: *command,
+                    response: Some("MOCK;".to_string()),
+                    error: None,
+                })
+                .collect());
         }
         let mut transcript = SerialTranscript::open(
             "KAT500",
@@ -521,36 +565,46 @@ impl Kat500Driver {
         &self,
         port: &mut SerialStream,
         transcript: &mut SerialTranscript,
-    ) -> Result<()> {
-        let commands = [
-            CMD_ANTENNA_STATUS,
-            CMD_BYPASS_STATUS,
-            CMD_MODE,
-            CMD_TUNE_POLL,
-            CMD_FAULT,
-            CMD_VSWR,
-            CMD_FORWARD_ADC,
-        ];
-        let mut responses = Vec::with_capacity(commands.len());
-        for command in commands {
-            let response = send_command(port, command, Duration::from_millis(1000), transcript)
-                .await
-                .with_context(|| format!("KAT500 {} timed out or failed", command.label))?;
-            debug!(command = command.label, response = %response, "KAT500 status response");
-            responses.push((command, response));
+    ) -> Result<Vec<CommandOutcome>> {
+        let mut outcomes = Vec::with_capacity(read_only_poll_commands().len());
+        for command in read_only_poll_commands() {
+            match send_command(port, *command, Duration::from_millis(1000), transcript).await {
+                Ok(response) => {
+                    debug!(command = command.label, response = %response, "KAT500 status response");
+                    outcomes.push(CommandOutcome {
+                        command: *command,
+                        response: Some(response),
+                        error: None,
+                    });
+                }
+                Err(err) => {
+                    warn!(device = "KAT500", command = command.label, error = %err, "KAT500 read-only command failed; continuing");
+                    outcomes.push(CommandOutcome {
+                        command: *command,
+                        response: None,
+                        error: Some(err.to_string()),
+                    });
+                }
+            }
         }
         let mut guard = self.state.write().await;
         guard.tuner.connected = true;
         guard.tuner.connection_state = ConnectionState::Connected;
         guard.tuner.last_serial_command_at = Some(SystemTime::now());
-        guard.tuner.last_serial_response_at = Some(SystemTime::now());
-        guard.tuner.last_successful_poll_at = Some(SystemTime::now());
-        for (command, response) in responses {
-            push_capability(&mut guard.tuner.capabilities, command.label);
-            parse_kat500_response(&response, &mut guard.tuner);
+        if outcomes.iter().any(|outcome| outcome.response.is_some()) {
+            guard.tuner.last_serial_response_at = Some(SystemTime::now());
+            guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+        } else {
+            guard.tuner.connection_state = ConnectionState::Degraded;
+        }
+        for outcome in &outcomes {
+            if let Some(response) = &outcome.response {
+                push_capability(&mut guard.tuner.capabilities, outcome.command.label);
+                parse_kat500_response(response, &mut guard.tuner);
+            }
         }
         sleep(self.settings.polling_interval).await;
-        Ok(())
+        Ok(outcomes)
     }
 
     pub async fn autotune_serial(port: &mut SerialStream) -> Result<String> {

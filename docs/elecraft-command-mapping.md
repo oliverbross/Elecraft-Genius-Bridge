@@ -13,7 +13,7 @@ Primary references:
 
 | Intent | Wire command | Safety | Verification |
 | --- | --- | --- | --- |
-| Read firmware | `^RVM;` | `read_only` | Programmer Reference |
+| Read firmware | `^RVM;` | `read_only` | Hardware verified on COM21 at 38400: `^RVM01.54;` |
 | Read serial number | `^SN;` | `read_only` | Programmer Reference |
 | Read operate/standby | `^OS;` | `read_only` | Programmer Reference |
 | Read power/SWR | `^WS;` | `read_only` | Programmer Reference |
@@ -25,6 +25,14 @@ Primary references:
 | Clear fault | `^FLC;` | `destructive_or_unknown` | Programmer Reference, not sent by test CLI |
 
 `^WSppp sss;` is parsed as forward power watts plus SWR encoded as hundredths. `sss=000` is treated as no-RF/no-SWR-measurement and mapped to SWR `1.0` for bridge state.
+
+Confirmed hardware baseline:
+
+- KPA500 on `COM21`
+- baud `38400`
+- no CR/LF terminator
+- probe `^RVM;`
+- response `^RVM01.54;`
 
 ## KAT500
 

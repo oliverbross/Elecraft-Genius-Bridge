@@ -19,6 +19,7 @@ cargo run -p egb -- list-serial
 ```powershell
 .\target-msvc\debug\egb.exe serial-probe --port COM21 --baud 38400 --send "^RVM;" --timeout-ms 1000
 .\target-msvc\debug\egb.exe baud-scan --port COM8
+.\target-msvc\debug\egb.exe serial-probe-batch --port COM8 --baud 38400 --send ";,RV;,SN;,AN;,BYP;,MD;,TP;,FLT;,VSWR;,VFWD;" --timeout-ms 1000
 ```
 
 7. Start with the read-only profile:

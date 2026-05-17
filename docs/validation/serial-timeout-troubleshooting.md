@@ -29,7 +29,13 @@ KAT500 baud scan:
 .\target-msvc\debug\egb.exe baud-scan --port COM8
 ```
 
-Optional KAT500 scan with version query after a wake response:
+KAT500 batch probe:
+
+```powershell
+.\target-msvc\debug\egb.exe serial-probe-batch --port COM8 --baud 38400 --send ";,RV;,SN;,AN;,BYP;,MD;,TP;,FLT;,VSWR;,VFWD;" --timeout-ms 1000
+```
+
+Optional KAT500 scan with only a version query after a wake response:
 
 ```powershell
 .\target-msvc\debug\egb.exe baud-scan --port COM8 --version-query "RV;"
@@ -61,6 +67,17 @@ If `serial-probe` returns only `;`:
 - The port and baud are probably correct.
 - The device is responding to null commands.
 - Move on to a documented read-only command, for example KPA500 `^RVM;` or KAT500 `RV;`.
+
+If `baud-scan` reports `echo only`:
+
+- The scanner received exactly the bytes it sent.
+- Treat this as inconclusive until a query returns `command response` or `echo+data`.
+- Run `serial-probe-batch` at the likely baud.
+
+If `baud-scan` reports `command response`:
+
+- The baud is likely correct.
+- Save the transcript and run the corresponding high-level `test-kat` or `test-kpa`.
 
 If KPA500 `^RVM;` works but `test-kpa` fails:
 

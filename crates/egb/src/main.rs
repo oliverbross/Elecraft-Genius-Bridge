@@ -4,10 +4,14 @@ use bridge_core::{AmpOperatingState, ConnectionState, SharedState};
 use clap::{Parser, Subcommand, ValueEnum};
 use egb_config::BridgeConfig;
 use elecraft_kat500::{
-    command_map as kat_command_map, CommandSafety as KatCommandSafety, Kat500Driver, Kat500Settings,
+    command_map as kat_command_map, read_only_discovery_commands as kat_discovery_commands,
+    read_only_poll_commands as kat_poll_commands, CommandOutcome as KatCommandOutcome,
+    CommandSafety as KatCommandSafety, Kat500Driver, Kat500Settings,
 };
 use elecraft_kpa500::{
-    command_map as kpa_command_map, CommandSafety as KpaCommandSafety, Kpa500Driver, Kpa500Settings,
+    command_map as kpa_command_map, read_only_discovery_commands as kpa_discovery_commands,
+    read_only_poll_commands as kpa_poll_commands, CommandOutcome as KpaCommandOutcome,
+    CommandSafety as KpaCommandSafety, Kpa500Driver, Kpa500Settings,
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -51,6 +55,20 @@ enum Commands {
         allow_control: bool,
         #[arg(long)]
         allow_rf_risk: bool,
+    },
+    SerialProbeBatch {
+        #[arg(long)]
+        port: String,
+        #[arg(long)]
+        baud: u32,
+        #[arg(long, value_delimiter = ',')]
+        send: Vec<String>,
+        #[arg(long, default_value_t = 1000)]
+        timeout_ms: u64,
+        #[arg(long, value_enum, default_value_t = SerialTerminator::None)]
+        terminator: SerialTerminator,
+        #[arg(long, default_value = "logs/serial")]
+        transcript_dir: PathBuf,
     },
     SerialProbe {
         #[arg(long)]
@@ -144,6 +162,25 @@ async fn main() -> Result<()> {
         } => {
             init_logging("info");
             serial_probe(
+                &port,
+                baud,
+                &send,
+                terminator,
+                Duration::from_millis(timeout_ms),
+                Some(transcript_dir),
+            )
+            .await
+        }
+        Commands::SerialProbeBatch {
+            port,
+            baud,
+            send,
+            timeout_ms,
+            terminator,
+            transcript_dir,
+        } => {
+            init_logging("info");
+            serial_probe_batch(
                 &port,
                 baud,
                 &send,
@@ -514,7 +551,59 @@ async fn serial_probe(
         .context("failed to flush serial port")?;
     let response = read_available_response(&mut stream, wait).await?;
     append_probe_transcript(&transcript_path, "RX", &response).await;
-    print_serial_response(&response);
+    print_serial_response(&bytes, &response);
+    Ok(())
+}
+
+async fn serial_probe_batch(
+    port: &str,
+    baud: u32,
+    sends: &[String],
+    terminator: SerialTerminator,
+    wait: Duration,
+    transcript_dir: Option<PathBuf>,
+) -> Result<()> {
+    println!(
+        "serial-probe-batch port={port} baud={baud} commands={} terminator={terminator:?} timeout_ms={}",
+        sends.len(),
+        wait.as_millis()
+    );
+    let mut stream = tokio_serial::new(port, baud)
+        .open_native_async()
+        .with_context(|| format!("failed to open serial port {port} at {baud} baud"))?;
+    let transcript_path =
+        write_probe_transcript_header(&transcript_dir, port, baud, "probe-batch").await;
+    if let Some(path) = &transcript_path {
+        println!("transcript={}", path.display());
+    }
+    for send in sends {
+        let mut bytes = send.as_bytes().to_vec();
+        append_terminator(&mut bytes, terminator);
+        append_probe_transcript(&transcript_path, "TX", &bytes).await;
+        stream
+            .write_all(&bytes)
+            .await
+            .with_context(|| format!("failed to write serial probe command {send}"))?;
+        stream
+            .flush()
+            .await
+            .context("failed to flush serial port")?;
+        match read_available_response(&mut stream, wait).await {
+            Ok(response) => {
+                append_probe_transcript(&transcript_path, "RX", &response).await;
+                print!("command={} ", printable_bytes(&bytes));
+                print_serial_response_inline(&bytes, &response);
+                println!();
+            }
+            Err(err) => {
+                println!(
+                    "command={} classification=no response error={err}",
+                    printable_bytes(&bytes)
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     Ok(())
 }
 
@@ -530,34 +619,33 @@ async fn baud_scan(
         wait.as_millis(),
         version_query.unwrap_or("(none)")
     );
+    let default_queries = ["RV;", "SN;", "AN;", "BYP;"];
     let transcript_path =
         write_probe_transcript_header(&transcript_dir, port, 0, "baud-scan").await;
     if let Some(path) = &transcript_path {
         println!("transcript={}", path.display());
     }
     for baud in bauds {
-        print!("baud {baud}: ");
+        println!("baud {baud}:");
         match tokio_serial::new(port, baud).open_native_async() {
             Ok(mut stream) => {
-                let mut saw_bytes = false;
+                let mut wake_response = None;
                 for _ in 0..4 {
                     append_probe_transcript(&transcript_path, &format!("TX {baud}"), b";").await;
                     if let Err(err) = stream.write_all(b";").await {
-                        println!("write failed: {err}");
+                        println!("  wake write failed: {err}");
                         break;
                     }
                     let _ = stream.flush().await;
                     match read_available_response(&mut stream, wait).await {
                         Ok(response) if !response.is_empty() => {
-                            saw_bytes = true;
                             append_probe_transcript(
                                 &transcript_path,
                                 &format!("RX {baud}"),
                                 &response,
                             )
                             .await;
-                            print!("wake bytes={} ", response.len());
-                            print_serial_response_inline(&response);
+                            wake_response = Some(response);
                             break;
                         }
                         Ok(_) | Err(_) => {
@@ -565,41 +653,66 @@ async fn baud_scan(
                         }
                     }
                 }
-                if saw_bytes {
-                    if let Some(query) = version_query {
-                        let query_bytes = query.as_bytes();
-                        append_probe_transcript(
-                            &transcript_path,
-                            &format!("TX {baud}"),
-                            query_bytes,
-                        )
-                        .await;
-                        stream
-                            .write_all(query_bytes)
-                            .await
-                            .context("failed to write baud-scan version query")?;
-                        stream
-                            .flush()
-                            .await
-                            .context("failed to flush serial port")?;
-                        match read_available_response(&mut stream, wait).await {
-                            Ok(response) => {
-                                append_probe_transcript(
-                                    &transcript_path,
-                                    &format!("RX {baud}"),
-                                    &response,
-                                )
-                                .await;
-                                print!("version ");
-                                print_serial_response_inline(&response);
-                            }
-                            Err(err) => print!("version timeout: {err}"),
-                        }
-                    }
+                if let Some(response) = wake_response {
+                    print!("  wake ");
+                    print_serial_response_inline(b";", &response);
                     println!();
                 } else {
-                    println!("no bytes returned");
+                    println!("  wake classification=no response");
                 }
+                let queries: Vec<&str> = if let Some(query) = version_query {
+                    vec![query]
+                } else {
+                    default_queries.to_vec()
+                };
+                let mut command_response_count = 0_u32;
+                for query in queries {
+                    let query_bytes = query.as_bytes();
+                    append_probe_transcript(&transcript_path, &format!("TX {baud}"), query_bytes)
+                        .await;
+                    stream
+                        .write_all(query_bytes)
+                        .await
+                        .context("failed to write baud-scan query")?;
+                    stream
+                        .flush()
+                        .await
+                        .context("failed to flush serial port")?;
+                    match read_available_response(&mut stream, wait).await {
+                        Ok(response) => {
+                            append_probe_transcript(
+                                &transcript_path,
+                                &format!("RX {baud}"),
+                                &response,
+                            )
+                            .await;
+                            let classification = classify_response(query_bytes, &response);
+                            if matches!(
+                                classification,
+                                ResponseClassification::CommandResponse
+                                    | ResponseClassification::EchoWithData
+                            ) {
+                                command_response_count += 1;
+                            }
+                            print!("  query={} ", printable_bytes(query_bytes));
+                            print_serial_response_inline(query_bytes, &response);
+                            println!();
+                        }
+                        Err(err) => println!(
+                            "  query={} classification=no response error={err}",
+                            printable_bytes(query_bytes)
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                println!(
+                    "  likely_baud={}",
+                    if command_response_count > 0 {
+                        "yes"
+                    } else {
+                        "unknown-echo-only-or-no-command-response"
+                    }
+                );
             }
             Err(err) => println!("open failed: {err}"),
         }
@@ -641,15 +754,51 @@ async fn read_available_response(stream: &mut SerialStream, wait: Duration) -> R
     }
 }
 
-fn print_serial_response(response: &[u8]) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseClassification {
+    NoResponse,
+    EchoOnly,
+    EchoWithData,
+    CommandResponse,
+}
+
+impl ResponseClassification {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoResponse => "no response",
+            Self::EchoOnly => "echo only",
+            Self::EchoWithData => "echo+data",
+            Self::CommandResponse => "command response",
+        }
+    }
+}
+
+fn classify_response(sent: &[u8], response: &[u8]) -> ResponseClassification {
+    if response.is_empty() {
+        return ResponseClassification::NoResponse;
+    }
+    if response == sent {
+        return ResponseClassification::EchoOnly;
+    }
+    if response.starts_with(sent) {
+        return ResponseClassification::EchoWithData;
+    }
+    ResponseClassification::CommandResponse
+}
+
+fn print_serial_response(sent: &[u8], response: &[u8]) {
+    let classification = classify_response(sent, response);
     println!("response bytes={}", response.len());
+    println!("classification={}", classification.label());
     println!("hex={}", hex_bytes(response));
     println!("printable={}", printable_bytes(response));
 }
 
-fn print_serial_response_inline(response: &[u8]) {
+fn print_serial_response_inline(sent: &[u8], response: &[u8]) {
+    let classification = classify_response(sent, response);
     print!(
-        "hex={} printable={}",
+        "classification={} hex={} printable={}",
+        classification.label(),
         hex_bytes(response),
         printable_bytes(response)
     );
@@ -771,8 +920,16 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         shared_default_state(),
     );
     driver.connect().await?;
-    println!("KPA500 read-only test: sending ^OS;, ^WS;, ^TM;, ^VI;, ^FL; safety=ReadOnly");
-    driver.poll_status().await?;
+    println!(
+        "KPA500 discovery commands: {}",
+        command_wires(kpa_discovery_commands())
+    );
+    println!(
+        "KPA500 read-only poll commands: {}",
+        command_wires(kpa_poll_commands())
+    );
+    let outcomes = driver.poll_status_outcomes().await?;
+    print_kpa_outcome_summary(&outcomes);
     if allow_control {
         println!("KPA500 control test: sending set_standby wire=^OS0; safety=StateChangeSafe");
         driver.set_standby().await?;
@@ -824,7 +981,16 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     println!(
         "KAT500 read-only test: wake/baud discovery, then RV;, SN;, AN;, BYP;, MD;, TP;, FLT;, VSWR;, VFWD;"
     );
-    driver.poll_status().await?;
+    println!(
+        "KAT500 discovery commands: {}",
+        command_wires(kat_discovery_commands())
+    );
+    println!(
+        "KAT500 read-only poll commands: {}",
+        command_wires(kat_poll_commands())
+    );
+    let outcomes = driver.poll_status_outcomes().await?;
+    print_kat_outcome_summary(&outcomes);
     if allow_control {
         println!("KAT500 control test: sending set_bypass_on wire=BYPB; safety=StateChangeSafe");
         driver.set_bypass(true).await?;
@@ -834,6 +1000,91 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         driver.autotune().await?;
     }
     Ok(())
+}
+
+fn command_wires<T>(commands: &[T]) -> String
+where
+    T: CommandWire,
+{
+    commands
+        .iter()
+        .map(CommandWire::wire)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+trait CommandWire {
+    fn wire(&self) -> &'static str;
+}
+
+impl CommandWire for elecraft_kpa500::ElecraftCommand {
+    fn wire(&self) -> &'static str {
+        self.wire
+    }
+}
+
+impl CommandWire for elecraft_kat500::ElecraftCommand {
+    fn wire(&self) -> &'static str {
+        self.wire
+    }
+}
+
+fn print_kpa_outcome_summary(outcomes: &[KpaCommandOutcome]) {
+    let succeeded = outcomes
+        .iter()
+        .filter(|outcome| outcome.response.is_some())
+        .map(|outcome| outcome.command.label)
+        .collect::<Vec<_>>();
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.error.is_some())
+        .map(|outcome| outcome.command.label)
+        .collect::<Vec<_>>();
+    println!("KPA500 read-only summary:");
+    println!("  succeeded={}", succeeded.join(", "));
+    println!("  timeout_or_failed={}", failed.join(", "));
+    for outcome in outcomes {
+        match (&outcome.response, &outcome.error) {
+            (Some(response), _) => println!(
+                "  ok {} wire={} response={}",
+                outcome.command.label, outcome.command.wire, response
+            ),
+            (_, Some(error)) => println!(
+                "  failed {} wire={} error={}",
+                outcome.command.label, outcome.command.wire, error
+            ),
+            _ => {}
+        }
+    }
+}
+
+fn print_kat_outcome_summary(outcomes: &[KatCommandOutcome]) {
+    let succeeded = outcomes
+        .iter()
+        .filter(|outcome| outcome.response.is_some())
+        .map(|outcome| outcome.command.label)
+        .collect::<Vec<_>>();
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.error.is_some())
+        .map(|outcome| outcome.command.label)
+        .collect::<Vec<_>>();
+    println!("KAT500 read-only summary:");
+    println!("  succeeded={}", succeeded.join(", "));
+    println!("  timeout_or_failed={}", failed.join(", "));
+    for outcome in outcomes {
+        match (&outcome.response, &outcome.error) {
+            (Some(response), _) => println!(
+                "  ok {} wire={} response={}",
+                outcome.command.label, outcome.command.wire, response
+            ),
+            (_, Some(error)) => println!(
+                "  failed {} wire={} error={}",
+                outcome.command.label, outcome.command.wire, error
+            ),
+            _ => {}
+        }
+    }
 }
 
 fn print_kpa_command_summary(
