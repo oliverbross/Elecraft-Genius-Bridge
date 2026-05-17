@@ -1,0 +1,4 @@
+TX ^OS0;
+RX ^OS0;
+TX ^OS0;
+RX ^OS0;

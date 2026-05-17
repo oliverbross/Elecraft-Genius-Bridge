@@ -888,4 +888,17 @@ mod tests {
             assert_ne!(command.wire, "FC;");
         }
     }
+
+    #[test]
+    fn standby_control_fixture_contains_only_safe_command() {
+        let fixture = include_str!("../../../tests/fixtures/kpa500-standby-control-com21.txt");
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                line.ends_with("^OS0;"),
+                "unexpected unsafe standby-control fixture line: {line}"
+            );
+            assert!(!line.contains("^OS1;"));
+            assert!(!line.contains("^FLC;"));
+        }
+    }
 }

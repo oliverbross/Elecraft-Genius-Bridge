@@ -13,7 +13,7 @@ use elecraft_kpa500::{
     read_only_poll_commands as kpa_poll_commands, CommandOutcome as KpaCommandOutcome,
     CommandSafety as KpaCommandSafety, Kpa500Driver, Kpa500Settings,
 };
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -885,6 +885,7 @@ fn timestamp_millis() -> u128 {
 
 async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) -> Result<()> {
     println!("KPA500 safety summary:");
+    print_bind_safety(cfg)?;
     println!(
         "  port={} baud={} mock={} dry_run={}",
         cfg.kpa500.com_port, cfg.kpa500.baud, cfg.kpa500.mock, cfg.kpa500.dry_run
@@ -931,18 +932,31 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     let outcomes = driver.poll_status_outcomes().await?;
     print_kpa_outcome_summary(&outcomes);
     if allow_control {
+        ensure_local_or_lan_bind(cfg)?;
+        println!("KPA500 safe-control summary:");
+        println!("  allow_control=true");
+        println!("  allow_rf_risk={allow_rf_risk}");
+        println!("  WILL SEND: set_standby wire=^OS0; safety=StateChangeSafe");
+        println!("  WILL NOT SEND without --allow-rf-risk: set_operate wire=^OS1; safety=RfRisk");
+        println!("  rollback: force standby (^OS0;) after control test");
         println!("KPA500 control test: sending set_standby wire=^OS0; safety=StateChangeSafe");
+        driver.set_standby().await?;
+        println!("KPA500 rollback: sending set_standby wire=^OS0; safety=StateChangeSafe");
         driver.set_standby().await?;
     }
     if allow_rf_risk {
+        ensure_local_or_lan_bind(cfg)?;
         println!("KPA500 RF-risk test: sending set_operate wire=^OS1; safety=RfRisk");
         driver.set_operate().await?;
+        println!("KPA500 rollback: sending set_standby wire=^OS0; safety=StateChangeSafe");
+        driver.set_standby().await?;
     }
     Ok(())
 }
 
 async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) -> Result<()> {
     println!("KAT500 safety summary:");
+    print_bind_safety(cfg)?;
     println!(
         "  port={} baud={} mock={} dry_run={}",
         cfg.kat500.com_port, cfg.kat500.baud, cfg.kat500.mock, cfg.kat500.dry_run
@@ -994,14 +1008,74 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     print_kat_outcome_summary(&outcomes);
     print_kat_parsed_state(&state).await;
     if allow_control {
-        println!("KAT500 control test: sending set_bypass_on wire=BYPB; safety=StateChangeSafe");
-        driver.set_bypass(true).await?;
+        println!("KAT500 control request blocked in Phase 12: bypass and antenna changes remain disabled");
     }
     if allow_rf_risk {
-        println!("KAT500 RF-risk test: sending autotune wire=T; safety=RfRisk");
-        driver.autotune().await?;
+        println!("KAT500 RF-risk request blocked in Phase 12: tune remains disabled");
     }
     Ok(())
+}
+
+fn print_bind_safety(cfg: &BridgeConfig) -> Result<()> {
+    let server_ip = parse_ip("server.bind_ip", &cfg.server.bind_ip)?;
+    let metrics_ip = parse_ip("metrics.bind_ip", &cfg.metrics.bind_ip)?;
+    println!(
+        "  bind server={} scope={} metrics={} scope={}",
+        cfg.server.bind_ip,
+        bind_scope(server_ip),
+        cfg.metrics.bind_ip,
+        bind_scope(metrics_ip)
+    );
+    Ok(())
+}
+
+fn ensure_local_or_lan_bind(cfg: &BridgeConfig) -> Result<()> {
+    let server_ip = parse_ip("server.bind_ip", &cfg.server.bind_ip)?;
+    let metrics_ip = parse_ip("metrics.bind_ip", &cfg.metrics.bind_ip)?;
+    if !is_local_or_private(server_ip) {
+        anyhow::bail!(
+            "refusing control test: server.bind_ip={} is not loopback/private LAN",
+            cfg.server.bind_ip
+        );
+    }
+    if cfg.metrics.enabled && !is_local_or_private(metrics_ip) {
+        anyhow::bail!(
+            "refusing control test: metrics.bind_ip={} is not loopback/private LAN",
+            cfg.metrics.bind_ip
+        );
+    }
+    Ok(())
+}
+
+fn parse_ip(label: &str, value: &str) -> Result<IpAddr> {
+    value
+        .parse()
+        .with_context(|| format!("{label} passed config validation but failed to parse"))
+}
+
+fn bind_scope(ip: IpAddr) -> &'static str {
+    if ip.is_loopback() {
+        "loopback"
+    } else if is_private_lan(ip) {
+        "private-lan"
+    } else if ip.is_unspecified() {
+        "public-or-all-interfaces"
+    } else {
+        "public-or-non-private"
+    }
+}
+
+fn is_local_or_private(ip: IpAddr) -> bool {
+    ip.is_loopback() || is_private_lan(ip)
+}
+
+fn is_private_lan(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(value) => {
+            value.is_private() || (value.octets()[0] == 169 && value.octets()[1] == 254)
+        }
+        IpAddr::V6(value) => value.segments()[0] & 0xfe00 == 0xfc00 || value == Ipv6Addr::LOCALHOST,
+    }
 }
 
 fn command_wires<T>(commands: &[T]) -> String

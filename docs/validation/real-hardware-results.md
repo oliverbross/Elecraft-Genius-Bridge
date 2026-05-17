@@ -110,6 +110,40 @@ Next commands:
 .\target-msvc\debug\egb.exe run --config .\config.hardware-readonly.yaml
 ```
 
+## 2026-05-17 Phase 12
+
+### LAN-Only Safe Control Plan
+
+Only KPA500 standby is permitted in this phase:
+
+```text
+^OS0;
+```
+
+Blocked in this phase:
+
+- KPA500 operate `^OS1;` unless a later test explicitly uses `--allow-rf-risk`
+- KPA500 clear fault `^FLC;`
+- KAT500 tune `T;`
+- KAT500 bypass change `BYPB;` / `BYPN;`
+- KAT500 antenna change `AN<n>;`
+
+The local-control profile must stay bound to loopback or a private LAN IP. `0.0.0.0`, public IPs, and WAN forwarding are not acceptable for control validation.
+
+Expected safe-control test:
+
+```powershell
+.\target-msvc\debug\egb.exe test-kpa --config .\config.hardware-control-local-only.yaml --allow-control
+```
+
+Rollback behaviour: the test sends standby `^OS0;`, then sends standby `^OS0;` again as a safe rollback. It does not send operate.
+
+Regression fixture:
+
+```text
+tests/fixtures/kpa500-standby-control-com21.txt
+```
+
 ## 2026-05-17 Phase 9
 
 ### KPA500

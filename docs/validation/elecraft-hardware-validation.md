@@ -172,7 +172,9 @@ cargo run -p egb -- test-kpa --config config.hardware-control-local-only.yaml --
 cargo run -p egb -- test-kat --config config.hardware-control-local-only.yaml --allow-control
 ```
 
-6. Test KAT500 autotune only with dummy load and a safe low-power plan:
+Phase 12 note: KAT500 control remains blocked even if `--allow-control` is passed. Do not test tuner bypass, antenna change, or tune yet.
+
+6. Test KAT500 autotune only in a future phase with dummy load and a safe low-power plan:
 
 ```powershell
 cargo run -p egb -- test-kat --config config.hardware-control-local-only.yaml --allow-rf-risk

@@ -107,4 +107,4 @@ These flags only affect mock-mode state. Use them later for degraded UI testing,
 
 - `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation and TGXL direct-presence diagnostics enabled.
 - `config.hardware-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true`.
-- `config.hardware-control-local-only.yaml`: COM8/COM21 hardware mode with `dry_run: false`, loopback bind by default. Use only locally or on a private LAN after read-only validation.
+- `config.hardware-control-local-only.yaml`: COM21 KPA500 control mode with `dry_run: false`, COM8 KAT500 still `dry_run: true`, loopback bind by default. Use only locally or on a private LAN after read-only validation.
