@@ -61,4 +61,9 @@ $env:RUSTDOC = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msv
 
 That workaround passed locally.
 
-The helper script `scripts\windows\check.ps1` applies this workaround automatically when those paths exist.
+Because this workstation has both MSVC Rust `1.90.0` and MSYS Rust `1.89.0`, do not share one Cargo target directory between them. The helper script `scripts\windows\check.ps1` uses:
+
+- `target-clippy` for MSYS `cargo clippy`
+- `target-msvc` for MSVC `cargo test` and config validation
+
+This avoids incompatible cached dependency artifacts.

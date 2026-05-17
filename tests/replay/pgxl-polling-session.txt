@@ -1,0 +1,3 @@
+C1|info
+C2|status
+C3|status

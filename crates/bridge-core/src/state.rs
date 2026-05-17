@@ -38,6 +38,37 @@ pub enum AmpOperatingState {
     Fault,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Degraded,
+    Error,
+}
+
+impl ConnectionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Degraded => "degraded",
+            Self::Error => "error",
+        }
+    }
+
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::Connected)
+    }
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self::Disconnected
+    }
+}
+
 impl AmpOperatingState {
     pub fn pgxl_state(self) -> &'static str {
         match self {
@@ -65,6 +96,8 @@ pub struct BridgeState {
     pub amp: AmpState,
     pub tuner: TunerState,
     pub clients: ClientState,
+    pub desired: DesiredState,
+    pub protocol: ProtocolCounters,
 }
 
 impl Default for BridgeState {
@@ -75,6 +108,8 @@ impl Default for BridgeState {
             amp: AmpState::default(),
             tuner: TunerState::default(),
             clients: ClientState::default(),
+            desired: DesiredState::default(),
+            protocol: ProtocolCounters::default(),
         }
     }
 }
@@ -84,6 +119,7 @@ impl BridgeState {
         Self {
             amp: AmpState {
                 connected: true,
+                connection_state: ConnectionState::Connected,
                 operate: false,
                 state: AmpOperatingState::Standby,
                 forward_power_watts: 0.0,
@@ -95,11 +131,15 @@ impl BridgeState {
                 meffa: "OK".to_string(),
                 fault: None,
                 warning: None,
+                firmware_version: Some("MOCK".to_string()),
+                capabilities: vec!["mock-status".to_string()],
                 last_serial_command_at: None,
                 last_serial_response_at: None,
+                last_successful_poll_at: Some(SystemTime::now()),
             },
             tuner: TunerState {
                 connected: true,
+                connection_state: ConnectionState::Connected,
                 operate: false,
                 bypass: false,
                 tuning: false,
@@ -110,8 +150,11 @@ impl BridgeState {
                 forward_power_watts: 0.0,
                 swr: 1.05,
                 fault: None,
+                firmware_version: Some("MOCK".to_string()),
+                capabilities: vec!["mock-status".to_string()],
                 last_serial_command_at: None,
                 last_serial_response_at: None,
+                last_successful_poll_at: Some(SystemTime::now()),
             },
             ..Self::default()
         }
@@ -121,6 +164,7 @@ impl BridgeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmpState {
     pub connected: bool,
+    pub connection_state: ConnectionState,
     pub operate: bool,
     pub state: AmpOperatingState,
     pub forward_power_watts: f32,
@@ -132,16 +176,21 @@ pub struct AmpState {
     pub meffa: String,
     pub fault: Option<String>,
     pub warning: Option<String>,
+    pub firmware_version: Option<String>,
+    pub capabilities: Vec<String>,
     #[serde(skip)]
     pub last_serial_command_at: Option<SystemTime>,
     #[serde(skip)]
     pub last_serial_response_at: Option<SystemTime>,
+    #[serde(skip)]
+    pub last_successful_poll_at: Option<SystemTime>,
 }
 
 impl Default for AmpState {
     fn default() -> Self {
         Self {
             connected: false,
+            connection_state: ConnectionState::Disconnected,
             operate: false,
             state: AmpOperatingState::Standby,
             forward_power_watts: 0.0,
@@ -153,8 +202,11 @@ impl Default for AmpState {
             meffa: "UNKNOWN".to_string(),
             fault: None,
             warning: None,
+            firmware_version: None,
+            capabilities: Vec::new(),
             last_serial_command_at: None,
             last_serial_response_at: None,
+            last_successful_poll_at: None,
         }
     }
 }
@@ -162,6 +214,7 @@ impl Default for AmpState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunerState {
     pub connected: bool,
+    pub connection_state: ConnectionState,
     pub operate: bool,
     pub bypass: bool,
     pub tuning: bool,
@@ -172,16 +225,21 @@ pub struct TunerState {
     pub forward_power_watts: f32,
     pub swr: f32,
     pub fault: Option<String>,
+    pub firmware_version: Option<String>,
+    pub capabilities: Vec<String>,
     #[serde(skip)]
     pub last_serial_command_at: Option<SystemTime>,
     #[serde(skip)]
     pub last_serial_response_at: Option<SystemTime>,
+    #[serde(skip)]
+    pub last_successful_poll_at: Option<SystemTime>,
 }
 
 impl Default for TunerState {
     fn default() -> Self {
         Self {
             connected: false,
+            connection_state: ConnectionState::Disconnected,
             operate: false,
             bypass: false,
             tuning: false,
@@ -192,8 +250,11 @@ impl Default for TunerState {
             forward_power_watts: 0.0,
             swr: 1.0,
             fault: None,
+            firmware_version: None,
+            capabilities: Vec::new(),
             last_serial_command_at: None,
             last_serial_response_at: None,
+            last_successful_poll_at: None,
         }
     }
 }
@@ -204,6 +265,37 @@ pub struct ClientState {
     pub tgxl_connected: bool,
     pub pgxl_client_count: usize,
     pub tgxl_client_count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DesiredState {
+    pub amp_operate: Option<bool>,
+    pub tuner_autotune_requested: bool,
+    pub tuner_selected_antenna: Option<u8>,
+    pub tuner_bypass: Option<bool>,
+    pub tuner_manual_tune: Option<ManualTuneRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualTuneRequest {
+    pub relay: u8,
+    pub movement: i32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProtocolCounters {
+    pub pgxl: ProtocolCounterSet,
+    pub tgxl: ProtocolCounterSet,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProtocolCounterSet {
+    pub commands_received: u64,
+    pub responses_sent: u64,
+    pub parse_failures: u64,
+    pub unknown_commands: u64,
+    pub unsupported_features: u64,
+    pub unexpected_sequences: u64,
 }
 
 pub fn shared_mock_state() -> SharedState {

@@ -9,6 +9,7 @@ The current serial drivers compile and provide reconnect/poll scaffolding, but t
 | Intent | Placeholder command | Safety | Verification |
 | --- | --- | --- | --- |
 | Poll status | `ST;` | `read_only` | Unverified |
+| Read version | `RV;` | `read_only` | Unverified |
 | Operate | `OP1;` | `rf_risk` | Unverified |
 | Standby | `OP0;` | `state_change_safe` | Unverified |
 | Clear fault | `FC;` | `destructive_or_unknown` | Unverified |
@@ -18,6 +19,7 @@ The current serial drivers compile and provide reconnect/poll scaffolding, but t
 | Intent | Placeholder command | Safety | Verification |
 | --- | --- | --- | --- |
 | Poll status | `ST;` | `read_only` | Unverified |
+| Read version | `RV;` | `read_only` | Unverified |
 | Autotune | `T;` | `rf_risk` | Unverified |
 | Bypass on | `BP1;` | `state_change_safe` | Unverified |
 | Bypass off | `BP0;` | `state_change_safe` | Unverified |

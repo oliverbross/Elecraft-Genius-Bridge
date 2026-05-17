@@ -37,3 +37,8 @@ logging:
   protocol_transcript_dir:
   # When set, EGB writes one raw serial transcript file per device session.
   serial_transcript_dir:
+
+metrics:
+  enabled: false
+  bind_ip: 127.0.0.1
+  port: 9160

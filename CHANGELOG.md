@@ -9,6 +9,7 @@
 - Added validation checklists for AetherSDR mock testing and Elecraft hardware testing.
 - Added GitHub Actions CI definition.
 - Added serial transcript capture, dry-run hardware safety gates, and config profiles for mock, hardware read-only, and local-only hardware control validation.
+- Added connection-state tracking, protocol mismatch counters, replay regression tests, and a localhost-only status endpoint.
 
 ## 0.1.0
 

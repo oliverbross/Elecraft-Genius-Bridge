@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bridge_core::SharedState;
+use bridge_core::{ConnectionState, SharedState};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::fs::{create_dir_all, File};
@@ -14,6 +14,12 @@ use tracing::{debug, info, warn};
 const CMD_STATUS: ElecraftCommand = ElecraftCommand {
     label: "poll_status",
     wire: "ST;",
+    safety: CommandSafety::ReadOnly,
+    verified: false,
+};
+const CMD_VERSION: ElecraftCommand = ElecraftCommand {
+    label: "read_version",
+    wire: "RV;",
     safety: CommandSafety::ReadOnly,
     verified: false,
 };
@@ -67,6 +73,7 @@ pub struct ElecraftCommand {
 pub fn command_map() -> &'static [ElecraftCommand] {
     &[
         CMD_STATUS,
+        CMD_VERSION,
         CMD_AUTOTUNE,
         CMD_BYPASS_ON,
         CMD_BYPASS_OFF,
@@ -109,9 +116,34 @@ impl Kat500Driver {
             {
                 let mut guard = self.state.write().await;
                 guard.tuner.connected = true;
+                guard.tuner.connection_state = ConnectionState::Connected;
                 guard.tuner.last_serial_response_at = Some(SystemTime::now());
+                guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+                if let Some(antenna) = guard.desired.tuner_selected_antenna {
+                    guard.tuner.selected_antenna = Some(antenna.saturating_sub(1));
+                }
+                if let Some(bypass) = guard.desired.tuner_bypass {
+                    guard.tuner.bypass = bypass;
+                }
+                if guard.desired.tuner_autotune_requested {
+                    guard.tuner.tuning = true;
+                    guard.desired.tuner_autotune_requested = false;
+                }
+                if let Some(manual) = guard.desired.tuner_manual_tune.take() {
+                    let step = if manual.movement >= 0 { 1 } else { -1 };
+                    let target = match manual.relay {
+                        0 => Some(&mut guard.tuner.relay_c1),
+                        1 => Some(&mut guard.tuner.relay_l),
+                        2 => Some(&mut guard.tuner.relay_c2),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        *target = (*target + step).clamp(0, 255);
+                    }
+                }
                 if guard.tuner.tuning {
                     guard.tuner.swr = 1.15;
+                    guard.tuner.tuning = false;
                 }
             }
             sleep(self.settings.polling_interval).await;
@@ -134,11 +166,16 @@ impl Kat500Driver {
                     {
                         let mut guard = self.state.write().await;
                         guard.tuner.connected = true;
+                        guard.tuner.connection_state = ConnectionState::Connecting;
                     }
+                    self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
                         if let Err(err) = self.poll_status_on_port(&mut port, &mut transcript).await
                         {
-                            warn!(error = %err, "KAT500 poll failed; reconnecting");
+                            warn!(event_id = "serial_disconnected", device = "KAT500", error = %err, "KAT500 poll failed; reconnecting");
+                            let mut guard = self.state.write().await;
+                            guard.tuner.connected = false;
+                            guard.tuner.connection_state = ConnectionState::Degraded;
                             break;
                         }
                     }
@@ -151,8 +188,14 @@ impl Kat500Driver {
                     );
                     let mut guard = self.state.write().await;
                     guard.tuner.connected = false;
+                    guard.tuner.connection_state = ConnectionState::Disconnected;
                 }
             }
+            warn!(
+                event_id = "reconnect_attempt",
+                device = "KAT500",
+                "KAT500 reconnect attempt scheduled"
+            );
             sleep(Duration::from_secs(5)).await;
         }
     }
@@ -161,6 +204,7 @@ impl Kat500Driver {
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.tuner.connected = true;
+            guard.tuner.connection_state = ConnectionState::Connected;
             return Ok(());
         }
         let _port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
@@ -177,13 +221,16 @@ impl Kat500Driver {
     pub async fn disconnect(&self) {
         let mut guard = self.state.write().await;
         guard.tuner.connected = false;
+        guard.tuner.connection_state = ConnectionState::Disconnected;
     }
 
     pub async fn poll_status(&self) -> Result<()> {
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.tuner.connected = true;
+            guard.tuner.connection_state = ConnectionState::Connected;
             guard.tuner.last_serial_response_at = Some(SystemTime::now());
+            guard.tuner.last_successful_poll_at = Some(SystemTime::now());
             return Ok(());
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
@@ -303,6 +350,7 @@ impl Kat500Driver {
     fn ensure_can_send(&self, command: ElecraftCommand) -> Result<()> {
         if self.settings.dry_run && command.safety != CommandSafety::ReadOnly {
             warn!(
+                event_id = "command_blocked_by_safety",
                 device = "KAT500",
                 command = command.label,
                 wire = command.wire,
@@ -318,6 +366,31 @@ impl Kat500Driver {
         Ok(())
     }
 
+    async fn discover_capabilities(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) {
+        match send_command(port, CMD_VERSION, Duration::from_millis(750), transcript).await {
+            Ok(response) => {
+                info!(event_id = "serial_connected", device = "KAT500", response = %response, "KAT500 read-only capability discovery succeeded");
+                let mut guard = self.state.write().await;
+                guard.tuner.firmware_version = Some(response.clone());
+                if !guard
+                    .tuner
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "read_version")
+                {
+                    guard.tuner.capabilities.push("read_version".to_string());
+                }
+            }
+            Err(err) => {
+                warn!(event_id = "serial_connected", device = "KAT500", error = %err, "KAT500 read-only capability discovery did not return a version");
+            }
+        }
+    }
+
     async fn poll_status_on_port(
         &self,
         port: &mut SerialStream,
@@ -328,8 +401,18 @@ impl Kat500Driver {
         debug!(response = %response, "KAT500 status response");
         let mut guard = self.state.write().await;
         guard.tuner.connected = true;
+        guard.tuner.connection_state = ConnectionState::Connected;
         guard.tuner.last_serial_command_at = Some(SystemTime::now());
         guard.tuner.last_serial_response_at = Some(SystemTime::now());
+        guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+        if !guard
+            .tuner
+            .capabilities
+            .iter()
+            .any(|capability| capability == "poll_status")
+        {
+            guard.tuner.capabilities.push("poll_status".to_string());
+        }
         parse_unverified_status(&response, &mut guard.tuner);
         sleep(self.settings.polling_interval).await;
         Ok(())

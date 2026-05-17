@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bridge_core::{AmpOperatingState, SharedState};
+use bridge_core::{AmpOperatingState, ConnectionState, SharedState};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::fs::{create_dir_all, File};
@@ -14,6 +14,12 @@ use tracing::{debug, info, warn};
 const CMD_STATUS: ElecraftCommand = ElecraftCommand {
     label: "poll_status",
     wire: "ST;",
+    safety: CommandSafety::ReadOnly,
+    verified: false,
+};
+const CMD_VERSION: ElecraftCommand = ElecraftCommand {
+    label: "read_version",
+    wire: "RV;",
     safety: CommandSafety::ReadOnly,
     verified: false,
 };
@@ -53,7 +59,13 @@ pub struct ElecraftCommand {
 }
 
 pub fn command_map() -> &'static [ElecraftCommand] {
-    &[CMD_STATUS, CMD_OPERATE, CMD_STANDBY, CMD_CLEAR_FAULT]
+    &[
+        CMD_STATUS,
+        CMD_VERSION,
+        CMD_OPERATE,
+        CMD_STANDBY,
+        CMD_CLEAR_FAULT,
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +102,12 @@ impl Kpa500Driver {
             {
                 let mut guard = self.state.write().await;
                 guard.amp.connected = true;
+                guard.amp.connection_state = ConnectionState::Connected;
                 guard.amp.last_serial_response_at = Some(SystemTime::now());
+                guard.amp.last_successful_poll_at = Some(SystemTime::now());
+                if let Some(operate) = guard.desired.amp_operate {
+                    guard.amp.operate = operate;
+                }
                 if guard.amp.operate {
                     guard.amp.state = AmpOperatingState::Idle;
                     guard.amp.mains_volts = 230;
@@ -122,11 +139,16 @@ impl Kpa500Driver {
                     {
                         let mut guard = self.state.write().await;
                         guard.amp.connected = true;
+                        guard.amp.connection_state = ConnectionState::Connecting;
                     }
+                    self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
                         if let Err(err) = self.poll_status_on_port(&mut port, &mut transcript).await
                         {
-                            warn!(error = %err, "KPA500 poll failed; reconnecting");
+                            warn!(event_id = "serial_disconnected", device = "KPA500", error = %err, "KPA500 poll failed; reconnecting");
+                            let mut guard = self.state.write().await;
+                            guard.amp.connected = false;
+                            guard.amp.connection_state = ConnectionState::Degraded;
                             break;
                         }
                     }
@@ -139,8 +161,14 @@ impl Kpa500Driver {
                     );
                     let mut guard = self.state.write().await;
                     guard.amp.connected = false;
+                    guard.amp.connection_state = ConnectionState::Disconnected;
                 }
             }
+            warn!(
+                event_id = "reconnect_attempt",
+                device = "KPA500",
+                "KPA500 reconnect attempt scheduled"
+            );
             sleep(Duration::from_secs(5)).await;
         }
     }
@@ -149,6 +177,7 @@ impl Kpa500Driver {
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.amp.connected = true;
+            guard.amp.connection_state = ConnectionState::Connected;
             return Ok(());
         }
         let _port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
@@ -165,13 +194,16 @@ impl Kpa500Driver {
     pub async fn disconnect(&self) {
         let mut guard = self.state.write().await;
         guard.amp.connected = false;
+        guard.amp.connection_state = ConnectionState::Disconnected;
     }
 
     pub async fn poll_status(&self) -> Result<()> {
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.amp.connected = true;
+            guard.amp.connection_state = ConnectionState::Connected;
             guard.amp.last_serial_response_at = Some(SystemTime::now());
+            guard.amp.last_successful_poll_at = Some(SystemTime::now());
             return Ok(());
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
@@ -290,6 +322,7 @@ impl Kpa500Driver {
     fn ensure_can_send(&self, command: ElecraftCommand) -> Result<()> {
         if self.settings.dry_run && command.safety != CommandSafety::ReadOnly {
             warn!(
+                event_id = "command_blocked_by_safety",
                 device = "KPA500",
                 command = command.label,
                 wire = command.wire,
@@ -305,6 +338,31 @@ impl Kpa500Driver {
         Ok(())
     }
 
+    async fn discover_capabilities(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) {
+        match send_command(port, CMD_VERSION, Duration::from_millis(750), transcript).await {
+            Ok(response) => {
+                info!(event_id = "serial_connected", device = "KPA500", response = %response, "KPA500 read-only capability discovery succeeded");
+                let mut guard = self.state.write().await;
+                guard.amp.firmware_version = Some(response.clone());
+                if !guard
+                    .amp
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "read_version")
+                {
+                    guard.amp.capabilities.push("read_version".to_string());
+                }
+            }
+            Err(err) => {
+                warn!(event_id = "serial_connected", device = "KPA500", error = %err, "KPA500 read-only capability discovery did not return a version");
+            }
+        }
+    }
+
     async fn poll_status_on_port(
         &self,
         port: &mut SerialStream,
@@ -315,8 +373,18 @@ impl Kpa500Driver {
         debug!(response = %response, "KPA500 status response");
         let mut guard = self.state.write().await;
         guard.amp.connected = true;
+        guard.amp.connection_state = ConnectionState::Connected;
         guard.amp.last_serial_command_at = Some(SystemTime::now());
         guard.amp.last_serial_response_at = Some(SystemTime::now());
+        guard.amp.last_successful_poll_at = Some(SystemTime::now());
+        if !guard
+            .amp
+            .capabilities
+            .iter()
+            .any(|capability| capability == "poll_status")
+        {
+            guard.amp.capabilities.push("poll_status".to_string());
+        }
         parse_unverified_status(&response, &mut guard.amp);
         sleep(self.settings.polling_interval).await;
         Ok(())

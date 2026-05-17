@@ -14,6 +14,7 @@ egb-config = { path = "../config" }
 elecraft-kat500 = { path = "../elecraft-kat500" }
 elecraft-kpa500 = { path = "../elecraft-kpa500" }
 pgxl-emulator = { path = "../pgxl-emulator" }
+serde_json.workspace = true
 test-harness = { path = "../test-harness" }
 tgxl-emulator = { path = "../tgxl-emulator" }
 tokio.workspace = true
@@ -24,4 +25,3 @@ tracing-subscriber.workspace = true
 [[bin]]
 name = "egb"
 path = "src/main.rs"
-

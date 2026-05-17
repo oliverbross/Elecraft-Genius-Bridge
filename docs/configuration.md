@@ -72,6 +72,17 @@ Set `protocol_transcript_dir` to write one timestamped transcript file per clien
 
 Set `serial_transcript_dir` to write one timestamped KPA500/KAT500 serial transcript per device session. Transcript write failures are logged and then disabled for that session so polling is not blocked.
 
+## Metrics
+
+```yaml
+metrics:
+  enabled: true
+  bind_ip: 127.0.0.1
+  port: 9160
+```
+
+When enabled, `GET /status` returns localhost-only JSON with connection states, poll timestamps, firmware/capability fields, protocol counters, and client counts. The endpoint refuses non-loopback binds.
+
 ## Profiles
 
 - `config.mock.yaml`: no hardware required, protocol trace enabled.

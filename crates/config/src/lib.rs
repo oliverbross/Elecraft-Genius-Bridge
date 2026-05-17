@@ -32,6 +32,7 @@ pub struct BridgeConfig {
     pub kat500: SerialDeviceConfig,
     pub security: SecurityConfig,
     pub logging: LoggingConfig,
+    pub metrics: MetricsConfig,
 }
 
 impl BridgeConfig {
@@ -59,6 +60,15 @@ impl BridgeConfig {
         })?;
         validate_port("pgxl.port", self.pgxl.port)?;
         validate_port("tgxl.port", self.tgxl.port)?;
+        if self.metrics.enabled {
+            self.metrics.bind_ip.parse::<IpAddr>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "metrics.bind_ip is not an IP address: {}",
+                    self.metrics.bind_ip
+                ))
+            })?;
+            validate_port("metrics.port", self.metrics.port)?;
+        }
         self.kpa500.validate("kpa500")?;
         self.kat500.validate("kat500")?;
         Ok(())
@@ -89,6 +99,7 @@ impl Default for BridgeConfig {
             },
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -204,6 +215,24 @@ impl Default for LoggingConfig {
             protocol_trace: false,
             protocol_transcript_dir: None,
             serial_transcript_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    pub enabled: bool,
+    pub bind_ip: String,
+    pub port: u16,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_ip: "127.0.0.1".to_string(),
+            port: 9160,
         }
     }
 }

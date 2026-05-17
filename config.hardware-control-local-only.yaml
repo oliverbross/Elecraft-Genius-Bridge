@@ -34,3 +34,8 @@ logging:
   protocol_trace: true
   protocol_transcript_dir: logs/protocol
   serial_transcript_dir: logs/serial
+
+metrics:
+  enabled: true
+  bind_ip: 127.0.0.1
+  port: 9160

@@ -22,6 +22,9 @@ Current status: MVP implementation scaffold with mock PGXL/TGXL emulators and co
 - Optional raw protocol trace logs and per-client transcript files.
 - Optional KPA500/KAT500 serial transcript files.
 - Dry-run hardware mode that opens COM ports and blocks non-read-only serial commands.
+- Shared connection-state model with degraded-state reporting and protocol counters.
+- Localhost-only `GET /status` metrics endpoint when enabled.
+- Replay regression tests for PGXL/TGXL polling sessions.
 - CLI commands:
   - `egb run --config config.yaml`
   - `egb check-config --config config.yaml`

@@ -12,3 +12,5 @@ bridge-core = { path = "../bridge-core" }
 pgxl-emulator = { path = "../pgxl-emulator" }
 tgxl-emulator = { path = "../tgxl-emulator" }
 
+[dev-dependencies]
+tokio.workspace = true

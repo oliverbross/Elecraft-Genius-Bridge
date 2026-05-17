@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
+use bridge_core::{ConnectionState, SharedState};
 use clap::{Parser, Subcommand};
 use egb_config::BridgeConfig;
 use elecraft_kat500::{
@@ -10,9 +11,11 @@ use elecraft_kpa500::{
 };
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio_serial::SerialPortType;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -198,12 +201,154 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
         });
     }
 
+    if cfg.metrics.enabled {
+        let bind_ip: IpAddr = cfg
+            .metrics
+            .bind_ip
+            .parse()
+            .context("metrics.bind_ip passed validation but failed to parse")?;
+        let addr = SocketAddr::new(bind_ip, cfg.metrics.port);
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_metrics_endpoint(addr, state).await {
+                error!(error = %err, "metrics endpoint stopped");
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let amp_after = Duration::from_millis(cfg.kpa500.polling_interval_ms.saturating_mul(3));
+        let tuner_after = Duration::from_millis(cfg.kat500.polling_interval_ms.saturating_mul(3));
+        tokio::spawn(async move {
+            stale_state_watchdog(
+                state,
+                amp_after.max(Duration::from_secs(3)),
+                tuner_after.max(Duration::from_secs(3)),
+            )
+            .await;
+        });
+    }
+
     info!("Elecraft Genius Bridge running; press Ctrl+C to stop");
     tokio::signal::ctrl_c()
         .await
         .context("failed waiting for Ctrl+C")?;
     info!("shutdown requested");
     Ok(())
+}
+
+async fn stale_state_watchdog(
+    state: SharedState,
+    amp_stale_after: Duration,
+    tuner_stale_after: Duration,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let now = SystemTime::now();
+        let mut guard = state.write().await;
+        if guard.amp.connection_state == ConnectionState::Connected
+            && is_stale(guard.amp.last_successful_poll_at, now, amp_stale_after)
+        {
+            guard.amp.connection_state = ConnectionState::Degraded;
+            guard.amp.connected = false;
+            warn!(
+                event_id = "stale_device_state",
+                device = "KPA500",
+                stale_after_ms = amp_stale_after.as_millis(),
+                "KPA500 state degraded because polling timestamp is stale"
+            );
+        }
+        if guard.tuner.connection_state == ConnectionState::Connected
+            && is_stale(guard.tuner.last_successful_poll_at, now, tuner_stale_after)
+        {
+            guard.tuner.connection_state = ConnectionState::Degraded;
+            guard.tuner.connected = false;
+            warn!(
+                event_id = "stale_device_state",
+                device = "KAT500",
+                stale_after_ms = tuner_stale_after.as_millis(),
+                "KAT500 state degraded because polling timestamp is stale"
+            );
+        }
+    }
+}
+
+fn is_stale(last_poll: Option<SystemTime>, now: SystemTime, stale_after: Duration) -> bool {
+    last_poll
+        .and_then(|last| now.duration_since(last).ok())
+        .is_some_and(|elapsed| elapsed > stale_after)
+}
+
+async fn run_metrics_endpoint(addr: SocketAddr, state: SharedState) -> Result<()> {
+    if !addr.ip().is_loopback() {
+        anyhow::bail!("metrics endpoint must bind to a loopback address");
+    }
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind metrics endpoint on {addr}"))?;
+    info!(%addr, "metrics endpoint listening");
+    loop {
+        let (mut socket, peer) = listener.accept().await?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            let mut request = [0_u8; 1024];
+            let read = socket.read(&mut request).await.unwrap_or_default();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let status = if request.starts_with("GET /status ") {
+                let body = status_json(&state).await;
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                let body = "{\"error\":\"not_found\"}";
+                format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            if let Err(err) = socket.write_all(status.as_bytes()).await {
+                warn!(%peer, error = %err, "failed to write metrics response");
+            }
+        });
+    }
+}
+
+async fn status_json(state: &SharedState) -> String {
+    let guard = state.read().await;
+    serde_json::json!({
+        "amp": {
+            "connection_state": guard.amp.connection_state.as_str(),
+            "connected": guard.amp.connected,
+            "firmware_version": guard.amp.firmware_version,
+            "capabilities": guard.amp.capabilities,
+            "last_successful_poll_ms": system_time_ms(guard.amp.last_successful_poll_at),
+        },
+        "tuner": {
+            "connection_state": guard.tuner.connection_state.as_str(),
+            "connected": guard.tuner.connected,
+            "firmware_version": guard.tuner.firmware_version,
+            "capabilities": guard.tuner.capabilities,
+            "last_successful_poll_ms": system_time_ms(guard.tuner.last_successful_poll_at),
+        },
+        "clients": {
+            "pgxl_client_count": guard.clients.pgxl_client_count,
+            "tgxl_client_count": guard.clients.tgxl_client_count,
+        },
+        "protocol": guard.protocol,
+    })
+    .to_string()
+}
+
+fn system_time_ms(value: Option<SystemTime>) -> Option<u128> {
+    value.and_then(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis())
+    })
 }
 
 fn init_logging(level: &str) {

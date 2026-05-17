@@ -24,7 +24,25 @@ if (Test-Path $Rustdoc) {
 }
 
 & $Cargo fmt --all -- --check
-& $Cargo clippy --workspace --all-targets -- -D warnings
+
+if (Test-Path (Join-Path $MsysTools "cargo-clippy.exe")) {
+    Write-Host "Running clippy with isolated target-clippy"
+    Remove-Item Env:RUSTC -ErrorAction SilentlyContinue
+    Remove-Item Env:RUSTDOC -ErrorAction SilentlyContinue
+    $env:CARGO_TARGET_DIR = "target-clippy"
+    & cargo clippy --workspace --all-targets -- -D warnings
+} else {
+    throw "cargo-clippy was not found. Install rustup component clippy or provide C:\JTSDK64-Tools\tools\msys64\mingw64\bin\cargo-clippy.exe."
+}
+
+if (Test-Path $Rustc) {
+    $env:RUSTC = $Rustc
+}
+if (Test-Path $Rustdoc) {
+    $env:RUSTDOC = $Rustdoc
+}
+$env:CARGO_TARGET_DIR = "target-msvc"
+Write-Host "Running tests and config validation with isolated target-msvc"
 & $Cargo test --workspace
 & $Cargo run -p egb -- check-config --config config.example.yaml
 & $Cargo run -p egb -- check-config --config config.mock.yaml

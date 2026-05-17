@@ -1,0 +1,5 @@
+C1|info
+C2|status
+C3|activate ant=2
+C4|tune relay=0 move=1
+C5|status
