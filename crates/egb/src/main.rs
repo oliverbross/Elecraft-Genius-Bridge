@@ -16,7 +16,7 @@ use elecraft_kpa500::{
 };
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_serial::{SerialPortBuilderExt, SerialPortType, SerialStream};
@@ -35,6 +35,12 @@ enum Commands {
     Run {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
+    },
+    SoakTest {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        duration_hours: f64,
     },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
@@ -121,6 +127,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_bridge(cfg).await
+        }
+        Commands::SoakTest {
+            config,
+            duration_hours,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_soak_test(cfg, duration_hours).await
         }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
@@ -217,14 +231,14 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
+async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
     let all_mock = cfg.kpa500.mock && cfg.kat500.mock;
     let state = if all_mock {
         shared_mock_state()
     } else {
         shared_default_state()
     };
-    apply_mock_config(&cfg, &state).await;
+    apply_mock_config(cfg, &state).await;
 
     if cfg.kpa500.enabled {
         let driver = Kpa500Driver::new(
@@ -235,6 +249,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 mock: cfg.kpa500.mock,
                 dry_run: cfg.kpa500.dry_run,
                 control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
+                transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
                     .logging
                     .serial_transcript_dir
@@ -254,6 +269,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
                 mock: cfg.kat500.mock,
                 dry_run: cfg.kat500.dry_run,
+                transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
                     .logging
                     .serial_transcript_dir
@@ -281,6 +297,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 .protocol_transcript_dir
                 .as_ref()
                 .map(PathBuf::from),
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             strict_emulation: cfg.pgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.pgxl.startup_delay_ms),
         };
@@ -301,6 +318,7 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
                 .protocol_transcript_dir
                 .as_ref()
                 .map(PathBuf::from),
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             strict_emulation: cfg.tgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.tgxl.startup_delay_ms),
             force_presence_test: cfg.tgxl.force_presence_test,
@@ -341,11 +359,52 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
         });
     }
 
+    Ok(state)
+}
+
+async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
+    let _state = start_bridge(&cfg).await?;
     info!("Elecraft Genius Bridge running; press Ctrl+C to stop");
     tokio::signal::ctrl_c()
         .await
         .context("failed waiting for Ctrl+C")?;
     info!("shutdown requested");
+    Ok(())
+}
+
+async fn run_soak_test(cfg: BridgeConfig, duration_hours: f64) -> Result<()> {
+    if !duration_hours.is_finite() || duration_hours <= 0.0 {
+        anyhow::bail!("--duration-hours must be a finite value greater than 0");
+    }
+    let state = start_bridge(&cfg).await?;
+    let duration = Duration::from_secs_f64(duration_hours * 3600.0);
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.tick().await;
+    info!(
+        duration_hours,
+        duration_secs = duration.as_secs(),
+        "soak test started"
+    );
+    print_soak_summary(&state, started.elapsed()).await;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                break;
+            }
+            _ = interval.tick() => {
+                print_soak_summary(&state, started.elapsed()).await;
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for Ctrl+C")?;
+                info!("soak test interrupted by Ctrl+C");
+                break;
+            }
+        }
+    }
+    print_soak_summary(&state, started.elapsed()).await;
+    info!("soak test finished");
     Ok(())
 }
 
@@ -393,6 +452,8 @@ async fn stale_state_watchdog(
         {
             guard.amp.connection_state = ConnectionState::Degraded;
             guard.amp.connected = false;
+            guard.amp.runtime.stale_transition_count =
+                guard.amp.runtime.stale_transition_count.saturating_add(1);
             warn!(
                 event_id = "stale_device_state",
                 device = "KPA500",
@@ -405,6 +466,8 @@ async fn stale_state_watchdog(
         {
             guard.tuner.connection_state = ConnectionState::Degraded;
             guard.tuner.connected = false;
+            guard.tuner.runtime.stale_transition_count =
+                guard.tuner.runtime.stale_transition_count.saturating_add(1);
             warn!(
                 event_id = "stale_device_state",
                 device = "KAT500",
@@ -467,6 +530,8 @@ async fn status_json(state: &SharedState) -> String {
             "firmware_version": guard.amp.firmware_version,
             "capabilities": guard.amp.capabilities,
             "last_successful_poll_ms": system_time_ms(guard.amp.last_successful_poll_at),
+            "stale_duration_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
+            "runtime": runtime_json(&guard.amp.runtime),
         },
         "tuner": {
             "connection_state": guard.tuner.connection_state.as_str(),
@@ -474,8 +539,12 @@ async fn status_json(state: &SharedState) -> String {
             "firmware_version": guard.tuner.firmware_version,
             "capabilities": guard.tuner.capabilities,
             "last_successful_poll_ms": system_time_ms(guard.tuner.last_successful_poll_at),
+            "stale_duration_ms": stale_duration_ms(guard.tuner.last_successful_poll_at),
+            "runtime": runtime_json(&guard.tuner.runtime),
         },
         "clients": {
+            "pgxl_connected": guard.clients.pgxl_connected,
+            "tgxl_connected": guard.clients.tgxl_connected,
             "pgxl_client_count": guard.clients.pgxl_client_count,
             "tgxl_client_count": guard.clients.tgxl_client_count,
         },
@@ -484,12 +553,83 @@ async fn status_json(state: &SharedState) -> String {
     .to_string()
 }
 
+async fn print_soak_summary(state: &SharedState, elapsed: Duration) {
+    let guard = state.read().await;
+    info!(
+        event_id = "soak_summary",
+        elapsed_secs = elapsed.as_secs(),
+        amp_state = guard.amp.connection_state.as_str(),
+        amp_poll_success = guard.amp.runtime.poll_success_count,
+        amp_poll_failures = guard.amp.runtime.poll_failure_count,
+        amp_reconnects = guard.amp.runtime.reconnect_count,
+        amp_stale_transitions = guard.amp.runtime.stale_transition_count,
+        amp_avg_poll_latency_ms = guard.amp.runtime.average_poll_latency_ms(),
+        amp_max_poll_latency_ms = guard.amp.runtime.max_poll_latency_ms,
+        amp_stale_duration_ms = stale_duration_ms(guard.amp.last_successful_poll_at),
+        tuner_state = guard.tuner.connection_state.as_str(),
+        tuner_poll_success = guard.tuner.runtime.poll_success_count,
+        tuner_poll_failures = guard.tuner.runtime.poll_failure_count,
+        tuner_reconnects = guard.tuner.runtime.reconnect_count,
+        tuner_stale_transitions = guard.tuner.runtime.stale_transition_count,
+        tuner_avg_poll_latency_ms = guard.tuner.runtime.average_poll_latency_ms(),
+        tuner_max_poll_latency_ms = guard.tuner.runtime.max_poll_latency_ms,
+        tuner_stale_duration_ms = stale_duration_ms(guard.tuner.last_successful_poll_at),
+        pgxl_clients = guard.clients.pgxl_client_count,
+        tgxl_clients = guard.clients.tgxl_client_count,
+        pgxl_unknown = guard.protocol.pgxl.unknown_commands,
+        pgxl_parse_failures = guard.protocol.pgxl.parse_failures,
+        tgxl_unknown = guard.protocol.tgxl.unknown_commands,
+        tgxl_parse_failures = guard.protocol.tgxl.parse_failures,
+        "soak health summary"
+    );
+    println!(
+        "soak elapsed={}s amp={} ok={} fail={} reconnect={} stale={} avg_ms={:?} max_ms={} tuner={} ok={} fail={} reconnect={} stale={} avg_ms={:?} max_ms={} clients(pgxl/tgxl)={}/{} protocol_unknown(pgxl/tgxl)={}/{}",
+        elapsed.as_secs(),
+        guard.amp.connection_state.as_str(),
+        guard.amp.runtime.poll_success_count,
+        guard.amp.runtime.poll_failure_count,
+        guard.amp.runtime.reconnect_count,
+        guard.amp.runtime.stale_transition_count,
+        guard.amp.runtime.average_poll_latency_ms(),
+        guard.amp.runtime.max_poll_latency_ms,
+        guard.tuner.connection_state.as_str(),
+        guard.tuner.runtime.poll_success_count,
+        guard.tuner.runtime.poll_failure_count,
+        guard.tuner.runtime.reconnect_count,
+        guard.tuner.runtime.stale_transition_count,
+        guard.tuner.runtime.average_poll_latency_ms(),
+        guard.tuner.runtime.max_poll_latency_ms,
+        guard.clients.pgxl_client_count,
+        guard.clients.tgxl_client_count,
+        guard.protocol.pgxl.unknown_commands,
+        guard.protocol.tgxl.unknown_commands
+    );
+}
+
+fn runtime_json(stats: &bridge_core::state::DeviceRuntimeStats) -> serde_json::Value {
+    serde_json::json!({
+        "reconnect_count": stats.reconnect_count,
+        "poll_success_count": stats.poll_success_count,
+        "poll_failure_count": stats.poll_failure_count,
+        "stale_transition_count": stats.stale_transition_count,
+        "last_poll_latency_ms": stats.last_poll_latency_ms,
+        "max_poll_latency_ms": stats.max_poll_latency_ms,
+        "average_poll_latency_ms": stats.average_poll_latency_ms(),
+    })
+}
+
 fn system_time_ms(value: Option<SystemTime>) -> Option<u128> {
     value.and_then(|time| {
         time.duration_since(UNIX_EPOCH)
             .ok()
             .map(|duration| duration.as_millis())
     })
+}
+
+fn stale_duration_ms(value: Option<SystemTime>) -> Option<u128> {
+    value
+        .and_then(|time| SystemTime::now().duration_since(time).ok())
+        .map(|duration| duration.as_millis())
 }
 
 fn init_logging(level: &str) {
@@ -915,6 +1055,7 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             mock: cfg.kpa500.mock,
             dry_run: cfg.kpa500.dry_run,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
                 .logging
                 .serial_transcript_dir
@@ -994,6 +1135,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
             mock: cfg.kat500.mock,
             dry_run: cfg.kat500.dry_run,
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
                 .logging
                 .serial_transcript_dir

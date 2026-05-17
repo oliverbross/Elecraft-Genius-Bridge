@@ -78,6 +78,11 @@ impl BridgeConfig {
                 "control.verify_delay_ms must be > 0".to_string(),
             ));
         }
+        if self.logging.transcript_rotate_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "logging.transcript_rotate_bytes must be > 0".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -233,6 +238,7 @@ pub struct LoggingConfig {
     pub protocol_trace: bool,
     pub protocol_transcript_dir: Option<String>,
     pub serial_transcript_dir: Option<String>,
+    pub transcript_rotate_bytes: u64,
 }
 
 impl Default for LoggingConfig {
@@ -242,6 +248,7 @@ impl Default for LoggingConfig {
             protocol_trace: false,
             protocol_transcript_dir: None,
             serial_transcript_dir: None,
+            transcript_rotate_bytes: 1_048_576,
         }
     }
 }

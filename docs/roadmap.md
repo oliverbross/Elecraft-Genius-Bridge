@@ -19,10 +19,21 @@ Status: complete for direct socket connection and polling.
 
 ## Phase 3: Elecraft Hardware Validation
 
-- Verify KPA500 command mapping.
-- Verify KAT500 command mapping.
+- KPA500 read-only command mapping mostly verified on COM21.
+- KAT500 read-only command mapping verified on COM8.
 - Capture serial transcripts.
 - Replace placeholder parsers with validated parsers.
+- Soak-test serial polling and reconnect behavior.
+
+## Phase 3A: Operational Stability
+
+Status: in progress.
+
+- Soak-test command added.
+- Serial reconnect backoff and stale-state transitions added.
+- `/status` expanded with runtime counters.
+- Windows power/USB guidance added.
+- RF-risk operate remains design-only.
 
 ## Phase 4: AetherSDR Applet Activation
 

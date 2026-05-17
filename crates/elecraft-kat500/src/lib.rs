@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use bridge_core::{ConnectionState, SharedState};
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
@@ -171,6 +171,7 @@ pub struct Kat500Settings {
     pub mock: bool,
     pub dry_run: bool,
     pub transcript_dir: Option<PathBuf>,
+    pub transcript_rotate_bytes: u64,
 }
 
 pub struct Kat500Driver {
@@ -201,6 +202,7 @@ impl Kat500Driver {
                 guard.tuner.connection_state = ConnectionState::Connected;
                 guard.tuner.last_serial_response_at = Some(SystemTime::now());
                 guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+                guard.tuner.runtime.record_poll_success(0);
                 if guard.tuner.fault.as_deref() == Some("mock_tgxl_fault") {
                     guard.tuner.connected = false;
                     guard.tuner.connection_state = ConnectionState::Degraded;
@@ -241,15 +243,18 @@ impl Kat500Driver {
     }
 
     async fn run_serial_loop(self) {
+        let mut backoff = Duration::from_secs(1);
         loop {
             let mut transcript = SerialTranscript::open(
                 "KAT500",
                 &self.settings.com_port,
                 &self.settings.transcript_dir,
+                self.settings.transcript_rotate_bytes,
             )
             .await;
             match self.open_with_discovery(&mut transcript).await {
                 Ok((mut port, baud)) => {
+                    backoff = Duration::from_secs(1);
                     info!(port = %self.settings.com_port, baud, "KAT500 serial connected");
                     {
                         let mut guard = self.state.write().await;
@@ -264,6 +269,10 @@ impl Kat500Driver {
                             let mut guard = self.state.write().await;
                             guard.tuner.connected = false;
                             guard.tuner.connection_state = ConnectionState::Degraded;
+                            guard.tuner.runtime.poll_failure_count =
+                                guard.tuner.runtime.poll_failure_count.saturating_add(1);
+                            guard.tuner.runtime.reconnect_count =
+                                guard.tuner.runtime.reconnect_count.saturating_add(1);
                             break;
                         }
                     }
@@ -277,14 +286,18 @@ impl Kat500Driver {
                     let mut guard = self.state.write().await;
                     guard.tuner.connected = false;
                     guard.tuner.connection_state = ConnectionState::Disconnected;
+                    guard.tuner.runtime.reconnect_count =
+                        guard.tuner.runtime.reconnect_count.saturating_add(1);
                 }
             }
             warn!(
                 event_id = "reconnect_attempt",
                 device = "KAT500",
+                backoff_ms = backoff.as_millis(),
                 "KAT500 reconnect attempt scheduled"
             );
-            sleep(Duration::from_secs(5)).await;
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(60));
         }
     }
 
@@ -308,6 +321,7 @@ impl Kat500Driver {
             "KAT500",
             &self.settings.com_port,
             &self.settings.transcript_dir,
+            self.settings.transcript_rotate_bytes,
         )
         .await;
         let (mut port, _) = self.open_with_discovery(&mut transcript).await?;
@@ -355,6 +369,7 @@ impl Kat500Driver {
             "KAT500",
             &self.settings.com_port,
             &self.settings.transcript_dir,
+            self.settings.transcript_rotate_bytes,
         )
         .await;
         let (mut port, _) = self.open_with_discovery(&mut transcript).await?;
@@ -382,6 +397,7 @@ impl Kat500Driver {
             "KAT500",
             &self.settings.com_port,
             &self.settings.transcript_dir,
+            self.settings.transcript_rotate_bytes,
         )
         .await;
         send_command(
@@ -414,6 +430,7 @@ impl Kat500Driver {
             "KAT500",
             &self.settings.com_port,
             &self.settings.transcript_dir,
+            self.settings.transcript_rotate_bytes,
         )
         .await;
         send_dynamic_command(
@@ -446,6 +463,7 @@ impl Kat500Driver {
             "KAT500",
             &self.settings.com_port,
             &self.settings.transcript_dir,
+            self.settings.transcript_rotate_bytes,
         )
         .await;
         send_command(
@@ -581,6 +599,7 @@ impl Kat500Driver {
         port: &mut SerialStream,
         transcript: &mut SerialTranscript,
     ) -> Result<Vec<CommandOutcome>> {
+        let started = Instant::now();
         let mut outcomes = Vec::with_capacity(read_only_poll_commands().len());
         for command in read_only_poll_commands() {
             match send_command(port, *command, Duration::from_millis(1000), transcript).await {
@@ -609,8 +628,14 @@ impl Kat500Driver {
         if outcomes.iter().any(|outcome| outcome.response.is_some()) {
             guard.tuner.last_serial_response_at = Some(SystemTime::now());
             guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+            guard
+                .tuner
+                .runtime
+                .record_poll_success(duration_millis_u64(started.elapsed()));
         } else {
             guard.tuner.connection_state = ConnectionState::Degraded;
+            guard.tuner.runtime.poll_failure_count =
+                guard.tuner.runtime.poll_failure_count.saturating_add(1);
         }
         for outcome in &outcomes {
             if let Some(response) = &outcome.response {
@@ -877,14 +902,30 @@ fn antenna_command(antenna: u8) -> ElecraftCommand {
 
 struct SerialTranscript {
     file: Option<File>,
+    dir: Option<PathBuf>,
+    device: String,
+    safe_port: String,
+    session_ts: u128,
+    index: u64,
+    bytes_written: u64,
+    rotate_bytes: u64,
 }
 
 impl SerialTranscript {
     fn disabled() -> Self {
-        Self { file: None }
+        Self {
+            file: None,
+            dir: None,
+            device: String::new(),
+            safe_port: String::new(),
+            session_ts: 0,
+            index: 0,
+            bytes_written: 0,
+            rotate_bytes: 0,
+        }
     }
 
-    async fn open(device: &str, port: &str, dir: &Option<PathBuf>) -> Self {
+    async fn open(device: &str, port: &str, dir: &Option<PathBuf>, rotate_bytes: u64) -> Self {
         let Some(dir) = dir else {
             return Self::disabled();
         };
@@ -894,14 +935,18 @@ impl SerialTranscript {
         }
         let ts = timestamp_millis();
         let safe_port = port.replace([':', '\\', '/', '.'], "_");
-        let path = dir.join(format!(
-            "{}-{}-{}.log",
-            device.to_lowercase(),
-            ts,
-            safe_port
-        ));
+        let path = transcript_path(dir, device, ts, &safe_port, 0);
         match File::create(&path).await {
-            Ok(file) => Self { file: Some(file) },
+            Ok(file) => Self {
+                file: Some(file),
+                dir: Some(dir.clone()),
+                device: device.to_lowercase(),
+                safe_port,
+                session_ts: ts,
+                index: 0,
+                bytes_written: 0,
+                rotate_bytes,
+            },
             Err(err) => {
                 warn!(device, path = %path.display(), error = %err, "serial transcript file could not be opened");
                 Self::disabled()
@@ -910,20 +955,63 @@ impl SerialTranscript {
     }
 
     async fn write_line(&mut self, direction: &str, line: &str) {
+        if self.file.is_none() {
+            return;
+        }
+        let row = format!("{} {direction} {line}\n", timestamp_millis());
+        if self.rotate_bytes > 0
+            && self.bytes_written.saturating_add(row.len() as u64) > self.rotate_bytes
+        {
+            self.rotate().await;
+        }
         let Some(file) = &mut self.file else {
             return;
         };
-        let row = format!("{} {direction} {line}\n", timestamp_millis());
         if let Err(err) = file.write_all(row.as_bytes()).await {
             warn!(error = %err, "serial transcript write failed");
             self.file = None;
             return;
         }
+        self.bytes_written = self.bytes_written.saturating_add(row.len() as u64);
         if let Err(err) = file.flush().await {
             warn!(error = %err, "serial transcript flush failed");
             self.file = None;
         }
     }
+
+    async fn rotate(&mut self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        self.index = self.index.saturating_add(1);
+        let path = transcript_path(
+            dir,
+            &self.device,
+            self.session_ts,
+            &self.safe_port,
+            self.index,
+        );
+        match File::create(&path).await {
+            Ok(file) => {
+                self.file = Some(file);
+                self.bytes_written = 0;
+            }
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "serial transcript rotation failed");
+                self.file = None;
+            }
+        }
+    }
+}
+
+fn transcript_path(dir: &Path, device: &str, ts: u128, safe_port: &str, index: u64) -> PathBuf {
+    dir.join(format!(
+        "{}-{}-{}-{}.log",
+        device.to_lowercase(),
+        ts,
+        safe_port,
+        index
+    ))
 }
 
 fn timestamp_millis() -> u128 {
@@ -931,6 +1019,10 @@ fn timestamp_millis() -> u128 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

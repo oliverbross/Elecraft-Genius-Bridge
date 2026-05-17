@@ -19,6 +19,7 @@
 - Add installer or service deployment path.
 - Add rotating file logs.
 - Add support bundle export containing config redaction, logs, and transcripts.
+- Validate serial reconnect and stale-state recovery with physical USB disconnect/reconnect tests.
 
 ## Protocol Unknowns
 
@@ -48,6 +49,8 @@
 - Multi-client command conflict policy is not defined.
 - Metrics endpoint is simple JSON over localhost and not optimized for frequent scraping.
 - Protocol transcript writing is per-line and should be reviewed under long sessions.
+- Serial and protocol transcript rotation exist, but long soak sessions still need disk-growth validation.
+- Soak-test memory/runtime stats are limited to bridge counters and do not yet include process RSS/handle counts.
 
 ## SmartSDR Compatibility
 

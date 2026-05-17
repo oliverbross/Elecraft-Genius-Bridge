@@ -64,6 +64,7 @@ logging:
   protocol_trace: false
   protocol_transcript_dir:
   serial_transcript_dir:
+  transcript_rotate_bytes: 1048576
 ```
 
 Use `debug` for internal diagnostic logs.
@@ -81,6 +82,8 @@ Set `protocol_transcript_dir` to write one timestamped transcript file per clien
 
 Set `serial_transcript_dir` to write one timestamped KPA500/KAT500 serial transcript per device session. Transcript write failures are logged and then disabled for that session so polling is not blocked.
 
+Set `transcript_rotate_bytes` to cap each serial or protocol transcript file. When the limit is reached, EGB opens the next indexed file for the same device/client session.
+
 ## Metrics
 
 ```yaml
@@ -91,6 +94,18 @@ metrics:
 ```
 
 When enabled, `GET /status` returns localhost-only JSON with connection states, poll timestamps, firmware/capability fields, protocol counters, and client counts. The endpoint refuses non-loopback binds.
+
+Phase 14 adds serial runtime counters to `/status`: poll successes/failures, reconnects, stale-state transitions, last/average/max poll latency, and stale duration.
+
+## Soak Test
+
+Use soak mode for long-duration validation:
+
+```powershell
+cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-hours 4
+```
+
+It starts the normal bridge runtime and prints a health summary every 60 seconds. See `docs/soak-testing.md`.
 
 ## Mock Fault Simulation
 

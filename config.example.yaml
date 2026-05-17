@@ -42,6 +42,7 @@ logging:
   protocol_transcript_dir:
   # When set, EGB writes one raw serial transcript file per device session.
   serial_transcript_dir:
+  transcript_rotate_bytes: 1048576
 
 metrics:
   enabled: false

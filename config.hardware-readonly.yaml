@@ -39,6 +39,7 @@ logging:
   protocol_trace: true
   protocol_transcript_dir: logs/protocol
   serial_transcript_dir: logs/serial
+  transcript_rotate_bytes: 1048576
 
 metrics:
   enabled: true

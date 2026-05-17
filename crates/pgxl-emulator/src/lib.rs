@@ -3,7 +3,7 @@ use bridge_core::{
     parse_client_command, response_line, AmpOperatingState, ConnectionState, SharedState,
 };
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -17,6 +17,7 @@ const VERSION: &str = "0.1.0-egb-pgxl";
 pub struct EmulatorOptions {
     pub protocol_trace: bool,
     pub transcript_dir: Option<PathBuf>,
+    pub transcript_rotate_bytes: u64,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
 }
@@ -71,7 +72,13 @@ async fn handle_client(
 
     let result = async {
         let (reader, mut writer) = socket.into_split();
-        let mut transcript = Transcript::new("pgxl", peer, options.transcript_dir.clone()).await?;
+        let mut transcript = Transcript::new(
+            "pgxl",
+            peer,
+            options.transcript_dir.clone(),
+            options.transcript_rotate_bytes,
+        )
+        .await;
         let mut stats = SessionStats::new(peer);
         let greeting = format!("V{VERSION}");
         write_protocol_line(
@@ -423,19 +430,56 @@ async fn increment_unexpected_sequence(state: &SharedState) {
 
 struct Transcript {
     file: Option<File>,
+    dir: Option<PathBuf>,
+    device: String,
+    safe_peer: String,
+    session_ts: u128,
+    index: u64,
+    bytes_written: u64,
+    rotate_bytes: u64,
 }
 
 impl Transcript {
-    async fn new(device: &str, peer: SocketAddr, dir: Option<PathBuf>) -> anyhow::Result<Self> {
+    fn disabled() -> Self {
+        Self {
+            file: None,
+            dir: None,
+            device: String::new(),
+            safe_peer: String::new(),
+            session_ts: 0,
+            index: 0,
+            bytes_written: 0,
+            rotate_bytes: 0,
+        }
+    }
+
+    async fn new(device: &str, peer: SocketAddr, dir: Option<PathBuf>, rotate_bytes: u64) -> Self {
         let Some(dir) = dir else {
-            return Ok(Self { file: None });
+            return Self::disabled();
         };
-        create_dir_all(&dir).await?;
+        if let Err(err) = create_dir_all(&dir).await {
+            warn!(device, error = %err, "protocol transcript directory could not be created");
+            return Self::disabled();
+        }
         let ts = timestamp_millis();
-        let peer = peer.to_string().replace([':', '.'], "_");
-        let path = dir.join(format!("{device}-{ts}-{peer}.log"));
-        let file = File::create(path).await?;
-        Ok(Self { file: Some(file) })
+        let safe_peer = peer.to_string().replace([':', '.'], "_");
+        let path = transcript_path(&dir, device, ts, &safe_peer, 0);
+        match File::create(&path).await {
+            Ok(file) => Self {
+                file: Some(file),
+                dir: Some(dir),
+                device: device.to_string(),
+                safe_peer,
+                session_ts: ts,
+                index: 0,
+                bytes_written: 0,
+                rotate_bytes,
+            },
+            Err(err) => {
+                warn!(device, path = %path.display(), error = %err, "protocol transcript file could not be opened");
+                Self::disabled()
+            }
+        }
     }
 
     async fn write_line(
@@ -444,13 +488,58 @@ impl Transcript {
         direction: &str,
         line: &str,
     ) -> anyhow::Result<()> {
-        if let Some(file) = &mut self.file {
-            let row = format!("{} {device} {direction} {line}\n", timestamp_millis());
-            file.write_all(row.as_bytes()).await?;
-            file.flush().await?;
+        if self.file.is_none() {
+            return Ok(());
+        }
+        let row = format!("{} {device} {direction} {line}\n", timestamp_millis());
+        if self.rotate_bytes > 0
+            && self.bytes_written.saturating_add(row.len() as u64) > self.rotate_bytes
+        {
+            self.rotate().await;
+        }
+        let Some(file) = &mut self.file else {
+            return Ok(());
+        };
+        if let Err(err) = file.write_all(row.as_bytes()).await {
+            warn!(device, error = %err, "protocol transcript write failed");
+            self.file = None;
+            return Ok(());
+        }
+        self.bytes_written = self.bytes_written.saturating_add(row.len() as u64);
+        if let Err(err) = file.flush().await {
+            warn!(device, error = %err, "protocol transcript flush failed");
+            self.file = None;
         }
         Ok(())
     }
+
+    async fn rotate(&mut self) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        self.index = self.index.saturating_add(1);
+        let path = transcript_path(
+            dir,
+            &self.device,
+            self.session_ts,
+            &self.safe_peer,
+            self.index,
+        );
+        match File::create(&path).await {
+            Ok(file) => {
+                self.file = Some(file);
+                self.bytes_written = 0;
+            }
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "protocol transcript rotation failed");
+                self.file = None;
+            }
+        }
+    }
+}
+
+fn transcript_path(dir: &Path, device: &str, ts: u128, safe_peer: &str, index: u64) -> PathBuf {
+    dir.join(format!("{device}-{ts}-{safe_peer}-{index}.log"))
 }
 
 async fn write_protocol_line<W>(

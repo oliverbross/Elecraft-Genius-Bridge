@@ -137,6 +137,7 @@ impl BridgeState {
                 last_serial_command_at: None,
                 last_serial_response_at: None,
                 last_successful_poll_at: Some(SystemTime::now()),
+                runtime: DeviceRuntimeStats::default(),
             },
             tuner: TunerState {
                 connected: true,
@@ -157,6 +158,7 @@ impl BridgeState {
                 last_serial_command_at: None,
                 last_serial_response_at: None,
                 last_successful_poll_at: Some(SystemTime::now()),
+                runtime: DeviceRuntimeStats::default(),
             },
             ..Self::default()
         }
@@ -187,6 +189,7 @@ pub struct AmpState {
     pub last_serial_response_at: Option<SystemTime>,
     #[serde(skip)]
     pub last_successful_poll_at: Option<SystemTime>,
+    pub runtime: DeviceRuntimeStats,
 }
 
 impl Default for AmpState {
@@ -211,6 +214,7 @@ impl Default for AmpState {
             last_serial_command_at: None,
             last_serial_response_at: None,
             last_successful_poll_at: None,
+            runtime: DeviceRuntimeStats::default(),
         }
     }
 }
@@ -238,6 +242,7 @@ pub struct TunerState {
     pub last_serial_response_at: Option<SystemTime>,
     #[serde(skip)]
     pub last_successful_poll_at: Option<SystemTime>,
+    pub runtime: DeviceRuntimeStats,
 }
 
 impl Default for TunerState {
@@ -261,6 +266,35 @@ impl Default for TunerState {
             last_serial_command_at: None,
             last_serial_response_at: None,
             last_successful_poll_at: None,
+            runtime: DeviceRuntimeStats::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeviceRuntimeStats {
+    pub reconnect_count: u64,
+    pub poll_success_count: u64,
+    pub poll_failure_count: u64,
+    pub stale_transition_count: u64,
+    pub last_poll_latency_ms: u64,
+    pub max_poll_latency_ms: u64,
+    pub total_poll_latency_ms: u64,
+}
+
+impl DeviceRuntimeStats {
+    pub fn record_poll_success(&mut self, latency_ms: u64) {
+        self.poll_success_count = self.poll_success_count.saturating_add(1);
+        self.last_poll_latency_ms = latency_ms;
+        self.max_poll_latency_ms = self.max_poll_latency_ms.max(latency_ms);
+        self.total_poll_latency_ms = self.total_poll_latency_ms.saturating_add(latency_ms);
+    }
+
+    pub fn average_poll_latency_ms(&self) -> Option<u64> {
+        if self.poll_success_count == 0 {
+            None
+        } else {
+            Some(self.total_poll_latency_ms / self.poll_success_count)
         }
     }
 }
@@ -310,4 +344,23 @@ pub fn shared_mock_state() -> SharedState {
 
 pub fn shared_default_state() -> SharedState {
     Arc::new(RwLock::new(BridgeState::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_stats_track_latency_and_counts() {
+        let mut stats = DeviceRuntimeStats::default();
+        assert_eq!(stats.average_poll_latency_ms(), None);
+
+        stats.record_poll_success(100);
+        stats.record_poll_success(300);
+
+        assert_eq!(stats.poll_success_count, 2);
+        assert_eq!(stats.last_poll_latency_ms, 300);
+        assert_eq!(stats.max_poll_latency_ms, 300);
+        assert_eq!(stats.average_poll_latency_ms(), Some(200));
+    }
 }
