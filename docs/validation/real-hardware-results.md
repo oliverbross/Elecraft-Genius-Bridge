@@ -43,11 +43,7 @@ Next KPA500 command:
 .\target-msvc\debug\egb.exe test-kpa --config .\config.hardware-readonly.yaml
 ```
 
-### KAT500
-
-Result: COM8 can be opened at multiple baud rates and semicolon wake/null probes return semicolon bytes, but no real KAT500 command response has been proven yet.
-
-Observed baud-scan result:
+### KAT500 Initial Baud Scan
 
 ```text
 38400 printable=;
@@ -56,22 +52,54 @@ Observed baud-scan result:
 4800 open failed Access denied
 ```
 
-Interpretation:
+This was inconclusive by itself because semicolon responses could be wake/null echo.
 
-- Semicolon responses only prove wake/null bytes or echo-like behaviour.
-- They do not prove that `RV;`, `SN;`, `AN;`, `BYP;`, or other command responses are available at that baud.
-- The Phase 9 scanner now sends documented read-only queries after wake probes and classifies responses as `echo only`, `echo+data`, or `command response`.
+### KAT500 Read-Only Validation
+
+Result: KAT500 read-only polling confirmed.
+
+Confirmed:
+
+- Port: `COM8`
+- Terminator: none
+- Baud: `38400`, `19200`, and `9600` all returned valid command responses
+- Preferred configured baud: `38400`
+
+Observed responses:
+
+```text
+; -> ;
+RV; -> RV02.16;
+SN; -> SN 3867;
+AN; -> AN2;
+BYP; -> BYPN;
+MD; -> MDA;
+TP; -> TP0;
+FLT; -> FLT0;
+VSWR; -> VSWR 1.00;
+VFWD; -> VFWD 0;
+```
+
+Parsed state:
+
+- firmware `02.16`
+- serial `3867`
+- antenna `2`
+- bypass `false`
+- mode `auto`
+- tune power/status `0`
+- fault `0`
+- SWR `1.00`
+- forward power `0`
+
+Regression fixture:
+
+```text
+tests/fixtures/kat500-readonly-com8.txt
+```
 
 Next KAT500 commands:
 
 ```powershell
-.\target-msvc\debug\egb.exe baud-scan --port COM8
-.\target-msvc\debug\egb.exe serial-probe-batch --port COM8 --baud 38400 --send ";,RV;,SN;,AN;,BYP;,MD;,TP;,FLT;,VSWR;,VFWD;" --timeout-ms 1000
-```
-
-If every query is `echo only` or `no response`, try:
-
-```powershell
-.\target-msvc\debug\egb.exe serial-probe-batch --port COM8 --baud 19200 --send ";,RV;,SN;,AN;,BYP;,MD;,TP;,FLT;,VSWR;,VFWD;" --timeout-ms 1000
-.\target-msvc\debug\egb.exe serial-probe-batch --port COM8 --baud 9600 --send ";,RV;,SN;,AN;,BYP;,MD;,TP;,FLT;,VSWR;,VFWD;" --timeout-ms 1000
+.\target-msvc\debug\egb.exe test-kat --config .\config.hardware-readonly.yaml
 ```

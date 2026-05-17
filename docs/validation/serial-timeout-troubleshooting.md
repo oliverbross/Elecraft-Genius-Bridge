@@ -29,6 +29,8 @@ KAT500 baud scan:
 .\target-msvc\debug\egb.exe baud-scan --port COM8
 ```
 
+Known station result: COM8 returned valid KAT500 command responses at `38400`, `19200`, and `9600`. Keep `38400` as the configured baud unless it fails.
+
 KAT500 batch probe:
 
 ```powershell

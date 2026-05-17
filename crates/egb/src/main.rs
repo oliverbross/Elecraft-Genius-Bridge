@@ -962,6 +962,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
         cfg.kat500.dry_run,
     );
 
+    let state = shared_default_state();
     let driver = Kat500Driver::new(
         Kat500Settings {
             com_port: cfg.kat500.com_port.clone(),
@@ -975,7 +976,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
                 .as_ref()
                 .map(PathBuf::from),
         },
-        shared_default_state(),
+        state.clone(),
     );
     driver.connect().await?;
     println!(
@@ -991,6 +992,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     );
     let outcomes = driver.poll_status_outcomes().await?;
     print_kat_outcome_summary(&outcomes);
+    print_kat_parsed_state(&state).await;
     if allow_control {
         println!("KAT500 control test: sending set_bypass_on wire=BYPB; safety=StateChangeSafe");
         driver.set_bypass(true).await?;
@@ -1085,6 +1087,46 @@ fn print_kat_outcome_summary(outcomes: &[KatCommandOutcome]) {
             _ => {}
         }
     }
+}
+
+async fn print_kat_parsed_state(state: &SharedState) {
+    let guard = state.read().await;
+    let mode = guard
+        .tuner
+        .capabilities
+        .iter()
+        .find_map(|capability| capability.strip_prefix("mode="))
+        .unwrap_or("unknown");
+    let tune_power = guard
+        .tuner
+        .capabilities
+        .iter()
+        .find_map(|capability| capability.strip_prefix("tune_power="))
+        .unwrap_or("unknown");
+    let fault = guard.tuner.fault.as_deref().unwrap_or("0");
+    println!("KAT500 parsed state:");
+    println!(
+        "  firmware={}",
+        guard.tuner.firmware_version.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  serial={}",
+        guard.tuner.serial_number.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  antenna={}",
+        guard
+            .tuner
+            .selected_antenna
+            .map(|antenna| antenna.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!("  bypass={}", guard.tuner.bypass);
+    println!("  mode={mode}");
+    println!("  tune_power={tune_power}");
+    println!("  fault={fault}");
+    println!("  swr={:.2}", guard.tuner.swr);
+    println!("  forward_power={:.0}", guard.tuner.forward_power_watts);
 }
 
 fn print_kpa_command_summary(

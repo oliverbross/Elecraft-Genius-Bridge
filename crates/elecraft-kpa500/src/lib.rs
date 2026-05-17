@@ -823,6 +823,16 @@ mod tests {
     }
 
     #[test]
+    fn parser_handles_real_com21_rvm_fixture() {
+        let fixture = include_str!("../../../tests/fixtures/kpa500-rvm-com21.txt");
+        let mut amp = bridge_core::AmpState::default();
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            parse_kpa500_response(line, &mut amp);
+        }
+        assert_eq!(amp.firmware_version.as_deref(), Some("01.54"));
+    }
+
+    #[test]
     fn parser_treats_no_rf_swr_zero_as_safe_baseline() {
         let mut amp = bridge_core::AmpState::default();
         parse_kpa500_response("^WS000 000;", &mut amp);

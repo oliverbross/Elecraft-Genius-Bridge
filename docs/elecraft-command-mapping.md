@@ -41,15 +41,15 @@ The KAT500 uses ordinary ASCII commands and may sleep. Wake discovery sends sing
 | Intent | Wire command | Safety | Verification |
 | --- | --- | --- | --- |
 | Wake/null probe | `;` | `read_only` | KAT500 Serial Command Reference |
-| Read firmware | `RV;` | `read_only` | KAT500 Serial Command Reference |
-| Read serial number | `SN;` | `read_only` | KAT500 Serial Command Reference |
-| Read antenna | `AN;` | `read_only` | KAT500 Serial Command Reference |
-| Read bypass relay | `BYP;` | `read_only` | KAT500 Serial Command Reference |
-| Read mode | `MD;` | `read_only` | KAT500 Serial Command Reference |
-| Read tune progress | `TP;` | `read_only` | KAT500 Serial Command Reference |
-| Read fault | `FLT;` | `read_only` | KAT500 Serial Command Reference |
-| Read VSWR | `VSWR;` | `read_only` | KAT500 Serial Command Reference |
-| Read forward ADC | `VFWD;` | `read_only` | KAT500 Serial Command Reference |
+| Read firmware | `RV;` | `read_only` | Hardware verified on COM8: `RV02.16;` |
+| Read serial number | `SN;` | `read_only` | Hardware verified on COM8: `SN 3867;` |
+| Read antenna | `AN;` | `read_only` | Hardware verified on COM8: `AN2;` |
+| Read bypass relay | `BYP;` | `read_only` | Hardware verified on COM8: `BYPN;` |
+| Read mode | `MD;` | `read_only` | Hardware verified on COM8: `MDA;` |
+| Read tune progress | `TP;` | `read_only` | Hardware verified on COM8: `TP0;` |
+| Read fault | `FLT;` | `read_only` | Hardware verified on COM8: `FLT0;` |
+| Read VSWR | `VSWR;` | `read_only` | Hardware verified on COM8: `VSWR 1.00;` |
+| Read forward ADC | `VFWD;` | `read_only` | Hardware verified on COM8: `VFWD 0;` |
 | Bypass on | `BYPB;` | `state_change_safe` | KAT500 Serial Command Reference, still gated |
 | Bypass off | `BYPN;` | `state_change_safe` | KAT500 Serial Command Reference, still gated |
 | Antenna select | `AN<n>;` | `state_change_safe` | KAT500 Serial Command Reference, still gated |
@@ -57,6 +57,14 @@ The KAT500 uses ordinary ASCII commands and may sleep. Wake discovery sends sing
 | Manual relay move | `UNVERIFIED_MANUAL_TUNE;` | `destructive_or_unknown` | Not active |
 
 `ST;` is intentionally not used as a KAT500 status poll. The KAT500 reference defines `STbbt;` as SWR-threshold GET/SET, not generic status.
+
+Confirmed hardware baseline:
+
+- KAT500 on `COM8`
+- baud `38400`, `19200`, and `9600` all returned valid command responses
+- preferred baud remains configured `38400`
+- terminator: none
+- read-only fixture: `tests/fixtures/kat500-readonly-com8.txt`
 
 ## Dry-Run Behaviour
 

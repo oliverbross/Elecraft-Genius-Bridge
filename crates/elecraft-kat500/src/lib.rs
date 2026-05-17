@@ -683,9 +683,12 @@ fn parse_kat500_response(response: &str, tuner: &mut bridge_core::TunerState) {
             "B" => {
                 tuner.bypass = true;
                 tuner.operate = false;
+                set_capability_value(&mut tuner.capabilities, "mode", "bypass");
             }
             "M" | "A" => {
                 tuner.operate = true;
+                let mode = if raw == "A" { "auto" } else { "manual" };
+                set_capability_value(&mut tuner.capabilities, "mode", mode);
             }
             _ => warn_invalid("mode", raw, response),
         }
@@ -696,8 +699,14 @@ fn parse_kat500_response(response: &str, tuner: &mut bridge_core::TunerState) {
         .and_then(|value| value.strip_suffix(';'))
     {
         match raw {
-            "0" => tuner.tuning = false,
-            "1" => tuner.tuning = true,
+            "0" => {
+                tuner.tuning = false;
+                set_capability_value(&mut tuner.capabilities, "tune_power", "0");
+            }
+            "1" => {
+                tuner.tuning = true;
+                set_capability_value(&mut tuner.capabilities, "tune_power", "1");
+            }
             _ => warn_invalid("tuning", raw, response),
         }
         return;
@@ -725,11 +734,21 @@ fn parse_kat500_response(response: &str, tuner: &mut bridge_core::TunerState) {
         .and_then(|value| value.strip_suffix(';'))
     {
         match raw.parse::<u16>() {
-            Ok(value) if value <= 4095 => {
-                tuner.forward_power_watts = 0.0;
-            }
+            Ok(value) if value <= 4095 => tuner.forward_power_watts = f32::from(value),
             _ => warn_invalid("forward_adc", raw, response),
         }
+    }
+}
+
+fn set_capability_value(capabilities: &mut Vec<String>, key: &str, value: &str) {
+    let prefix = format!("{key}=");
+    if let Some(existing) = capabilities
+        .iter_mut()
+        .find(|capability| capability.starts_with(&prefix))
+    {
+        *existing = format!("{prefix}{value}");
+    } else {
+        capabilities.push(format!("{prefix}{value}"));
     }
 }
 
@@ -923,6 +942,28 @@ mod tests {
         assert!(tuner.tuning);
         assert_eq!(tuner.fault.as_deref(), Some("KAT500 fault 4"));
         assert_eq!(tuner.swr, 1.25);
+    }
+
+    #[test]
+    fn parser_handles_real_com8_readonly_fixture() {
+        let fixture = include_str!("../../../tests/fixtures/kat500-readonly-com8.txt");
+        let mut tuner = bridge_core::TunerState::default();
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            parse_kat500_response(line, &mut tuner);
+        }
+        assert_eq!(tuner.firmware_version.as_deref(), Some("02.16"));
+        assert_eq!(tuner.serial_number.as_deref(), Some("3867"));
+        assert_eq!(tuner.selected_antenna, Some(2));
+        assert!(!tuner.bypass);
+        assert!(tuner.operate);
+        assert_eq!(tuner.fault, None);
+        assert_eq!(tuner.swr, 1.0);
+        assert_eq!(tuner.forward_power_watts, 0.0);
+        assert!(tuner.capabilities.iter().any(|value| value == "mode=auto"));
+        assert!(tuner
+            .capabilities
+            .iter()
+            .any(|value| value == "tune_power=0"));
     }
 
     #[test]
