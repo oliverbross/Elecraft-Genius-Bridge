@@ -48,12 +48,17 @@ Direct `rustfmt.exe --edition 2021 --check <files>` works from that toolchain. I
 x86_64-w64-mingw32-gcc: fatal error: cannot execute 'ld': CreateProcess: No such file or directory
 ```
 
-The working local workaround is to prepend the MSYS tool directory to `PATH` while using the MSVC Cargo:
+The working local workaround is to prepend the MSYS tool directory to `PATH` while using the MSVC Cargo and pinning `RUSTC`/`RUSTDOC` back to the same MSVC rustup toolchain:
 
 ```powershell
 $env:PATH = "C:\JTSDK64-Tools\tools\msys64\mingw64\bin;$env:PATH"
+$env:RUSTC = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe"
+$env:RUSTDOC = "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustdoc.exe"
 & "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe" fmt --all -- --check
 & "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe" clippy --workspace --all-targets -- -D warnings
+& "$env:USERPROFILE\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe" test --workspace
 ```
 
 That workaround passed locally.
+
+The helper script `scripts\windows\check.ps1` applies this workaround automatically when those paths exist.

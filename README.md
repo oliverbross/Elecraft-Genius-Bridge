@@ -20,6 +20,8 @@ Current status: MVP implementation scaffold with mock PGXL/TGXL emulators and co
 - Newline-delimited `C/R/S/V` parser and response framing.
 - Mock KPA500/KAT500 state.
 - Optional raw protocol trace logs and per-client transcript files.
+- Optional KPA500/KAT500 serial transcript files.
+- Dry-run hardware mode that opens COM ports and blocks non-read-only serial commands.
 - CLI commands:
   - `egb run --config config.yaml`
   - `egb check-config --config config.yaml`
@@ -38,6 +40,14 @@ cargo run -p egb -- run --config config.yaml
 ```
 
 The default config binds to `127.0.0.1` for safety. Change `server.bind_ip` to your LAN IP when testing from another machine.
+
+Named profiles are available:
+
+```powershell
+cargo run -p egb -- run --config config.mock.yaml
+cargo run -p egb -- check-config --config config.hardware-readonly.yaml
+cargo run -p egb -- check-config --config config.hardware-control-local-only.yaml
+```
 
 ## AetherSDR Test
 

@@ -14,7 +14,8 @@
 - KPA500 command mapping is placeholder and unverified.
 - KAT500 command mapping is placeholder and unverified.
 - Real serial status response formats need official docs or captures.
-- Serial transcript capture is still needed.
+- Serial transcript capture is implemented but needs real KPA500/KAT500 validation.
+- KAT500 manual relay move command is classified as `destructive_or_unknown` until official mapping is found.
 - Band/frequency tracking commands need validation.
 
 ## Security Hardening
@@ -41,4 +42,3 @@
 - Document tested tunnel options.
 - Avoid recommending unsafe public port forwarding.
 - Investigate whether AetherSDR peripheral manual IP works cleanly across each WAN path.
-

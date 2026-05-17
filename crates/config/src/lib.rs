@@ -77,6 +77,7 @@ impl Default for BridgeConfig {
                 baud: 38_400,
                 polling_interval_ms: 1000,
                 mock: true,
+                dry_run: true,
             },
             kat500: SerialDeviceConfig {
                 enabled: true,
@@ -84,6 +85,7 @@ impl Default for BridgeConfig {
                 baud: 38_400,
                 polling_interval_ms: 1000,
                 mock: true,
+                dry_run: true,
             },
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
@@ -145,6 +147,7 @@ pub struct SerialDeviceConfig {
     pub baud: u32,
     pub polling_interval_ms: u64,
     pub mock: bool,
+    pub dry_run: bool,
 }
 
 impl SerialDeviceConfig {
@@ -174,6 +177,7 @@ impl Default for SerialDeviceConfig {
             baud: 38_400,
             polling_interval_ms: 1000,
             mock: true,
+            dry_run: true,
         }
     }
 }
@@ -190,6 +194,7 @@ pub struct LoggingConfig {
     pub level: String,
     pub protocol_trace: bool,
     pub protocol_transcript_dir: Option<String>,
+    pub serial_transcript_dir: Option<String>,
 }
 
 impl Default for LoggingConfig {
@@ -198,6 +203,7 @@ impl Default for LoggingConfig {
             level: "info".to_string(),
             protocol_trace: false,
             protocol_transcript_dir: None,
+            serial_transcript_dir: None,
         }
     }
 }

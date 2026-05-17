@@ -30,12 +30,15 @@ logging:
   level: debug
   protocol_trace: true
   protocol_transcript_dir: logs/protocol
+  serial_transcript_dir: logs/serial
 
 kpa500:
   mock: false
+  dry_run: true
 
 kat500:
   mock: false
+  dry_run: true
 ```
 
 ## KPA500 Test Steps
@@ -47,16 +50,17 @@ kat500:
 egb test-kpa --config config.yaml
 ```
 
-3. Start bridge:
+3. Confirm the safety summary says only `poll_status` will be sent. Do not use `--allow-control` or `--allow-rf-risk` during the first read-only test.
+4. Start bridge:
 
 ```powershell
 egb run --config config.yaml
 ```
 
-4. Confirm serial open succeeds.
-5. Confirm no fault is reported.
-6. Do not transmit yet.
-7. If operate/standby commands are tested, watch the physical amp and be ready to stop EGB.
+5. Confirm serial open succeeds.
+6. Confirm no fault is reported.
+7. Do not transmit yet.
+8. If operate/standby commands are tested later, use `config.hardware-control-local-only.yaml`, watch the physical amp, and be ready to stop EGB.
 
 ## KAT500 Test Steps
 
@@ -67,9 +71,10 @@ egb run --config config.yaml
 egb test-kat --config config.yaml
 ```
 
-3. Start bridge.
-4. Confirm serial open succeeds.
-5. Do not run a tune cycle with RF until dummy load and low-power drive are ready.
+3. Confirm the safety summary says only `poll_status` will be sent. Do not use `--allow-control` or `--allow-rf-risk` during the first read-only test.
+4. Start bridge.
+5. Confirm serial open succeeds.
+6. Do not run a tune cycle with RF until dummy load and low-power drive are ready.
 
 ## Low-Power RF Test
 
@@ -81,12 +86,21 @@ egb test-kat --config config.yaml
 
 ## Serial Transcript Capture
 
-Serial transcript capture is not implemented yet. For now:
+Set:
 
-- Keep `logging.level: debug`.
-- Save console output.
-- Record exact firmware versions.
-- Record physical device behavior for each command.
+```yaml
+logging:
+  serial_transcript_dir: logs/serial
+```
+
+EGB writes timestamped files such as:
+
+```text
+logs/serial/kpa500-<timestamp>-COM21.log
+logs/serial/kat500-<timestamp>-COM8.log
+```
+
+Keep these with the hardware validation notes. Also record exact firmware versions and physical device behavior for each command.
 
 ## Rollback
 
@@ -104,3 +118,51 @@ kat500:
 3. Restart AetherSDR if it keeps stale connection state.
 4. Power-cycle Elecraft hardware only if the device manual recommends it for the observed fault.
 
+## Exact Next Manual Test B: Windows Hardware Read-Only
+
+1. Connect KPA500 on `COM21` and KAT500 on `COM8`.
+2. Run:
+
+```powershell
+cargo run -p egb -- list-serial
+cargo run -p egb -- check-config --config config.hardware-readonly.yaml
+cargo run -p egb -- test-kpa --config config.hardware-readonly.yaml
+cargo run -p egb -- test-kat --config config.hardware-readonly.yaml
+```
+
+3. Verify the CLI summaries show only read-only `poll_status` will be sent.
+4. Save files from `logs/serial/`.
+5. Verify no operate, tune, antenna, bypass, relay move, or clear-fault command appears in the serial transcripts.
+
+## Exact Next Manual Test C: Local-Only Hardware Control
+
+Use this only after Test B passes.
+
+1. Keep `config.hardware-control-local-only.yaml` bound to `127.0.0.1` or replace it with a private LAN IP only. Do not expose it to WAN.
+2. Use a dummy load or no RF, depending on the specific device action.
+3. Run read-only tests first:
+
+```powershell
+cargo run -p egb -- test-kpa --config config.hardware-control-local-only.yaml
+cargo run -p egb -- test-kat --config config.hardware-control-local-only.yaml
+```
+
+4. Test standby/operate only if physically safe:
+
+```powershell
+cargo run -p egb -- test-kpa --config config.hardware-control-local-only.yaml --allow-control
+```
+
+5. Test KAT500 bypass only if physically safe:
+
+```powershell
+cargo run -p egb -- test-kat --config config.hardware-control-local-only.yaml --allow-control
+```
+
+6. Test KAT500 autotune only with dummy load and a safe low-power plan:
+
+```powershell
+cargo run -p egb -- test-kat --config config.hardware-control-local-only.yaml --allow-rf-risk
+```
+
+7. Save serial transcripts and stop immediately on unexpected physical device behaviour.

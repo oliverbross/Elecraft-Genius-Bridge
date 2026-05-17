@@ -1,5 +1,5 @@
 server:
-  # Safe default for MVP. Use 0.0.0.0 only after you understand the security notes.
+  # Change to the Windows LAN IP when testing from macOS AetherSDR.
   bind_ip: 127.0.0.1
 
 pgxl:
@@ -27,13 +27,10 @@ kat500:
   dry_run: true
 
 security:
-  # Reserved for a later authenticated API/control plane.
   token:
 
 logging:
-  level: info
-  protocol_trace: false
-  # When set, EGB writes one raw PGXL/TGXL transcript file per client session.
-  protocol_transcript_dir:
-  # When set, EGB writes one raw serial transcript file per device session.
+  level: debug
+  protocol_trace: true
+  protocol_transcript_dir: logs/protocol
   serial_transcript_dir:

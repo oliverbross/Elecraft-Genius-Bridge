@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use bridge_core::SharedState;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
@@ -9,10 +11,69 @@ use tracing::{debug, info, warn};
 // UNVERIFIED ELECRAFT COMMAND MAPPING.
 // These strings are intentionally isolated until an official KAT500 command
 // reference is added to docs/ or verified against real hardware.
-const CMD_STATUS: &str = "ST;";
-const CMD_AUTOTUNE: &str = "T;";
-const CMD_BYPASS_ON: &str = "BP1;";
-const CMD_BYPASS_OFF: &str = "BP0;";
+const CMD_STATUS: ElecraftCommand = ElecraftCommand {
+    label: "poll_status",
+    wire: "ST;",
+    safety: CommandSafety::ReadOnly,
+    verified: false,
+};
+const CMD_AUTOTUNE: ElecraftCommand = ElecraftCommand {
+    label: "autotune",
+    wire: "T;",
+    safety: CommandSafety::RfRisk,
+    verified: false,
+};
+const CMD_BYPASS_ON: ElecraftCommand = ElecraftCommand {
+    label: "set_bypass_on",
+    wire: "BP1;",
+    safety: CommandSafety::StateChangeSafe,
+    verified: false,
+};
+const CMD_BYPASS_OFF: ElecraftCommand = ElecraftCommand {
+    label: "set_bypass_off",
+    wire: "BP0;",
+    safety: CommandSafety::StateChangeSafe,
+    verified: false,
+};
+const CMD_ANTENNA_SELECT: ElecraftCommand = ElecraftCommand {
+    label: "set_antenna",
+    wire: "AN<n>;",
+    safety: CommandSafety::StateChangeSafe,
+    verified: false,
+};
+const CMD_MANUAL_TUNE: ElecraftCommand = ElecraftCommand {
+    label: "manual_tune_relay_move",
+    wire: "UNVERIFIED_MANUAL_TUNE;",
+    safety: CommandSafety::DestructiveOrUnknown,
+    verified: false,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandSafety {
+    ReadOnly,
+    StateChangeSafe,
+    RfRisk,
+    DestructiveOrUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElecraftCommand {
+    pub label: &'static str,
+    pub wire: &'static str,
+    pub safety: CommandSafety,
+    pub verified: bool,
+}
+
+pub fn command_map() -> &'static [ElecraftCommand] {
+    &[
+        CMD_STATUS,
+        CMD_AUTOTUNE,
+        CMD_BYPASS_ON,
+        CMD_BYPASS_OFF,
+        CMD_ANTENNA_SELECT,
+        CMD_MANUAL_TUNE,
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct Kat500Settings {
@@ -20,6 +81,8 @@ pub struct Kat500Settings {
     pub baud: u32,
     pub polling_interval: Duration,
     pub mock: bool,
+    pub dry_run: bool,
+    pub transcript_dir: Option<PathBuf>,
 }
 
 pub struct Kat500Driver {
@@ -62,12 +125,19 @@ impl Kat500Driver {
             {
                 Ok(mut port) => {
                     info!(port = %self.settings.com_port, baud = self.settings.baud, "KAT500 serial connected");
+                    let mut transcript = SerialTranscript::open(
+                        "KAT500",
+                        &self.settings.com_port,
+                        &self.settings.transcript_dir,
+                    )
+                    .await;
                     {
                         let mut guard = self.state.write().await;
                         guard.tuner.connected = true;
                     }
                     loop {
-                        if let Err(err) = self.poll_status_on_port(&mut port).await {
+                        if let Err(err) = self.poll_status_on_port(&mut port, &mut transcript).await
+                        {
                             warn!(error = %err, "KAT500 poll failed; reconnecting");
                             break;
                         }
@@ -124,10 +194,17 @@ impl Kat500Driver {
                     self.settings.com_port
                 )
             })?;
-        self.poll_status_on_port(&mut port).await
+        let mut transcript = SerialTranscript::open(
+            "KAT500",
+            &self.settings.com_port,
+            &self.settings.transcript_dir,
+        )
+        .await;
+        self.poll_status_on_port(&mut port, &mut transcript).await
     }
 
     pub async fn autotune(&self) -> Result<()> {
+        self.ensure_can_send(CMD_AUTOTUNE)?;
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.tuner.tuning = true;
@@ -143,11 +220,25 @@ impl Kat500Driver {
                     self.settings.com_port
                 )
             })?;
-        Self::autotune_serial(&mut port).await?;
+        let mut transcript = SerialTranscript::open(
+            "KAT500",
+            &self.settings.com_port,
+            &self.settings.transcript_dir,
+        )
+        .await;
+        send_command(
+            &mut port,
+            CMD_AUTOTUNE,
+            Duration::from_secs(5),
+            &mut transcript,
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn set_antenna(&self, antenna: u8) -> Result<()> {
+        let command = antenna_command(antenna);
+        self.ensure_can_send(command)?;
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.tuner.selected_antenna = Some(antenna.saturating_sub(1));
@@ -161,11 +252,25 @@ impl Kat500Driver {
                     self.settings.com_port
                 )
             })?;
-        Self::set_antenna_serial(&mut port, antenna).await?;
+        let mut transcript = SerialTranscript::open(
+            "KAT500",
+            &self.settings.com_port,
+            &self.settings.transcript_dir,
+        )
+        .await;
+        send_dynamic_command(
+            &mut port,
+            command,
+            Duration::from_millis(750),
+            &mut transcript,
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn set_bypass(&self, on: bool) -> Result<()> {
+        let command = if on { CMD_BYPASS_ON } else { CMD_BYPASS_OFF };
+        self.ensure_can_send(command)?;
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.tuner.bypass = on;
@@ -179,12 +284,47 @@ impl Kat500Driver {
                     self.settings.com_port
                 )
             })?;
-        Self::set_bypass_serial(&mut port, on).await?;
+        let mut transcript = SerialTranscript::open(
+            "KAT500",
+            &self.settings.com_port,
+            &self.settings.transcript_dir,
+        )
+        .await;
+        send_command(
+            &mut port,
+            command,
+            Duration::from_millis(750),
+            &mut transcript,
+        )
+        .await?;
         Ok(())
     }
 
-    async fn poll_status_on_port(&self, port: &mut SerialStream) -> Result<()> {
-        let response = send_command(port, CMD_STATUS, Duration::from_millis(750)).await?;
+    fn ensure_can_send(&self, command: ElecraftCommand) -> Result<()> {
+        if self.settings.dry_run && command.safety != CommandSafety::ReadOnly {
+            warn!(
+                device = "KAT500",
+                command = command.label,
+                wire = command.wire,
+                safety = ?command.safety,
+                "blocked serial command because dry-run mode is enabled"
+            );
+            anyhow::bail!(
+                "KAT500 dry-run blocked {} ({:?})",
+                command.label,
+                command.safety
+            );
+        }
+        Ok(())
+    }
+
+    async fn poll_status_on_port(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) -> Result<()> {
+        let response =
+            send_command(port, CMD_STATUS, Duration::from_millis(750), transcript).await?;
         debug!(response = %response, "KAT500 status response");
         let mut guard = self.state.write().await;
         guard.tuner.connected = true;
@@ -196,21 +336,25 @@ impl Kat500Driver {
     }
 
     pub async fn autotune_serial(port: &mut SerialStream) -> Result<String> {
-        send_command(port, CMD_AUTOTUNE, Duration::from_secs(5)).await
+        let mut transcript = SerialTranscript::disabled();
+        send_command(port, CMD_AUTOTUNE, Duration::from_secs(5), &mut transcript).await
     }
 
     pub async fn set_bypass_serial(port: &mut SerialStream, on: bool) -> Result<String> {
-        send_command(
-            port,
-            if on { CMD_BYPASS_ON } else { CMD_BYPASS_OFF },
-            Duration::from_millis(750),
-        )
-        .await
+        let mut transcript = SerialTranscript::disabled();
+        let command = if on { CMD_BYPASS_ON } else { CMD_BYPASS_OFF };
+        send_command(port, command, Duration::from_millis(750), &mut transcript).await
     }
 
     pub async fn set_antenna_serial(port: &mut SerialStream, antenna: u8) -> Result<String> {
-        let command = format!("AN{};", antenna);
-        send_command(port, &command, Duration::from_millis(750)).await
+        let mut transcript = SerialTranscript::disabled();
+        send_dynamic_command(
+            port,
+            antenna_command(antenna),
+            Duration::from_millis(750),
+            &mut transcript,
+        )
+        .await
     }
 }
 
@@ -222,10 +366,35 @@ fn parse_unverified_status(response: &str, tuner: &mut bridge_core::TunerState) 
     }
 }
 
-async fn send_command(port: &mut SerialStream, command: &str, wait: Duration) -> Result<String> {
-    port.write_all(command.as_bytes())
+async fn send_command(
+    port: &mut SerialStream,
+    command: ElecraftCommand,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<String> {
+    send_wire_command(port, command.label, command.wire, wait, transcript).await
+}
+
+async fn send_dynamic_command(
+    port: &mut SerialStream,
+    command: ElecraftCommand,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<String> {
+    send_wire_command(port, command.label, command.wire, wait, transcript).await
+}
+
+async fn send_wire_command(
+    port: &mut SerialStream,
+    label: &str,
+    wire: &str,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<String> {
+    transcript.write_line("TX", wire).await;
+    port.write_all(wire.as_bytes())
         .await
-        .with_context(|| format!("failed to write serial command {command}"))?;
+        .with_context(|| format!("failed to write serial command {label}"))?;
     port.flush().await.context("failed to flush serial port")?;
 
     let mut buf = Vec::new();
@@ -247,7 +416,82 @@ async fn send_command(port: &mut SerialStream, command: &str, wait: Duration) ->
     .context("serial response timed out")?
     .context("failed reading serial response")?;
 
-    Ok(String::from_utf8_lossy(&buf).trim().to_string())
+    let response = String::from_utf8_lossy(&buf).trim().to_string();
+    transcript.write_line("RX", &response).await;
+    Ok(response)
+}
+
+fn antenna_command(antenna: u8) -> ElecraftCommand {
+    let wire = match antenna {
+        1 => "AN1;",
+        2 => "AN2;",
+        3 => "AN3;",
+        _ => "AN?;",
+    };
+    ElecraftCommand {
+        label: "set_antenna",
+        wire,
+        safety: CommandSafety::StateChangeSafe,
+        verified: false,
+    }
+}
+
+struct SerialTranscript {
+    file: Option<File>,
+}
+
+impl SerialTranscript {
+    fn disabled() -> Self {
+        Self { file: None }
+    }
+
+    async fn open(device: &str, port: &str, dir: &Option<PathBuf>) -> Self {
+        let Some(dir) = dir else {
+            return Self::disabled();
+        };
+        if let Err(err) = create_dir_all(dir).await {
+            warn!(device, error = %err, "serial transcript directory could not be created");
+            return Self::disabled();
+        }
+        let ts = timestamp_millis();
+        let safe_port = port.replace([':', '\\', '/', '.'], "_");
+        let path = dir.join(format!(
+            "{}-{}-{}.log",
+            device.to_lowercase(),
+            ts,
+            safe_port
+        ));
+        match File::create(&path).await {
+            Ok(file) => Self { file: Some(file) },
+            Err(err) => {
+                warn!(device, path = %path.display(), error = %err, "serial transcript file could not be opened");
+                Self::disabled()
+            }
+        }
+    }
+
+    async fn write_line(&mut self, direction: &str, line: &str) {
+        let Some(file) = &mut self.file else {
+            return;
+        };
+        let row = format!("{} {direction} {line}\n", timestamp_millis());
+        if let Err(err) = file.write_all(row.as_bytes()).await {
+            warn!(error = %err, "serial transcript write failed");
+            self.file = None;
+            return;
+        }
+        if let Err(err) = file.flush().await {
+            warn!(error = %err, "serial transcript flush failed");
+            self.file = None;
+        }
+    }
+}
+
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 #[cfg(test)]
@@ -259,5 +503,16 @@ mod tests {
         let mut tuner = bridge_core::TunerState::default();
         parse_unverified_status("BYP;", &mut tuner);
         assert!(tuner.bypass);
+    }
+
+    #[test]
+    fn all_commands_have_safety_classification() {
+        assert!(command_map()
+            .iter()
+            .all(|command| !command.label.is_empty() && !command.wire.is_empty()));
+        assert_eq!(CMD_STATUS.safety, CommandSafety::ReadOnly);
+        assert_eq!(CMD_AUTOTUNE.safety, CommandSafety::RfRisk);
+        assert_eq!(antenna_command(1).safety, CommandSafety::StateChangeSafe);
+        assert!(command_map().iter().all(|command| !command.verified));
     }
 }

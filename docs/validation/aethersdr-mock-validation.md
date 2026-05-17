@@ -4,10 +4,10 @@ Use this checklist to validate the mock MVP against real AetherSDR on macOS.
 
 ## Bridge Setup
 
-1. On the Windows bridge machine, copy the example config:
+1. On the Windows bridge machine, start from the mock profile:
 
 ```powershell
-Copy-Item config.example.yaml config.yaml
+Copy-Item config.mock.yaml config.yaml
 ```
 
 2. Edit `config.yaml`:
@@ -32,6 +32,12 @@ logging:
 
 ```powershell
 cargo run -p egb -- run --config config.yaml
+```
+
+Or use the helper script:
+
+```powershell
+scripts\windows\run-mock.ps1
 ```
 
 ## AetherSDR PGXL Manual IP
@@ -112,3 +118,18 @@ Save these artifacts under `docs/packet-captures/` or attach them to an issue:
 - Exposed TGXL controls produce expected commands.
 - Transcript files are created for both client sessions.
 
+## Exact Next Manual Test A: macOS/AetherSDR Mock
+
+1. On Windows, edit `config.mock.yaml` and set `server.bind_ip` to the Windows LAN IP.
+2. Run:
+
+```powershell
+scripts\windows\run-mock.ps1
+```
+
+3. On macOS, open AetherSDR and connect to the radio as usual.
+4. Configure PGXL manual IP to the Windows LAN IP and port `9008`.
+5. Configure TGXL manual IP to the Windows LAN IP and port `9010`.
+6. Save screenshots showing PGXL and TGXL connected.
+7. Save transcript files from `logs/protocol/`.
+8. Copy `docs/validation/aethersdr-session-report-template.md` into a session-specific report and fill in mismatches.

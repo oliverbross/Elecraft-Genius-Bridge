@@ -8,8 +8,8 @@
 - Added protocol trace logging and optional per-session transcript capture.
 - Added validation checklists for AetherSDR mock testing and Elecraft hardware testing.
 - Added GitHub Actions CI definition.
+- Added serial transcript capture, dry-run hardware safety gates, and config profiles for mock, hardware read-only, and local-only hardware control validation.
 
 ## 0.1.0
 
 - Initial local scaffold and Phase 1 protocol documentation.
-
