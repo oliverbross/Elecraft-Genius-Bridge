@@ -8,38 +8,68 @@ use tokio::time::{sleep, timeout};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tracing::{debug, info, warn};
 
-// UNVERIFIED ELECRAFT COMMAND MAPPING.
-// These strings are intentionally isolated until an official KPA500 command
-// reference is added to docs/ or verified against real hardware.
-const CMD_STATUS: ElecraftCommand = ElecraftCommand {
-    label: "poll_status",
-    wire: "ST;",
+// KPA500 Programmer Reference caret-prefixed command set.
+// Keep all mappings isolated here so hardware transcripts can correct them
+// without touching PGXL/TGXL protocol code.
+const CMD_FIRMWARE: ElecraftCommand = ElecraftCommand {
+    label: "read_firmware",
+    wire: "^RVM;",
     safety: CommandSafety::ReadOnly,
-    verified: false,
+    verified: true,
 };
-const CMD_VERSION: ElecraftCommand = ElecraftCommand {
-    label: "read_version",
-    wire: "RV;",
+const CMD_SERIAL_NUMBER: ElecraftCommand = ElecraftCommand {
+    label: "read_serial_number",
+    wire: "^SN;",
     safety: CommandSafety::ReadOnly,
-    verified: false,
+    verified: true,
+};
+const CMD_OPERATE_STATUS: ElecraftCommand = ElecraftCommand {
+    label: "read_operate_status",
+    wire: "^OS;",
+    safety: CommandSafety::ReadOnly,
+    verified: true,
+};
+const CMD_POWER_SWR: ElecraftCommand = ElecraftCommand {
+    label: "read_power_swr",
+    wire: "^WS;",
+    safety: CommandSafety::ReadOnly,
+    verified: true,
+};
+const CMD_TEMPERATURE: ElecraftCommand = ElecraftCommand {
+    label: "read_temperature",
+    wire: "^TM;",
+    safety: CommandSafety::ReadOnly,
+    verified: true,
+};
+const CMD_VOLTS_CURRENT: ElecraftCommand = ElecraftCommand {
+    label: "read_volts_current",
+    wire: "^VI;",
+    safety: CommandSafety::ReadOnly,
+    verified: true,
+};
+const CMD_FAULT: ElecraftCommand = ElecraftCommand {
+    label: "read_fault",
+    wire: "^FL;",
+    safety: CommandSafety::ReadOnly,
+    verified: true,
 };
 const CMD_OPERATE: ElecraftCommand = ElecraftCommand {
     label: "set_operate",
-    wire: "OP1;",
+    wire: "^OS1;",
     safety: CommandSafety::RfRisk,
-    verified: false,
+    verified: true,
 };
 const CMD_STANDBY: ElecraftCommand = ElecraftCommand {
     label: "set_standby",
-    wire: "OP0;",
+    wire: "^OS0;",
     safety: CommandSafety::StateChangeSafe,
-    verified: false,
+    verified: true,
 };
 const CMD_CLEAR_FAULT: ElecraftCommand = ElecraftCommand {
     label: "clear_fault",
-    wire: "FC;",
+    wire: "^FLC;",
     safety: CommandSafety::DestructiveOrUnknown,
-    verified: false,
+    verified: true,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,8 +90,13 @@ pub struct ElecraftCommand {
 
 pub fn command_map() -> &'static [ElecraftCommand] {
     &[
-        CMD_STATUS,
-        CMD_VERSION,
+        CMD_FIRMWARE,
+        CMD_SERIAL_NUMBER,
+        CMD_OPERATE_STATUS,
+        CMD_POWER_SWR,
+        CMD_TEMPERATURE,
+        CMD_VOLTS_CURRENT,
+        CMD_FAULT,
         CMD_OPERATE,
         CMD_STANDBY,
         CMD_CLEAR_FAULT,
@@ -349,22 +384,32 @@ impl Kpa500Driver {
         port: &mut SerialStream,
         transcript: &mut SerialTranscript,
     ) {
-        match send_command(port, CMD_VERSION, Duration::from_millis(750), transcript).await {
+        match send_command(port, CMD_FIRMWARE, Duration::from_millis(1000), transcript).await {
             Ok(response) => {
                 info!(event_id = "serial_connected", device = "KPA500", response = %response, "KPA500 read-only capability discovery succeeded");
                 let mut guard = self.state.write().await;
-                guard.amp.firmware_version = Some(response.clone());
-                if !guard
-                    .amp
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability == "read_version")
-                {
-                    guard.amp.capabilities.push("read_version".to_string());
-                }
+                parse_kpa500_response(&response, &mut guard.amp);
+                push_capability(&mut guard.amp.capabilities, CMD_FIRMWARE.label);
             }
             Err(err) => {
                 warn!(event_id = "serial_connected", device = "KPA500", error = %err, "KPA500 read-only capability discovery did not return a version");
+            }
+        }
+        match send_command(
+            port,
+            CMD_SERIAL_NUMBER,
+            Duration::from_millis(1000),
+            transcript,
+        )
+        .await
+        {
+            Ok(response) => {
+                let mut guard = self.state.write().await;
+                parse_kpa500_response(&response, &mut guard.amp);
+                push_capability(&mut guard.amp.capabilities, CMD_SERIAL_NUMBER.label);
+            }
+            Err(err) => {
+                warn!(event_id = "serial_connected", device = "KPA500", error = %err, "KPA500 read-only capability discovery did not return a serial number");
             }
         }
     }
@@ -374,24 +419,31 @@ impl Kpa500Driver {
         port: &mut SerialStream,
         transcript: &mut SerialTranscript,
     ) -> Result<()> {
-        let response =
-            send_command(port, CMD_STATUS, Duration::from_millis(750), transcript).await?;
-        debug!(response = %response, "KPA500 status response");
+        let commands = [
+            CMD_OPERATE_STATUS,
+            CMD_POWER_SWR,
+            CMD_TEMPERATURE,
+            CMD_VOLTS_CURRENT,
+            CMD_FAULT,
+        ];
+        let mut responses = Vec::with_capacity(commands.len());
+        for command in commands {
+            let response = send_command(port, command, Duration::from_millis(1000), transcript)
+                .await
+                .with_context(|| format!("KPA500 {} timed out or failed", command.label))?;
+            debug!(command = command.label, response = %response, "KPA500 status response");
+            responses.push((command, response));
+        }
         let mut guard = self.state.write().await;
         guard.amp.connected = true;
         guard.amp.connection_state = ConnectionState::Connected;
         guard.amp.last_serial_command_at = Some(SystemTime::now());
         guard.amp.last_serial_response_at = Some(SystemTime::now());
         guard.amp.last_successful_poll_at = Some(SystemTime::now());
-        if !guard
-            .amp
-            .capabilities
-            .iter()
-            .any(|capability| capability == "poll_status")
-        {
-            guard.amp.capabilities.push("poll_status".to_string());
+        for (command, response) in responses {
+            push_capability(&mut guard.amp.capabilities, command.label);
+            parse_kpa500_response(&response, &mut guard.amp);
         }
-        parse_unverified_status(&response, &mut guard.amp);
         sleep(self.settings.polling_interval).await;
         Ok(())
     }
@@ -430,43 +482,170 @@ impl Kpa500Driver {
     }
 }
 
-fn parse_unverified_status(response: &str, amp: &mut bridge_core::AmpState) {
-    // Placeholder parser. Keep this conservative until real KPA500 responses
-    // are documented or captured.
-    if response.contains("FAULT") {
-        amp.state = AmpOperatingState::Fault;
-        amp.fault = Some(response.to_string());
-    }
-    if let Some(swr) = parse_swr_ratio(response) {
-        amp.swr = swr;
+fn push_capability(capabilities: &mut Vec<String>, capability: &str) {
+    if !capabilities.iter().any(|existing| existing == capability) {
+        capabilities.push(capability.to_string());
     }
 }
 
-fn parse_swr_ratio(response: &str) -> Option<f32> {
-    for token in response.split([';', ' ', ',', '|']) {
-        let Some(raw) = token
-            .strip_prefix("SWR=")
-            .or_else(|| token.strip_prefix("swr="))
-            .or_else(|| token.strip_prefix("SWR"))
-        else {
-            continue;
-        };
-        let Ok(value) = raw.parse::<f32>() else {
-            continue;
-        };
-        if (1.0..=99.0).contains(&value) {
-            return Some(value);
+fn parse_kpa500_response(response: &str, amp: &mut bridge_core::AmpState) {
+    let response = response.trim();
+    if let Some(raw) = response
+        .strip_prefix("^RVM")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        if !raw.is_empty() {
+            amp.firmware_version = Some(raw.to_string());
         }
-        warn!(
-            event_id = "invalid_serial_value",
-            device = "KPA500",
-            field = "swr",
-            value,
-            response,
-            "rejected impossible KPA500 SWR value"
-        );
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^SN")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        if !raw.is_empty() {
+            amp.serial_number = Some(raw.to_string());
+        }
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^OS")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        match raw {
+            "0" => {
+                amp.operate = false;
+                amp.state = AmpOperatingState::Standby;
+            }
+            "1" => {
+                amp.operate = true;
+                amp.state = AmpOperatingState::Operate;
+            }
+            _ => warn!(
+                event_id = "invalid_serial_value",
+                device = "KPA500",
+                field = "operate_status",
+                value = raw,
+                response,
+                "rejected unknown KPA500 operate status"
+            ),
+        }
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^WS")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        parse_power_swr(raw, response, amp);
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^TM")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        parse_temperature(raw, response, amp);
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^VI")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        parse_volts_current(raw, response, amp);
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^FL")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        parse_fault(raw, response, amp);
+    }
+}
+
+fn parse_power_swr(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
+    let mut parts = raw.split_whitespace();
+    let Some(power_raw) = parts.next() else {
+        warn_invalid("power_swr", raw, response);
+        return;
+    };
+    let Some(swr_raw) = parts.next() else {
+        warn_invalid("power_swr", raw, response);
+        return;
+    };
+    match power_raw.parse::<u16>() {
+        Ok(power) if power <= 1000 => amp.forward_power_watts = f32::from(power),
+        _ => warn_invalid("forward_power_watts", power_raw, response),
+    }
+    match parse_kpa_swr(swr_raw) {
+        Some(swr) => amp.swr = swr,
+        None => warn_invalid("swr", swr_raw, response),
+    }
+}
+
+fn parse_kpa_swr(raw: &str) -> Option<f32> {
+    let value = raw.parse::<u16>().ok()?;
+    if value == 0 {
+        return Some(1.0);
+    }
+    if (100..=990).contains(&value) {
+        return Some(f32::from(value) / 100.0);
     }
     None
+}
+
+fn parse_temperature(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
+    match raw.parse::<i16>() {
+        Ok(value) if (-40..=150).contains(&value) => amp.temperature_c = f32::from(value),
+        _ => warn_invalid("temperature_c", raw, response),
+    }
+}
+
+fn parse_volts_current(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
+    let mut parts = raw.split_whitespace();
+    let Some(volts_raw) = parts.next() else {
+        warn_invalid("volts_current", raw, response);
+        return;
+    };
+    let Some(current_raw) = parts.next() else {
+        warn_invalid("volts_current", raw, response);
+        return;
+    };
+    match volts_raw.parse::<u16>() {
+        Ok(value) if value <= 300 => amp.mains_volts = value,
+        _ => warn_invalid("mains_volts", volts_raw, response),
+    }
+    match current_raw.parse::<u16>() {
+        Ok(value) if value <= 1000 => amp.drain_current_amps = f32::from(value) / 10.0,
+        _ => warn_invalid("drain_current_amps", current_raw, response),
+    }
+}
+
+fn parse_fault(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
+    match raw.parse::<u16>() {
+        Ok(0) => {
+            amp.fault = None;
+            if amp.operate {
+                amp.state = AmpOperatingState::Operate;
+            } else {
+                amp.state = AmpOperatingState::Standby;
+            }
+        }
+        Ok(code) => {
+            amp.state = AmpOperatingState::Fault;
+            amp.fault = Some(format!("KPA500 fault {code}"));
+        }
+        Err(_) => warn_invalid("fault", raw, response),
+    }
+}
+
+fn warn_invalid(field: &str, value: &str, response: &str) {
+    warn!(
+        event_id = "invalid_serial_value",
+        device = "KPA500",
+        field,
+        value = value,
+        response,
+        "rejected invalid KPA500 serial value"
+    );
 }
 
 async fn send_command(
@@ -568,21 +747,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unverified_fault_parser_sets_fault() {
+    fn parser_handles_documented_read_only_responses() {
         let mut amp = bridge_core::AmpState::default();
-        parse_unverified_status("FAULT;", &mut amp);
+        parse_kpa500_response("^RVM01.23;", &mut amp);
+        parse_kpa500_response("^SN12345;", &mut amp);
+        parse_kpa500_response("^OS1;", &mut amp);
+        parse_kpa500_response("^WS500 150;", &mut amp);
+        parse_kpa500_response("^TM034;", &mut amp);
+        parse_kpa500_response("^VI230 125;", &mut amp);
+        parse_kpa500_response("^FL07;", &mut amp);
+        assert_eq!(amp.firmware_version.as_deref(), Some("01.23"));
+        assert_eq!(amp.serial_number.as_deref(), Some("12345"));
+        assert!(amp.operate);
+        assert_eq!(amp.forward_power_watts, 500.0);
+        assert_eq!(amp.swr, 1.5);
+        assert_eq!(amp.temperature_c, 34.0);
+        assert_eq!(amp.mains_volts, 230);
+        assert_eq!(amp.drain_current_amps, 12.5);
         assert_eq!(amp.state, AmpOperatingState::Fault);
-        assert!(amp.fault.is_some());
+        assert_eq!(amp.fault.as_deref(), Some("KPA500 fault 7"));
+    }
+
+    #[test]
+    fn parser_treats_no_rf_swr_zero_as_safe_baseline() {
+        let mut amp = bridge_core::AmpState::default();
+        parse_kpa500_response("^WS000 000;", &mut amp);
+        assert_eq!(amp.forward_power_watts, 0.0);
+        assert_eq!(amp.swr, 1.0);
     }
 
     #[test]
     fn parser_rejects_impossible_swr_values() {
         let mut amp = bridge_core::AmpState::default();
-        parse_unverified_status("SWR=-1.0;", &mut amp);
+        parse_kpa500_response("^WS000 099;", &mut amp);
         assert_eq!(amp.swr, 1.0);
-        parse_unverified_status("SWR=1000.0;", &mut amp);
+        parse_kpa500_response("^WS000 991;", &mut amp);
         assert_eq!(amp.swr, 1.0);
-        parse_unverified_status("SWR=1.4;", &mut amp);
+        parse_kpa500_response("^WS000 140;", &mut amp);
         assert_eq!(amp.swr, 1.4);
     }
 
@@ -591,8 +792,19 @@ mod tests {
         assert!(command_map()
             .iter()
             .all(|command| !command.label.is_empty() && !command.wire.is_empty()));
-        assert_eq!(CMD_STATUS.safety, CommandSafety::ReadOnly);
+        assert_eq!(CMD_OPERATE_STATUS.safety, CommandSafety::ReadOnly);
         assert_eq!(CMD_OPERATE.safety, CommandSafety::RfRisk);
-        assert!(command_map().iter().all(|command| !command.verified));
+        assert!(command_map().iter().all(|command| command.verified));
+    }
+
+    #[test]
+    fn removed_placeholder_commands_are_not_active_for_kpa500() {
+        for command in command_map() {
+            assert_ne!(command.wire, "ST;");
+            assert_ne!(command.wire, "RV;");
+            assert_ne!(command.wire, "OP1;");
+            assert_ne!(command.wire, "OP0;");
+            assert_ne!(command.wire, "FC;");
+        }
     }
 }

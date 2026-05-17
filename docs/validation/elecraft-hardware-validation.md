@@ -44,37 +44,49 @@ kat500:
 ## KPA500 Test Steps
 
 1. Confirm KPA500 is powered on and connected by USB/serial.
-2. Run:
+2. Probe firmware first:
+
+```powershell
+.\target-msvc\debug\egb.exe serial-probe --port COM21 --baud 38400 --send "^RVM;" --timeout-ms 1000
+```
+
+3. Run:
 
 ```powershell
 egb test-kpa --config config.yaml
 ```
 
-3. Confirm the safety summary says only `poll_status` will be sent. Do not use `--allow-control` or `--allow-rf-risk` during the first read-only test.
-4. Start bridge:
+4. Confirm the safety summary shows only caret-prefixed read-only KPA500 commands. Do not use `--allow-control` or `--allow-rf-risk` during the first read-only test.
+5. Start bridge:
 
 ```powershell
 egb run --config config.yaml
 ```
 
-5. Confirm serial open succeeds.
-6. Confirm no fault is reported.
-7. Do not transmit yet.
-8. If operate/standby commands are tested later, use `config.hardware-control-local-only.yaml`, watch the physical amp, and be ready to stop EGB.
+6. Confirm serial open succeeds.
+7. Confirm no fault is reported.
+8. Do not transmit yet.
+9. If operate/standby commands are tested later, use `config.hardware-control-local-only.yaml`, watch the physical amp, and be ready to stop EGB.
 
 ## KAT500 Test Steps
 
 1. Confirm KAT500 is powered on and connected by USB/serial.
-2. Run:
+2. Probe wake/baud first:
+
+```powershell
+.\target-msvc\debug\egb.exe baud-scan --port COM8
+```
+
+3. Run:
 
 ```powershell
 egb test-kat --config config.yaml
 ```
 
-3. Confirm the safety summary says only `poll_status` will be sent. Do not use `--allow-control` or `--allow-rf-risk` during the first read-only test.
-4. Start bridge.
-5. Confirm serial open succeeds.
-6. Do not run a tune cycle with RF until dummy load and low-power drive are ready.
+4. Confirm the safety summary shows wake/baud discovery and documented read-only KAT500 GETs. Do not use `--allow-control` or `--allow-rf-risk` during the first read-only test.
+5. Start bridge.
+6. Confirm serial open succeeds.
+7. Do not run a tune cycle with RF until dummy load and low-power drive are ready.
 
 ## Low-Power RF Test
 

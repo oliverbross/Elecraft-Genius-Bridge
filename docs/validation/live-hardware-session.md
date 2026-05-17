@@ -14,7 +14,14 @@ Use this runbook for the first real KPA500/KAT500 validation sessions.
 cargo run -p egb -- list-serial
 ```
 
-6. Start with the read-only profile:
+6. Probe raw serial before high-level tests:
+
+```powershell
+.\target-msvc\debug\egb.exe serial-probe --port COM21 --baud 38400 --send "^RVM;" --timeout-ms 1000
+.\target-msvc\debug\egb.exe baud-scan --port COM8
+```
+
+7. Start with the read-only profile:
 
 ```powershell
 cargo run -p egb -- check-config --config config.hardware-readonly.yaml

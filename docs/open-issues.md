@@ -14,8 +14,8 @@
 - Validate against current AetherSDR builds on macOS.
 - Resolve PGXL applet activation path: AetherSDR requires radio-side `amplifier` presence for AMP visibility in the inspected source.
 - Resolve TGXL binary/source mismatch: inspected AetherSDR source supports direct TGXL presence, but the tested binary reportedly did not show the TUN applet.
-- Validate real KPA500/KAT500 command mappings against official references or hardware transcripts.
-- Replace placeholder Elecraft parsers with confirmed response parsing.
+- Validate corrected KPA500/KAT500 command mappings against hardware transcripts.
+- Expand Elecraft parsers only from official references or captured hardware responses.
 - Add installer or service deployment path.
 - Add rotating file logs.
 - Add support bundle export containing config redaction, logs, and transcripts.
@@ -35,10 +35,10 @@
 
 ## Elecraft Command Unknowns
 
-- KPA500 command mapping is placeholder and unverified.
-- KAT500 command mapping is placeholder and unverified.
-- KPA500/KAT500 `RV;` version query is unverified.
-- Real serial status response formats need official docs or captures.
+- KPA500 active mapping was corrected to caret-prefixed Programmer Reference commands, but still needs COM21 transcript validation.
+- KAT500 active mapping was corrected to documented read-only GETs and wake/baud discovery, but still needs COM8 transcript validation.
+- KAT500 read-only commands beyond `RV;`, `SN;`, `AN;`, `BYP;`, `MD;`, `TP;`, `FLT;`, `VSWR;`, and `VFWD;` are not implemented.
+- Real serial response variants need captures from Oliver's firmware versions.
 - Serial transcript capture is implemented but needs real KPA500/KAT500 validation.
 - KAT500 manual relay move command is classified as `destructive_or_unknown` until official mapping is found.
 - Band/frequency tracking commands need validation.
