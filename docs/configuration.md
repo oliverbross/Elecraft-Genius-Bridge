@@ -48,7 +48,19 @@ Set `mock: false` only when real hardware is connected and command mappings have
 ```yaml
 logging:
   level: info
+  protocol_trace: false
+  protocol_transcript_dir:
 ```
 
-Use `debug` to see protocol traffic.
+Use `debug` for internal diagnostic logs.
 
+Set `protocol_trace: true` to print raw PGXL/TGXL lines with direction markers:
+
+```text
+PGXL RX < C1|status
+PGXL TX > R1|0|...
+TGXL RX < C1|status
+TGXL TX > R1|0|...
+```
+
+Set `protocol_transcript_dir` to write one timestamped transcript file per client session.

@@ -72,4 +72,3 @@ mod tests {
         assert_eq!(response_line(7, 0, "state=IDLE"), "R7|0|state=IDLE\n");
     }
 }
-

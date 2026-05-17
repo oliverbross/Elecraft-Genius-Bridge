@@ -5,4 +5,3 @@ pub use protocol::{parse_client_command, response_line, ClientCommand, ProtocolE
 pub use state::{
     AmpOperatingState, AmpState, Band, BridgeState, ClientState, SharedState, TunerState,
 };
-

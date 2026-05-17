@@ -12,4 +12,3 @@ pub async fn replay_pgxl(bind_addr: SocketAddr) -> anyhow::Result<()> {
 pub async fn replay_tgxl(bind_addr: SocketAddr) -> anyhow::Result<()> {
     tgxl_emulator::run(bind_addr, mock_state()).await
 }
-

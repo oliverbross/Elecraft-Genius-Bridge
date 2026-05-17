@@ -1,14 +1,31 @@
 use anyhow::Context;
 use bridge_core::{parse_client_command, response_line, SharedState};
 use std::net::SocketAddr;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::fs::{create_dir_all, File};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
 const VERSION: &str = "0.1.0-egb-tgxl";
 
+#[derive(Debug, Clone, Default)]
+pub struct EmulatorOptions {
+    pub protocol_trace: bool,
+    pub transcript_dir: Option<PathBuf>,
+}
+
 pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()> {
+    run_with_options(bind_addr, state, EmulatorOptions::default()).await
+}
+
+pub async fn run_with_options(
+    bind_addr: SocketAddr,
+    state: SharedState,
+    options: EmulatorOptions,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind TGXL emulator on {bind_addr}"))?;
@@ -17,15 +34,21 @@ pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()
     loop {
         let (socket, peer) = listener.accept().await?;
         let state = state.clone();
+        let options = options.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client(socket, peer, state).await {
+            if let Err(err) = handle_client(socket, peer, state, options).await {
                 warn!(%peer, error = %err, "TGXL client ended with error");
             }
         });
     }
 }
 
-async fn handle_client(socket: TcpStream, peer: SocketAddr, state: SharedState) -> anyhow::Result<()> {
+async fn handle_client(
+    socket: TcpStream,
+    peer: SocketAddr,
+    state: SharedState,
+    options: EmulatorOptions,
+) -> anyhow::Result<()> {
     {
         let mut guard = state.write().await;
         guard.clients.tgxl_connected = true;
@@ -35,10 +58,18 @@ async fn handle_client(socket: TcpStream, peer: SocketAddr, state: SharedState) 
 
     let result = async {
         let (reader, mut writer) = socket.into_split();
-        writer
-            .write_all(format!("V{VERSION}\n").as_bytes())
-            .await
-            .context("failed to write TGXL version greeting")?;
+        let mut transcript = Transcript::new("tgxl", peer, options.transcript_dir.clone()).await?;
+        let greeting = format!("V{VERSION}");
+        write_protocol_line(
+            &mut writer,
+            &mut transcript,
+            "TGXL",
+            "TX >",
+            &greeting,
+            options.protocol_trace,
+        )
+        .await
+        .context("failed to write TGXL version greeting")?;
 
         let mut lines = BufReader::new(reader).lines();
         while let Some(line) = lines.next_line().await? {
@@ -46,15 +77,38 @@ async fn handle_client(socket: TcpStream, peer: SocketAddr, state: SharedState) 
             if line.is_empty() {
                 continue;
             }
-            debug!(%peer, rx = %line, "TGXL RX");
+            trace_protocol_line(
+                &mut transcript,
+                "TGXL",
+                "RX <",
+                &line,
+                options.protocol_trace,
+            )
+            .await?;
+            debug!(%peer, command_line_len = line.len(), "TGXL command received");
             match parse_client_command(&line) {
                 Ok(cmd) => {
                     let outcome = handle_command(cmd.seq, &cmd.command, &state).await;
-                    debug!(%peer, tx = %outcome.response.trim(), "TGXL TX");
-                    writer.write_all(outcome.response.as_bytes()).await?;
+                    debug!(%peer, command = %cmd.command, "TGXL command handled");
+                    write_protocol_line(
+                        &mut writer,
+                        &mut transcript,
+                        "TGXL",
+                        "TX >",
+                        outcome.response.trim_end(),
+                        options.protocol_trace,
+                    )
+                    .await?;
                     for push in outcome.pushes {
-                        debug!(%peer, tx = %push.trim(), "TGXL TX push");
-                        writer.write_all(push.as_bytes()).await?;
+                        write_protocol_line(
+                            &mut writer,
+                            &mut transcript,
+                            "TGXL",
+                            "TX >",
+                            push.trim_end(),
+                            options.protocol_trace,
+                        )
+                        .await?;
                     }
                 }
                 Err(err) => {
@@ -213,6 +267,74 @@ fn state_push_from_tuner(tuner: &bridge_core::TunerState) -> String {
     format!("S0|state {}\n", status_body_from_tuner(tuner))
 }
 
+struct Transcript {
+    file: Option<File>,
+}
+
+impl Transcript {
+    async fn new(device: &str, peer: SocketAddr, dir: Option<PathBuf>) -> anyhow::Result<Self> {
+        let Some(dir) = dir else {
+            return Ok(Self { file: None });
+        };
+        create_dir_all(&dir).await?;
+        let ts = timestamp_millis();
+        let peer = peer.to_string().replace([':', '.'], "_");
+        let path = dir.join(format!("{device}-{ts}-{peer}.log"));
+        let file = File::create(path).await?;
+        Ok(Self { file: Some(file) })
+    }
+
+    async fn write_line(
+        &mut self,
+        device: &str,
+        direction: &str,
+        line: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(file) = &mut self.file {
+            let row = format!("{} {device} {direction} {line}\n", timestamp_millis());
+            file.write_all(row.as_bytes()).await?;
+            file.flush().await?;
+        }
+        Ok(())
+    }
+}
+
+async fn write_protocol_line<W>(
+    writer: &mut W,
+    transcript: &mut Transcript,
+    device: &str,
+    direction: &str,
+    line: &str,
+    protocol_trace: bool,
+) -> anyhow::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    trace_protocol_line(transcript, device, direction, line, protocol_trace).await?;
+    writer.write_all(format!("{line}\n").as_bytes()).await?;
+    Ok(())
+}
+
+async fn trace_protocol_line(
+    transcript: &mut Transcript,
+    device: &str,
+    direction: &str,
+    line: &str,
+    protocol_trace: bool,
+) -> anyhow::Result<()> {
+    if protocol_trace {
+        info!("{device} {direction} {line}");
+    }
+    transcript.write_line(device, direction, line).await
+}
+
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn bool_int(value: bool) -> u8 {
     if value {
         1
@@ -255,9 +377,20 @@ mod tests {
     #[tokio::test]
     async fn relay_command_updates_state() {
         let state = shared_mock_state();
-        apply_relay_command("tune relay=0 move=1", &state).await.unwrap();
+        apply_relay_command("tune relay=0 move=1", &state)
+            .await
+            .unwrap();
         let guard = state.read().await;
         assert_eq!(guard.tuner.relay_c1, 21);
     }
-}
 
+    #[tokio::test]
+    async fn golden_tgxl_mock_status_response_is_stable() {
+        let state = shared_mock_state();
+        let body = status_body(&state).await;
+        assert_eq!(
+            response_line(2, 0, body),
+            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-32.2557\n"
+        );
+    }
+}

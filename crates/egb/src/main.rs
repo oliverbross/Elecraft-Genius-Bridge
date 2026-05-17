@@ -72,14 +72,24 @@ async fn main() -> Result<()> {
         Commands::TestKpa { config } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            test_serial_device("KPA500", &cfg.kpa500.com_port, cfg.kpa500.baud, cfg.kpa500.mock)
-                .await
+            test_serial_device(
+                "KPA500",
+                &cfg.kpa500.com_port,
+                cfg.kpa500.baud,
+                cfg.kpa500.mock,
+            )
+            .await
         }
         Commands::TestKat { config } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            test_serial_device("KAT500", &cfg.kat500.com_port, cfg.kat500.baud, cfg.kat500.mock)
-                .await
+            test_serial_device(
+                "KAT500",
+                &cfg.kat500.com_port,
+                cfg.kat500.baud,
+                cfg.kat500.mock,
+            )
+            .await
         }
         Commands::ReplayPgxl { bind } => {
             init_logging("debug");
@@ -135,8 +145,16 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
     if cfg.pgxl.enabled {
         let addr = SocketAddr::new(bind_ip, cfg.pgxl.port);
         let state = state.clone();
+        let options = pgxl_emulator::EmulatorOptions {
+            protocol_trace: cfg.logging.protocol_trace,
+            transcript_dir: cfg
+                .logging
+                .protocol_transcript_dir
+                .as_ref()
+                .map(PathBuf::from),
+        };
         tokio::spawn(async move {
-            if let Err(err) = pgxl_emulator::run(addr, state).await {
+            if let Err(err) = pgxl_emulator::run_with_options(addr, state, options).await {
                 error!(error = %err, "PGXL emulator stopped");
             }
         });
@@ -145,15 +163,25 @@ async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
     if cfg.tgxl.enabled {
         let addr = SocketAddr::new(bind_ip, cfg.tgxl.port);
         let state = state.clone();
+        let options = tgxl_emulator::EmulatorOptions {
+            protocol_trace: cfg.logging.protocol_trace,
+            transcript_dir: cfg
+                .logging
+                .protocol_transcript_dir
+                .as_ref()
+                .map(PathBuf::from),
+        };
         tokio::spawn(async move {
-            if let Err(err) = tgxl_emulator::run(addr, state).await {
+            if let Err(err) = tgxl_emulator::run_with_options(addr, state, options).await {
                 error!(error = %err, "TGXL emulator stopped");
             }
         });
     }
 
     info!("Elecraft Genius Bridge running; press Ctrl+C to stop");
-    tokio::signal::ctrl_c().await.context("failed waiting for Ctrl+C")?;
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed waiting for Ctrl+C")?;
     info!("shutdown requested");
     Ok(())
 }

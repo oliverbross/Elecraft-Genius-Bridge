@@ -213,4 +213,3 @@ pub fn shared_mock_state() -> SharedState {
 pub fn shared_default_state() -> SharedState {
     Arc::new(RwLock::new(BridgeState::default()))
 }
-

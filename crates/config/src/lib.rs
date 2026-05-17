@@ -51,10 +51,12 @@ impl BridgeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.server
-            .bind_ip
-            .parse::<IpAddr>()
-            .map_err(|_| ConfigError::Invalid(format!("server.bind_ip is not an IP address: {}", self.server.bind_ip)))?;
+        self.server.bind_ip.parse::<IpAddr>().map_err(|_| {
+            ConfigError::Invalid(format!(
+                "server.bind_ip is not an IP address: {}",
+                self.server.bind_ip
+            ))
+        })?;
         validate_port("pgxl.port", self.pgxl.port)?;
         validate_port("tgxl.port", self.tgxl.port)?;
         self.kpa500.validate("kpa500")?;
@@ -186,19 +188,25 @@ pub struct SecurityConfig {
 #[serde(default)]
 pub struct LoggingConfig {
     pub level: String,
+    pub protocol_trace: bool,
+    pub protocol_transcript_dir: Option<String>,
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
+            protocol_trace: false,
+            protocol_transcript_dir: None,
         }
     }
 }
 
 fn validate_port(name: &str, port: u16) -> Result<(), ConfigError> {
     if port == 0 {
-        return Err(ConfigError::Invalid(format!("{name} must be between 1 and 65535")));
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be between 1 and 65535"
+        )));
     }
     Ok(())
 }
@@ -234,4 +242,3 @@ pgxl:
         assert_eq!(cfg.tgxl.port, 9010);
     }
 }
-

@@ -125,7 +125,12 @@ impl Kpa500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KPA500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KPA500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         self.poll_status_on_port(&mut port).await
     }
 
@@ -138,7 +143,12 @@ impl Kpa500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KPA500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KPA500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         Self::set_operate_serial(&mut port).await?;
         Ok(())
     }
@@ -153,7 +163,12 @@ impl Kpa500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KPA500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KPA500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         Self::set_standby_serial(&mut port).await?;
         Ok(())
     }
@@ -166,7 +181,12 @@ impl Kpa500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KPA500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KPA500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         Self::clear_fault_serial(&mut port).await?;
         Ok(())
     }

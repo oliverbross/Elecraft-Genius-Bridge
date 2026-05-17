@@ -19,6 +19,7 @@ Current status: MVP implementation scaffold with mock PGXL/TGXL emulators and co
 - Server-first `V<version>` greeting for AetherSDR.
 - Newline-delimited `C/R/S/V` parser and response framing.
 - Mock KPA500/KAT500 state.
+- Optional raw protocol trace logs and per-client transcript files.
 - CLI commands:
   - `egb run --config config.yaml`
   - `egb check-config --config config.yaml`
@@ -77,4 +78,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-In the initial Windows environment, `cargo test --workspace` passed using the installed rustup toolchain. The `rustfmt` and `clippy` components were not installed, so `cargo fmt` and `cargo clippy` could not be run until those components are added.
+In the initial Windows environment, `cargo test --workspace` passed using the installed rustup MSVC toolchain. `rustup` itself was not on `PATH`, but prepending the MSYS2 tool directory made `cargo fmt` and `cargo clippy` available to the MSVC Cargo; all three checks passed with that setup.

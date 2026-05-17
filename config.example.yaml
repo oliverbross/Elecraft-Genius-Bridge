@@ -30,4 +30,6 @@ security:
 
 logging:
   level: info
-
+  protocol_trace: false
+  # When set, EGB writes one raw PGXL/TGXL transcript file per client session.
+  protocol_transcript_dir:

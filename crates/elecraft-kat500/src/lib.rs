@@ -118,7 +118,12 @@ impl Kat500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KAT500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KAT500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         self.poll_status_on_port(&mut port).await
     }
 
@@ -132,7 +137,12 @@ impl Kat500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KAT500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KAT500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         Self::autotune_serial(&mut port).await?;
         Ok(())
     }
@@ -145,7 +155,12 @@ impl Kat500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KAT500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KAT500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         Self::set_antenna_serial(&mut port, antenna).await?;
         Ok(())
     }
@@ -158,7 +173,12 @@ impl Kat500Driver {
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
-            .with_context(|| format!("failed to open KAT500 serial port {}", self.settings.com_port))?;
+            .with_context(|| {
+                format!(
+                    "failed to open KAT500 serial port {}",
+                    self.settings.com_port
+                )
+            })?;
         Self::set_bypass_serial(&mut port, on).await?;
         Ok(())
     }
