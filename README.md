@@ -31,6 +31,7 @@ Current status: MVP implementation scaffold with mock PGXL/TGXL emulators and co
   - `egb check-config --config config.yaml`
   - `egb list-serial`
   - `egb test-kpa --config config.yaml`
+  - `egb test-kpa-operate --config config.yaml --allow-rf-risk`
   - `egb test-kat --config config.yaml`
   - `egb replay-pgxl`
   - `egb replay-tgxl`

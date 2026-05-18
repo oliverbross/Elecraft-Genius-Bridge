@@ -16,7 +16,7 @@ Primary references:
 | Read firmware | `^RVM;` | `read_only` | Hardware verified on COM21 at 38400: `^RVM01.54;` |
 | Read serial number | `^SN;` | `read_only` | Programmer Reference |
 | Read operate/standby | `^OS;` | `read_only` | Hardware verified on COM21: `^OS0;` |
-| Read power/SWR | `^WS;` | `read_only` | Hardware verified on COM21: `^WS000 000;` |
+| Read power/SWR | `^WS;` | `read_only` | Hardware verified on COM21: `^WS000 000;`, live RF sample `^WS030 011;` |
 | Read temperature | `^TM;` | `read_only` | Hardware verified on COM21: `^TM030;` |
 | Read PA volts/current | `^VI;` | `read_only` | Hardware verified on COM21: `^VI689 000;` / `^VI690 000;` |
 | Read fault | `^FL;` | `read_only` | Hardware verified on COM21: `^FL00;` |
@@ -24,7 +24,7 @@ Primary references:
 | Operate | `^OS1;` | `rf_risk` | Programmer Reference, still gated |
 | Clear fault | `^FLC;` | `destructive_or_unknown` | Programmer Reference, not sent by test CLI |
 
-`^WSppp sss;` is parsed as forward power watts plus SWR encoded as hundredths. `sss=000` is treated as no-RF/no-SWR-measurement and mapped to SWR `1.0` for bridge state.
+`^WSppp sss;` is parsed as forward power watts plus SWR encoded in tenths. `^WS030 011;` is treated as `30 W` forward power and SWR `1.1`. `sss=000` is treated as no-RF/no-SWR-measurement and mapped to SWR `1.0` for bridge state.
 
 Confirmed hardware baseline:
 
@@ -73,6 +73,8 @@ Confirmed hardware baseline:
 With `dry_run: true`, the serial drivers permit only `read_only` commands. They block `state_change_safe`, `rf_risk`, and `destructive_or_unknown` commands and log the blocked command label, wire string, and safety class.
 
 The `egb test-kpa` and `egb test-kat` commands default to read-only tests. `--allow-control` is required before state-changing control tests are attempted. `--allow-rf-risk` is required before RF-risk tests are attempted. `destructive_or_unknown` commands are not sent by these test commands.
+
+`egb test-kpa-operate --allow-rf-risk` is the explicit local-only RF-risk workflow. It forces standby, sends `^OS1;`, verifies with `^OS;`, immediately sends `^OS0;`, and verifies standby rollback.
 
 Command ACK and verification semantics are tracked in `docs/elecraft-command-semantics.md`.
 

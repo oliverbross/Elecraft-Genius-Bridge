@@ -56,6 +56,12 @@ enum Commands {
         #[arg(long)]
         allow_rf_risk: bool,
     },
+    TestKpaOperate {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        allow_rf_risk: bool,
+    },
     TestKat {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -164,6 +170,14 @@ async fn main() -> Result<()> {
             init_logging(&cfg.logging.level);
             test_kpa(&cfg, allow_control, allow_rf_risk).await
         }
+        Commands::TestKpaOperate {
+            config,
+            allow_rf_risk,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            test_kpa_operate(&cfg, allow_rf_risk).await
+        }
         Commands::TestKat {
             config,
             allow_control,
@@ -254,6 +268,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
                 mock: cfg.kpa500.mock,
                 dry_run: cfg.kpa500.dry_run,
+                allow_rf_risk: cfg.kpa500.allow_rf_risk,
                 control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
                 transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
@@ -372,6 +387,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             serial: cfg.flex_injection.serial.clone(),
             handle_label: cfg.flex_injection.handle.clone(),
             ant_map: cfg.flex_injection.ant_map.clone(),
+            allow_rf_risk: cfg.kpa500.allow_rf_risk,
             reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
             reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
             ping_interval: Duration::from_millis(cfg.flex_injection.ping_interval_ms),
@@ -1066,8 +1082,12 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     println!("KPA500 safety summary:");
     print_bind_safety(cfg)?;
     println!(
-        "  port={} baud={} mock={} dry_run={}",
-        cfg.kpa500.com_port, cfg.kpa500.baud, cfg.kpa500.mock, cfg.kpa500.dry_run
+        "  port={} baud={} mock={} dry_run={} allow_rf_risk={}",
+        cfg.kpa500.com_port,
+        cfg.kpa500.baud,
+        cfg.kpa500.mock,
+        cfg.kpa500.dry_run,
+        cfg.kpa500.allow_rf_risk || allow_rf_risk
     );
     println!(
         "  transcript_dir={}",
@@ -1091,6 +1111,7 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
             mock: cfg.kpa500.mock,
             dry_run: cfg.kpa500.dry_run,
+            allow_rf_risk: cfg.kpa500.allow_rf_risk || allow_rf_risk,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
@@ -1134,10 +1155,62 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     if allow_rf_risk {
         ensure_local_or_lan_bind(cfg)?;
         println!("KPA500 RF-risk test: sending set_operate wire=^OS1; safety=RfRisk");
-        driver.set_operate().await?;
+        let operate = driver.set_operate_verified().await?;
+        print_kpa_control_result("set_operate", &operate);
         println!("KPA500 rollback: sending set_standby wire=^OS0; safety=StateChangeSafe");
         let rollback = driver.set_standby().await?;
         print_kpa_control_result("rollback_standby", &rollback);
+    }
+    Ok(())
+}
+
+async fn test_kpa_operate(cfg: &BridgeConfig, allow_rf_risk: bool) -> Result<()> {
+    if !allow_rf_risk && !cfg.kpa500.allow_rf_risk {
+        anyhow::bail!("test-kpa-operate requires --allow-rf-risk or kpa500.allow_rf_risk=true");
+    }
+    ensure_local_or_lan_bind(cfg)?;
+    println!("KPA500 operate safety summary:");
+    print_bind_safety(cfg)?;
+    println!(
+        "  port={} baud={} mock={} dry_run={} allow_rf_risk={}",
+        cfg.kpa500.com_port,
+        cfg.kpa500.baud,
+        cfg.kpa500.mock,
+        cfg.kpa500.dry_run,
+        cfg.kpa500.allow_rf_risk || allow_rf_risk
+    );
+    println!("  workflow: verify standby -> ^OS1; verify ^OS1; immediate ^OS0; verify ^OS0;");
+    let state = shared_default_state();
+    let driver = Kpa500Driver::new(
+        Kpa500Settings {
+            com_port: cfg.kpa500.com_port.clone(),
+            baud: cfg.kpa500.baud,
+            polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
+            mock: cfg.kpa500.mock,
+            dry_run: cfg.kpa500.dry_run,
+            allow_rf_risk: cfg.kpa500.allow_rf_risk || allow_rf_risk,
+            control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
+            transcript_dir: cfg
+                .logging
+                .serial_transcript_dir
+                .as_ref()
+                .map(PathBuf::from),
+        },
+        state,
+    );
+    driver.connect().await?;
+    println!("KPA500 preflight: sending standby ^OS0;");
+    let standby = driver.set_standby().await?;
+    print_kpa_control_result("preflight_standby", &standby);
+    println!("KPA500 RF-risk: sending operate ^OS1;");
+    let operate = driver.set_operate_verified().await?;
+    print_kpa_control_result("set_operate", &operate);
+    println!("KPA500 rollback: sending standby ^OS0;");
+    let rollback = driver.set_standby().await?;
+    print_kpa_control_result("rollback_standby", &rollback);
+    if rollback.verify_result != Some(KpaCommandResultState::Verified) {
+        anyhow::bail!("rollback standby was not verified");
     }
     Ok(())
 }
@@ -1386,6 +1459,9 @@ fn print_kat_outcome_summary(outcomes: &[KatCommandOutcome]) {
                 outcome.command.label, outcome.command.wire, error
             ),
             _ => {}
+        }
+        for line in &outcome.unsolicited {
+            println!("    unsolicited during {}: {}", outcome.command.label, line);
         }
     }
 }

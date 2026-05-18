@@ -20,12 +20,12 @@ This registry documents response expectations and verification requirements for 
 | `^RVM;` | Read firmware | yes | no | n/a | read_only | hardware verified | `^RVM01.54;` |
 | `^SN;` | Read serial number | yes | no | n/a | read_only | pending transcript | none |
 | `^OS;` | Read operate/standby | yes | no | n/a | read_only | hardware verified | `^OS0;` |
-| `^WS;` | Read power/SWR | yes | no | n/a | read_only | hardware verified | `^WS000 000;` |
+| `^WS;` | Read power/SWR | yes | no | n/a | read_only | hardware verified | `^WS000 000;`, `^WS030 011;` |
 | `^TM;` | Read temperature | yes | no | n/a | read_only | hardware verified | `^TM030;` |
 | `^VI;` | Read PA voltage/current | yes | no | n/a | read_only | hardware verified | `^VI689 000;`, `^VI690 000;` |
 | `^FL;` | Read fault | yes | no | n/a | read_only | hardware verified | `^FL00;` |
 | `^OS0;` | Set standby | no | yes | wait `control.verify_delay_ms`, send `^OS;`, expect `^OS0;` | state_change_safe | hardware behaviour observed as no-ACK; post-verify implemented | `tests/fixtures/kpa500-standby-noack-verify-com21.txt` |
-| `^OS1;` | Set operate | no | yes | not enabled in safe-control phase | rf_risk | not control-validated | none |
+| `^OS1;` | Set operate | no | yes | wait `control.verify_delay_ms`, send `^OS;`, expect `^OS1;`; immediately rollback with `^OS0;` in CLI test | rf_risk | implemented but gated; not yet live-control validated | none |
 | `^FLC;` | Clear fault | no | yes | not enabled | destructive_or_unknown | not control-validated | none |
 
 ## KAT500

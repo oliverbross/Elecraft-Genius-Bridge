@@ -46,6 +46,7 @@ kpa500:
   polling_interval_ms: 1000
   mock: true
   dry_run: true
+  allow_rf_risk: false
 
 kat500:
   enabled: true
@@ -54,11 +55,14 @@ kat500:
   polling_interval_ms: 1000
   mock: true
   dry_run: true
+  allow_rf_risk: false
 ```
 
 Set `mock: false` only when real hardware is connected and command mappings have been checked for your firmware.
 
 Set `dry_run: true` for first hardware tests. Dry-run opens the configured COM port and permits read-only status queries, but blocks control-changing commands such as operate, tune, antenna change, bypass, relay move, and clear fault.
+
+Set `kpa500.allow_rf_risk: true` only for local controlled KPA500 operate testing after dummy-load / no-RF checks. It is required before EGB will translate a Flex/PGXL operate request to `^OS1;`. Standby still uses `^OS0;` and remains state-change-safe, but it is blocked when `dry_run: true`.
 
 ## Logging
 

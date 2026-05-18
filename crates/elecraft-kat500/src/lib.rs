@@ -124,6 +124,7 @@ pub struct ElecraftCommand {
 pub struct CommandOutcome {
     pub command: ElecraftCommand,
     pub response: Option<String>,
+    pub unsolicited: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -361,6 +362,7 @@ impl Kat500Driver {
                 .map(|command| CommandOutcome {
                     command: *command,
                     response: Some("MOCK;".to_string()),
+                    unsolicited: Vec::new(),
                     error: None,
                 })
                 .collect());
@@ -602,12 +604,15 @@ impl Kat500Driver {
         let started = Instant::now();
         let mut outcomes = Vec::with_capacity(read_only_poll_commands().len());
         for command in read_only_poll_commands() {
-            match send_command(port, *command, Duration::from_millis(1000), transcript).await {
-                Ok(response) => {
-                    debug!(command = command.label, response = %response, "KAT500 status response");
+            match send_command_collect(port, *command, Duration::from_millis(1000), transcript)
+                .await
+            {
+                Ok(read) => {
+                    debug!(command = command.label, response = %read.response, "KAT500 status response");
                     outcomes.push(CommandOutcome {
                         command: *command,
-                        response: Some(response),
+                        response: Some(read.response),
+                        unsolicited: read.unsolicited,
                         error: None,
                     });
                 }
@@ -616,6 +621,7 @@ impl Kat500Driver {
                     outcomes.push(CommandOutcome {
                         command: *command,
                         response: None,
+                        unsolicited: Vec::new(),
                         error: Some(err.to_string()),
                     });
                 }
@@ -642,6 +648,9 @@ impl Kat500Driver {
                 if let Some(response) = &outcome.response {
                     push_capability(&mut guard.tuner.capabilities, outcome.command.label);
                     parse_kat500_response(response, &mut guard.tuner);
+                }
+                for unsolicited in &outcome.unsolicited {
+                    parse_kat500_response(unsolicited, &mut guard.tuner);
                 }
             }
         }
@@ -819,7 +828,32 @@ async fn send_command(
     wait: Duration,
     transcript: &mut SerialTranscript,
 ) -> Result<String> {
-    send_wire_command(port, command.label, command.wire, wait, transcript).await
+    Ok(send_command_collect(port, command, wait, transcript)
+        .await?
+        .response)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SerialRead {
+    response: String,
+    unsolicited: Vec<String>,
+}
+
+async fn send_command_collect(
+    port: &mut SerialStream,
+    command: ElecraftCommand,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<SerialRead> {
+    send_wire_command(
+        port,
+        command.label,
+        command.wire,
+        expected_prefixes(command),
+        wait,
+        transcript,
+    )
+    .await
 }
 
 async fn wake_kat500(
@@ -847,44 +881,119 @@ async fn send_dynamic_command(
     wait: Duration,
     transcript: &mut SerialTranscript,
 ) -> Result<String> {
-    send_wire_command(port, command.label, command.wire, wait, transcript).await
+    Ok(send_command_collect(port, command, wait, transcript)
+        .await?
+        .response)
 }
 
 async fn send_wire_command(
     port: &mut SerialStream,
     label: &str,
     wire: &str,
+    expected_prefixes: &[&str],
     wait: Duration,
     transcript: &mut SerialTranscript,
-) -> Result<String> {
+) -> Result<SerialRead> {
     transcript.write_line("TX", wire).await;
     port.write_all(wire.as_bytes())
         .await
         .with_context(|| format!("failed to write serial command {label}"))?;
     port.flush().await.context("failed to flush serial port")?;
 
-    let mut buf = Vec::new();
-    timeout(wait, async {
+    let mut unsolicited = Vec::new();
+    let response = timeout(wait, async {
         loop {
-            let mut byte = [0_u8; 1];
-            let n = port.read(&mut byte).await?;
-            if n == 0 {
-                continue;
+            let response = read_serial_line(port).await?;
+            transcript.write_line("RX", &response).await;
+            if matches_expected_response(&response, wire, expected_prefixes) {
+                debug!(
+                    device = "KAT500",
+                    command = label,
+                    expected_prefix = ?expected_prefixes,
+                    received = %response,
+                    classification = "matched",
+                    "KAT500 serial response matched command"
+                );
+                break Ok::<String, std::io::Error>(response);
             }
-            buf.push(byte[0]);
-            if byte[0] == b';' || byte[0] == b'\n' {
-                break;
-            }
+            let classification = if response == wire {
+                "echo_only"
+            } else if is_unsolicited_response(&response) {
+                "unsolicited"
+            } else {
+                "mismatched"
+            };
+            debug!(
+                device = "KAT500",
+                command = label,
+                expected_prefix = ?expected_prefixes,
+                received = %response,
+                classification,
+                "KAT500 serial response did not match current command"
+            );
+            unsolicited.push(response);
         }
-        Ok::<(), std::io::Error>(())
     })
     .await
     .context("serial response timed out")?
     .context("failed reading serial response")?;
 
-    let response = String::from_utf8_lossy(&buf).trim().to_string();
-    transcript.write_line("RX", &response).await;
-    Ok(response)
+    Ok(SerialRead {
+        response,
+        unsolicited,
+    })
+}
+
+async fn read_serial_line(port: &mut SerialStream) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let n = port.read(&mut byte).await?;
+        if n == 0 {
+            continue;
+        }
+        buf.push(byte[0]);
+        if byte[0] == b';' || byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+fn expected_prefixes(command: ElecraftCommand) -> &'static [&'static str] {
+    match command.label {
+        "null_wake" => &[";"],
+        "read_firmware" => &["RV"],
+        "read_serial_number" => &["SN"],
+        "read_antenna" | "set_antenna" => &["AN"],
+        "read_bypass" | "set_bypass_on" | "set_bypass_off" => &["BYP"],
+        "read_mode" => &["MD"],
+        "read_tune_poll" => &["TP"],
+        "read_fault" => &["FLT"],
+        "read_vswr" => &["VSWR "],
+        "read_forward_adc" => &["VFWD "],
+        "autotune" => &["T", "TP", "VSWR", "VRFL", "F", "ATTN", "AMPI", "BN"],
+        _ => &[],
+    }
+}
+
+fn matches_expected_response(response: &str, wire: &str, expected_prefixes: &[&str]) -> bool {
+    if response == wire {
+        return true;
+    }
+    expected_prefixes
+        .iter()
+        .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
+}
+
+fn is_unsolicited_response(response: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "F", "VRFL", "ATTN", "AMPI", "BN", "VSWRB", "VSWR ", "VFWD ", "TP", "FLT", "AN", "BYP",
+        "MD", "RV", "SN",
+    ];
+    PREFIXES
+        .iter()
+        .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
 }
 
 fn antenna_command(antenna: u8) -> ElecraftCommand {
@@ -1091,6 +1200,43 @@ mod tests {
         let mut tuner = bridge_core::TunerState::default();
         parse_kat500_response("VSWR 0.0;", &mut tuner);
         assert_eq!(tuner.swr, 1.0);
+    }
+
+    #[test]
+    fn response_matching_routes_out_of_order_lines() {
+        assert!(!matches_expected_response(
+            "VRFL 0;",
+            "AN;",
+            expected_prefixes(CMD_ANTENNA_STATUS)
+        ));
+        assert!(is_unsolicited_response("VRFL 0;"));
+        assert!(matches_expected_response(
+            "AN2;",
+            "AN;",
+            expected_prefixes(CMD_ANTENNA_STATUS)
+        ));
+        assert!(!matches_expected_response(
+            "VSWR 1.69;",
+            "BYP;",
+            expected_prefixes(CMD_BYPASS_STATUS)
+        ));
+        assert!(is_unsolicited_response("VSWR 1.69;"));
+        assert!(matches_expected_response(
+            "BYPN;",
+            "BYP;",
+            expected_prefixes(CMD_BYPASS_STATUS)
+        ));
+
+        let fixture =
+            include_str!("../../../tests/fixtures/kat500-out-of-order-after-tune-com8.txt");
+        let mut tuner = bridge_core::TunerState::default();
+        for line in fixture.lines().filter_map(|line| line.strip_prefix("RX ")) {
+            parse_kat500_response(line, &mut tuner);
+        }
+        assert_eq!(tuner.selected_antenna, Some(2));
+        assert!(!tuner.bypass);
+        assert!(tuner.operate);
+        assert_eq!(tuner.swr, 1.69);
     }
 
     #[test]

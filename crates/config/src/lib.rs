@@ -102,6 +102,7 @@ impl Default for BridgeConfig {
                 polling_interval_ms: 1000,
                 mock: true,
                 dry_run: true,
+                allow_rf_risk: false,
             },
             kat500: SerialDeviceConfig {
                 enabled: true,
@@ -110,6 +111,7 @@ impl Default for BridgeConfig {
                 polling_interval_ms: 1000,
                 mock: true,
                 dry_run: true,
+                allow_rf_risk: false,
             },
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
@@ -198,6 +200,7 @@ pub struct SerialDeviceConfig {
     pub polling_interval_ms: u64,
     pub mock: bool,
     pub dry_run: bool,
+    pub allow_rf_risk: bool,
 }
 
 impl SerialDeviceConfig {
@@ -228,6 +231,7 @@ impl Default for SerialDeviceConfig {
             polling_interval_ms: 1000,
             mock: true,
             dry_run: true,
+            allow_rf_risk: false,
         }
     }
 }

@@ -24,6 +24,7 @@ kpa500:
   polling_interval_ms: 1000
   mock: false
   dry_run: false
+  allow_rf_risk: false
 
 kat500:
   enabled: true
@@ -33,6 +34,7 @@ kat500:
   mock: false
   # Keep tuner controls blocked until a separate KAT500 control phase.
   dry_run: true
+  allow_rf_risk: false
 
 security:
   token:

@@ -24,6 +24,7 @@ kpa500:
   polling_interval_ms: 1000
   mock: false
   dry_run: true
+  allow_rf_risk: false
 
 kat500:
   enabled: true
@@ -32,6 +33,7 @@ kat500:
   polling_interval_ms: 1000
   mock: false
   dry_run: true
+  allow_rf_risk: false
 
 security:
   token:

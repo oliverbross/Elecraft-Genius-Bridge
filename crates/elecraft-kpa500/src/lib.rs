@@ -172,6 +172,7 @@ pub struct Kpa500Settings {
     pub polling_interval: Duration,
     pub mock: bool,
     pub dry_run: bool,
+    pub allow_rf_risk: bool,
     pub control_verify_delay: Duration,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
@@ -252,6 +253,17 @@ impl Kpa500Driver {
                     }
                     self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
+                        if let Err(err) = self
+                            .process_desired_control(&mut port, &mut transcript)
+                            .await
+                        {
+                            warn!(
+                                event_id = "command_blocked_by_safety",
+                                device = "KPA500",
+                                error = %err,
+                                "KPA500 desired control request was not applied"
+                            );
+                        }
                         if let Err(err) = self.poll_status_on_port(&mut port, &mut transcript).await
                         {
                             warn!(event_id = "serial_disconnected", device = "KPA500", error = %err, "KPA500 poll failed; reconnecting");
@@ -363,12 +375,31 @@ impl Kpa500Driver {
     }
 
     pub async fn set_operate(&self) -> Result<()> {
+        let result = self.set_operate_verified().await?;
+        if result.verify_result != Some(CommandResultState::Verified) {
+            anyhow::bail!(
+                "KPA500 operate was not verified: send={:?} verify={:?} response={:?}",
+                result.send_result,
+                result.verify_result,
+                result.verification_response
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn set_operate_verified(&self) -> Result<ControlCommandResult> {
         self.ensure_can_send(CMD_OPERATE)?;
         if self.settings.mock {
             let mut guard = self.state.write().await;
             guard.amp.operate = true;
             guard.amp.state = AmpOperatingState::Operate;
-            return Ok(());
+            return Ok(ControlCommandResult {
+                command: CMD_OPERATE,
+                send_result: CommandResultState::SentNoAck,
+                verify_result: Some(CommandResultState::Verified),
+                verification_response: Some("^OS1;".to_string()),
+                final_state: Some(AmpOperatingState::Operate),
+            });
         }
         let mut port = tokio_serial::new(self.settings.com_port.clone(), self.settings.baud)
             .open_native_async()
@@ -385,14 +416,8 @@ impl Kpa500Driver {
             self.settings.transcript_rotate_bytes,
         )
         .await;
-        send_command(
-            &mut port,
-            CMD_OPERATE,
-            Duration::from_millis(750),
-            &mut transcript,
-        )
-        .await?;
-        Ok(())
+        self.send_ackless_verified(&mut port, &mut transcript, CMD_OPERATE, true)
+            .await
     }
 
     pub async fn set_standby(&self) -> Result<ControlCommandResult> {
@@ -425,33 +450,86 @@ impl Kpa500Driver {
             self.settings.transcript_rotate_bytes,
         )
         .await;
-        send_no_ack_command(&mut port, CMD_STANDBY, &mut transcript).await?;
+        self.send_ackless_verified(&mut port, &mut transcript, CMD_STANDBY, false)
+            .await
+    }
+
+    async fn process_desired_control(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) -> Result<()> {
+        let desired = {
+            let mut guard = self.state.write().await;
+            guard.desired.amp_operate.take()
+        };
+        let Some(operate) = desired else {
+            return Ok(());
+        };
+        let command = if operate { CMD_OPERATE } else { CMD_STANDBY };
+        info!(
+            event_id = "pgxl_control_mapping",
+            requested_operate = operate,
+            kpa_command = command.wire,
+            safety = ?command.safety,
+            dry_run = self.settings.dry_run,
+            allow_rf_risk = self.settings.allow_rf_risk,
+            "mapping PGXL/Flex amplifier control to KPA500"
+        );
+        let result = self
+            .send_ackless_verified(port, transcript, command, operate)
+            .await?;
+        info!(
+            event_id = "pgxl_control_result",
+            command = command.label,
+            send_result = ?result.send_result,
+            verify_result = ?result.verify_result,
+            verification_response = ?result.verification_response,
+            final_state = ?result.final_state,
+            "KPA500 mapped control completed"
+        );
+        Ok(())
+    }
+
+    async fn send_ackless_verified(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+        command: ElecraftCommand,
+        expected_operate: bool,
+    ) -> Result<ControlCommandResult> {
+        self.ensure_can_send(command)?;
+        send_no_ack_command(port, command, transcript).await?;
         sleep(self.settings.control_verify_delay).await;
         match send_command(
-            &mut port,
+            port,
             CMD_OPERATE_STATUS,
             Duration::from_millis(1000),
-            &mut transcript,
+            transcript,
         )
         .await
         {
             Ok(response) => {
                 let mut amp = bridge_core::AmpState::default();
                 parse_kpa500_response(&response, &mut amp);
-                let verified = !amp.operate && matches!(amp.state, AmpOperatingState::Standby);
+                let verified = amp.operate == expected_operate
+                    && matches!(
+                        (expected_operate, amp.state),
+                        (false, AmpOperatingState::Standby) | (true, AmpOperatingState::Operate)
+                    );
                 if verified {
                     let mut guard = self.state.write().await;
                     parse_kpa500_response(&response, &mut guard.amp);
                     Ok(ControlCommandResult {
-                        command: CMD_STANDBY,
+                        command,
                         send_result: CommandResultState::SentNoAck,
                         verify_result: Some(CommandResultState::Verified),
                         verification_response: Some(response),
-                        final_state: Some(AmpOperatingState::Standby),
+                        final_state: Some(amp.state),
                     })
                 } else {
                     Ok(ControlCommandResult {
-                        command: CMD_STANDBY,
+                        command,
                         send_result: CommandResultState::SentNoAck,
                         verify_result: Some(CommandResultState::VerifyFailed),
                         verification_response: Some(response),
@@ -460,7 +538,7 @@ impl Kpa500Driver {
                 }
             }
             Err(err) => Ok(ControlCommandResult {
-                command: CMD_STANDBY,
+                command,
                 send_result: CommandResultState::SentNoAck,
                 verify_result: Some(CommandResultState::Timeout),
                 verification_response: Some(err.to_string()),
@@ -515,6 +593,19 @@ impl Kpa500Driver {
                 "KPA500 dry-run blocked {} ({:?})",
                 command.label,
                 command.safety
+            );
+        }
+        if command.safety == CommandSafety::RfRisk && !self.settings.allow_rf_risk {
+            warn!(
+                event_id = "blocked_rf_risk_control",
+                device = "KPA500",
+                command = command.label,
+                wire = command.wire,
+                "blocked RF-risk KPA500 command because allow_rf_risk is false"
+            );
+            anyhow::bail!(
+                "KPA500 RF-risk command {} requires allow_rf_risk",
+                command.label
             );
         }
         Ok(())
@@ -748,8 +839,8 @@ fn parse_kpa_swr(raw: &str) -> Option<f32> {
     if value == 0 {
         return Some(1.0);
     }
-    if (100..=990).contains(&value) {
-        return Some(f32::from(value) / 100.0);
+    if (10..=990).contains(&value) {
+        return Some(f32::from(value) / 10.0);
     }
     None
 }
@@ -994,7 +1085,7 @@ mod tests {
         parse_kpa500_response("^RVM01.23;", &mut amp);
         parse_kpa500_response("^SN12345;", &mut amp);
         parse_kpa500_response("^OS1;", &mut amp);
-        parse_kpa500_response("^WS500 150;", &mut amp);
+        parse_kpa500_response("^WS500 015;", &mut amp);
         parse_kpa500_response("^TM034;", &mut amp);
         parse_kpa500_response("^VI689 125;", &mut amp);
         parse_kpa500_response("^FL07;", &mut amp);
@@ -1046,13 +1137,24 @@ mod tests {
     }
 
     #[test]
+    fn parser_handles_live_power_swr_tenths() {
+        let fixture = include_str!("../../../tests/fixtures/kpa500-live-ws-com21.txt");
+        let mut amp = bridge_core::AmpState::default();
+        for line in fixture.lines().filter(|line| line.starts_with('^')) {
+            parse_kpa500_response(line, &mut amp);
+        }
+        assert_eq!(amp.forward_power_watts, 30.0);
+        assert_eq!(amp.swr, 1.1);
+    }
+
+    #[test]
     fn parser_rejects_impossible_swr_values() {
         let mut amp = bridge_core::AmpState::default();
-        parse_kpa500_response("^WS000 099;", &mut amp);
+        parse_kpa500_response("^WS000 009;", &mut amp);
         assert_eq!(amp.swr, 1.0);
         parse_kpa500_response("^WS000 991;", &mut amp);
         assert_eq!(amp.swr, 1.0);
-        parse_kpa500_response("^WS000 140;", &mut amp);
+        parse_kpa500_response("^WS000 014;", &mut amp);
         assert_eq!(amp.swr, 1.4);
     }
 

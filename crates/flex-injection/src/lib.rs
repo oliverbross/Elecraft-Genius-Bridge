@@ -16,6 +16,7 @@ pub struct FlexInjectionSettings {
     pub serial: String,
     pub handle_label: String,
     pub ant_map: String,
+    pub allow_rf_risk: bool,
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
     pub ping_interval: Duration,
@@ -73,6 +74,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
 
     let create = settings.amplifier_create_command();
     let mut create_sent = false;
+    let mut subscribe_sent = false;
     let mut next_seq = 1_u32;
     let mut ping_timer = Box::pin(sleep(settings.ping_interval));
 
@@ -107,6 +109,15 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                             "Flex amplifier object creation accepted"
                         );
                         log_amp_snapshot(&state).await;
+                        if !subscribe_sent {
+                            send_command(&mut writer, next_seq, "sub amplifier all").await?;
+                            info!(
+                                seq = next_seq,
+                                "Flex amplifier subscription sent"
+                            );
+                            next_seq = next_seq.saturating_add(1);
+                            subscribe_sent = true;
+                        }
                     } else if seq == 1 {
                         warn!(
                             seq,
@@ -114,6 +125,19 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                             body = %body,
                             "Flex amplifier object creation rejected"
                         );
+                    }
+                }
+
+                if let Some(status) = parse_amplifier_status(&line) {
+                    if session.observe_amplifier_status(settings, &status) {
+                        handle_amplifier_status(
+                            settings,
+                            &state,
+                            &mut writer,
+                            &mut next_seq,
+                            &status,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -149,6 +173,7 @@ struct FlexSession {
     has_handle: bool,
     handle: Option<String>,
     version: Option<String>,
+    amplifier_handle: Option<String>,
 }
 
 impl FlexSession {
@@ -163,6 +188,135 @@ impl FlexSession {
             info!(%handle, "Flex API client handle received");
         }
     }
+
+    fn observe_amplifier_status(
+        &mut self,
+        settings: &FlexInjectionSettings,
+        status: &AmplifierStatus,
+    ) -> bool {
+        let model_match = status
+            .value("model")
+            .is_some_and(|model| model == settings.amplifier_model);
+        let serial_match = status
+            .value("serial_num")
+            .is_some_and(|serial| serial == settings.serial);
+        let known_handle = self.amplifier_handle.as_deref() == Some(status.handle.as_str());
+        if model_match || serial_match || known_handle {
+            if self.amplifier_handle.as_deref() != Some(status.handle.as_str()) {
+                self.amplifier_handle = Some(status.handle.clone());
+                info!(
+                    amplifier_handle = %status.handle,
+                    model = status.value("model").unwrap_or(""),
+                    serial = status.value("serial_num").unwrap_or(""),
+                    "Flex amplifier object handle observed"
+                );
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+async fn handle_amplifier_status(
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    next_seq: &mut u32,
+    status: &AmplifierStatus,
+) -> Result<()> {
+    let requested = status.requested_operate();
+    debug!(
+        amplifier_handle = %status.handle,
+        requested_operate = ?requested,
+        raw = %status.raw,
+        "Flex amplifier status observed"
+    );
+    let Some(operate) = requested else {
+        return Ok(());
+    };
+
+    if operate && !settings.allow_rf_risk {
+        warn!(
+            event_id = "blocked_rf_risk_control",
+            amplifier_handle = %status.handle,
+            raw = %status.raw,
+            "Flex requested amplifier operate while RF-risk control is disabled"
+        );
+        let command = format!("amplifier set {} operate=0", status.handle);
+        send_command(writer, *next_seq, &command).await?;
+        info!(
+            seq = *next_seq,
+            command = %command,
+            "Flex amplifier operate request reverted to standby"
+        );
+        *next_seq = (*next_seq).saturating_add(1);
+        return Ok(());
+    }
+
+    {
+        let mut guard = state.write().await;
+        if guard.desired.amp_operate != Some(operate) {
+            guard.desired.amp_operate = Some(operate);
+        }
+    }
+    info!(
+        event_id = "pgxl_control_mapping",
+        amplifier_handle = %status.handle,
+        requested_operate = operate,
+        allow_rf_risk = settings.allow_rf_risk,
+        "Flex amplifier state mapped to KPA500 desired state"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct AmplifierStatus {
+    raw: String,
+    handle: String,
+    kvs: Vec<(String, String)>,
+}
+
+impl AmplifierStatus {
+    fn value(&self, key: &str) -> Option<&str> {
+        self.kvs
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn requested_operate(&self) -> Option<bool> {
+        if let Some(value) = self.value("operate") {
+            return match value {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            };
+        }
+        let state = self.value("state")?.to_ascii_uppercase();
+        Some(matches!(
+            state.as_str(),
+            "IDLE" | "OPERATE" | "TRANSMIT" | "TRANSMIT_A" | "TRANSMIT_B"
+        ))
+    }
+}
+
+fn parse_amplifier_status(line: &str) -> Option<AmplifierStatus> {
+    let body = line.split_once('|')?.1;
+    let rest = body.strip_prefix("amplifier ")?;
+    let mut parts = rest.split_whitespace();
+    let handle = parts.next()?.to_string();
+    let kvs = parts
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    Some(AmplifierStatus {
+        raw: line.to_string(),
+        handle,
+        kvs,
+    })
 }
 
 async fn log_amp_snapshot(state: &SharedState) {
@@ -259,5 +413,21 @@ mod tests {
             Some((44, "0".to_string(), "32".to_string()))
         );
         assert_eq!(parse_response("S0|amplifier 0x1 model=PowerGeniusXL"), None);
+    }
+
+    #[test]
+    fn parses_amplifier_status_operate_request() {
+        let status = parse_amplifier_status(
+            "S1A2B|amplifier 0x42000001 model=PowerGeniusXL serial_num=EGB-KPA500 operate=1",
+        )
+        .unwrap();
+        assert_eq!(status.handle, "0x42000001");
+        assert_eq!(status.value("model"), Some("PowerGeniusXL"));
+        assert_eq!(status.requested_operate(), Some(true));
+
+        let standby =
+            parse_amplifier_status("S1A2B|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
+                .unwrap();
+        assert_eq!(standby.requested_operate(), Some(false));
     }
 }

@@ -1,6 +1,6 @@
 # Flex Amplifier Presence Injection
 
-Status: Phase 17 passive prototype implemented. Presence only; no RF-risk control.
+Status: Phase 18 control observation prototype implemented. RF-risk operate remains gated.
 
 ## Research Sources
 
@@ -35,7 +35,8 @@ stateDiagram-v2
     Connecting --> WaitingForHandle: TCP connected
     WaitingForHandle --> Registering: H<handle> received
     Registering --> Registered: R1|0
-    Registered --> Registered: periodic ping
+    Registered --> Registered: sub amplifier all / periodic ping
+    Registered --> Registered: observe operate=0/1 status
     Registered --> Reconnecting: TCP error / timeout
     Reconnecting --> Connecting: exponential backoff
 ```
@@ -86,22 +87,39 @@ Actual panel telemetry still comes from the existing PGXL direct socket on port 
 | `vac` | `0` until safe AC mains equivalent is validated |
 | `meffa` | safe compatibility placeholder |
 
-Phase 17 does not create Flex meters or UDP VITA meter streams. If AetherSDR requires radio-side meters in addition to direct PGXL telemetry, that will be a later correction loop.
+Phase 17/18 does not create Flex meters or UDP VITA meter streams. If AetherSDR requires radio-side meters in addition to direct PGXL telemetry, that will be a later correction loop.
 
 ## Control Policy
 
-Phase 17 sends no RF-risk commands.
+Phase 18 observes the Flex radio amplifier status after AetherSDR sends:
+
+```text
+amplifier set <handle> operate=0|1
+```
+
+That exact command comes from `MainWindow.cpp` in the inspected AetherSDR source when the AMP applet operate button is pressed.
+
+EGB subscribes to `sub amplifier all`, watches status for the registered amplifier object, and maps:
+
+- `operate=0` or standby-like state to desired KPA500 standby `^OS0;`.
+- `operate=1` or operate/transmit-like state to desired KPA500 operate `^OS1;`, only when RF-risk is explicitly allowed.
+
+If RF-risk is disabled and the radio reports `operate=1`, EGB sends a radio-side revert:
+
+```text
+amplifier set <handle> operate=0
+```
+
+and does not send `^OS1;`.
 
 Not implemented:
 
-- `amplifier set <handle> operate=1`
-- `amplifier set <handle> operate=0`
 - meter creation
 - interlock creation
 - proxy command interception
 - WAN exposure
 
-KPA500 standby remains available only through existing explicit local CLI safety gates, not through Flex injection.
+KPA500 standby is state-change-safe but still blocked when `kpa500.dry_run: true`. KPA500 operate requires `kpa500.allow_rf_risk: true` or the explicit `test-kpa-operate --allow-rf-risk` CLI path.
 
 ## Expected AetherSDR Behavior
 
