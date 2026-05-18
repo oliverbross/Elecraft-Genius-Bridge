@@ -95,6 +95,7 @@ pub struct BridgeState {
     pub band: Band,
     pub amp: AmpState,
     pub tuner: TunerState,
+    pub flex_injection: FlexInjectionState,
     pub clients: ClientState,
     pub desired: DesiredState,
     pub protocol: ProtocolCounters,
@@ -107,6 +108,7 @@ impl Default for BridgeState {
             band: Band::M20,
             amp: AmpState::default(),
             tuner: TunerState::default(),
+            flex_injection: FlexInjectionState::default(),
             clients: ClientState::default(),
             desired: DesiredState::default(),
             protocol: ProtocolCounters::default(),
@@ -280,6 +282,27 @@ pub struct DeviceRuntimeStats {
     pub last_poll_latency_ms: u64,
     pub max_poll_latency_ms: u64,
     pub total_poll_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FlexInjectionState {
+    pub enabled: bool,
+    pub connection_state: ConnectionState,
+    pub client_handle: Option<String>,
+    pub amplifier_handle: Option<String>,
+    pub meter_handles: Vec<FlexMeterHandle>,
+    pub interlock_handle: Option<String>,
+    pub last_command: Option<String>,
+    pub last_response: Option<String>,
+    pub command_success_count: u64,
+    pub command_failure_count: u64,
+    pub ping_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlexMeterHandle {
+    pub name: String,
+    pub handle: String,
 }
 
 impl DeviceRuntimeStats {

@@ -12,7 +12,7 @@
 ## Must Fix Before Public Release
 
 - Validate against current AetherSDR builds on macOS.
-- Resolve PGXL applet activation path: AetherSDR requires radio-side `amplifier` presence for AMP visibility in the inspected source.
+- Resolve PGXL full SmartSDR visibility: AetherSDR AMP pane appears, but SmartSDR does not yet see the amp and AetherSDR Peripherals still reports PGXL Not connected.
 - Resolve TGXL binary/source mismatch: inspected AetherSDR source supports direct TGXL presence, but the tested binary reportedly did not show the TUN applet.
 - Validate corrected KPA500/KAT500 command mappings against hardware transcripts.
 - Expand Elecraft parsers only from official references or captured hardware responses.
@@ -29,7 +29,9 @@
 - Whether PGXL applet visibility should be solved by native Flex radio configuration, an AetherSDR patch, a Flex API proxy, or another documented SmartSDR-compatible path.
 - Whether the user's AetherSDR build includes the `TunerModel::m_directPresence` fallback for TGXL.
 - Whether AetherSDR tolerates extra `connection_state` and `fault` fields in status responses.
-- Exact PGXL direct TCP command set for operate/standby, if any.
+- Exact PGXL direct TCP command set for operate/standby, if any. AetherSDR AMP operate currently uses Flex `amplifier set <handle> operate=<0|1>`.
+- Exact PGXL direct fields that drive AetherSDR Peripherals connected state.
+- Exact external-amplifier Flex meter value publication path after `meter create`.
 - Exact error codes used by real PGXL/TGXL devices.
 - Real TGXL autotune lifecycle timing and messages.
 - Whether AetherSDR requires additional fields during longer sessions.
@@ -61,8 +63,8 @@
 ## Applet Activation
 
 - Determine whether Flex can be configured to advertise synthetic PGXL/TGXL amplifier records without real Genius hardware.
-- Validate Phase 17 `amplifier create` registration against a real Flex radio and AetherSDR.
-- Capture whether the radio broadcasts the created amplifier object to AetherSDR after `sub amplifier all`.
+- Validate Phase 19 full PGXL registration sequence against a real Flex radio, SmartSDR, and AetherSDR.
+- Capture whether the radio broadcasts amplifier, meter, and interlock status after full registration.
 - Verify Oliver's installed macOS AetherSDR binary is `0.9.5` or newer, or otherwise contains the direct TGXL presence fix from #2250.
 - Run the AetherSDR layout reset helper after confirming the binary contains direct TGXL presence.
 - Keep Flex API proxy mode separate from direct PGXL/TGXL emulation.

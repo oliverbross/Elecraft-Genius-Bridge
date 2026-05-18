@@ -1,0 +1,4 @@
+Observed in Phase 19:
+- SmartSDR sees the injected tuner through the radio-side accessory path.
+- SmartSDR does not yet see the injected amplifier with amplifier-create-only registration.
+- Working hypothesis: SmartSDR expects the PGXL radio-side contract to include AMP meters, AMP interlock, keepalive, and matching serial/antenna map metadata.

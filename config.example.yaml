@@ -8,6 +8,7 @@ pgxl:
   aethersdr_compat: false
   strict_emulation: false
   startup_delay_ms: 0
+  force_direct_connected_test: false
 
 tgxl:
   enabled: true
@@ -66,7 +67,10 @@ flex_injection:
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
   handle: amp_1
-  ant_map: ANT1:PORTA,ANT2:NONE
+  ant_map: ANT1:PORTA,ANT2:PORTB
+  full_pgxl_registration: true
+  create_meters: true
+  create_interlock: true
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000

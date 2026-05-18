@@ -6,7 +6,7 @@ use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const DISCOVERY_BAUDS: [u32; 5] = [38400, 19200, 9600, 4800, 38400];
 
@@ -923,14 +923,25 @@ async fn send_wire_command(
             } else {
                 "mismatched"
             };
-            debug!(
-                device = "KAT500",
-                command = label,
-                expected_prefix = ?expected_prefixes,
-                received = %response,
-                classification,
-                "KAT500 serial response did not match current command"
-            );
+            if classification == "unsolicited" || classification == "echo_only" {
+                trace!(
+                    device = "KAT500",
+                    command = label,
+                    expected_prefix = ?expected_prefixes,
+                    received = %response,
+                    classification,
+                    "KAT500 serial response did not match current command"
+                );
+            } else {
+                debug!(
+                    device = "KAT500",
+                    command = label,
+                    expected_prefix = ?expected_prefixes,
+                    received = %response,
+                    classification,
+                    "KAT500 serial response did not match current command"
+                );
+            }
             unsolicited.push(response);
         }
     })
@@ -1237,6 +1248,10 @@ mod tests {
         assert!(!tuner.bypass);
         assert!(tuner.operate);
         assert_eq!(tuner.swr, 1.69);
+
+        let burst = include_str!("../../../tests/fixtures/kat500-unsolicited-burst-com8.txt");
+        assert!(burst.lines().any(|line| line == "RX VRFL 0;"));
+        assert!(burst.lines().any(|line| line == "RX ATTN0;"));
     }
 
     #[test]

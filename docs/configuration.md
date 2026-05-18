@@ -117,19 +117,24 @@ flex_injection:
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
   handle: amp_1
-  ant_map: ANT1:PORTA,ANT2:NONE
+  ant_map: ANT1:PORTA,ANT2:PORTB
+  full_pgxl_registration: true
+  create_meters: true
+  create_interlock: true
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
 ```
 
-Phase 17 `flex_injection` is a passive LAN/local-only registration client. It connects to the Flex radio TCP API on port `4992` and sends `amplifier create` so the radio can advertise a `PowerGeniusXL`-compatible amplifier to AetherSDR.
+Phase 19 `flex_injection` is a LAN/local-only registration client. It connects to the Flex radio TCP API on port `4992` and sends the documented PGXL-style amplifier registration sequence so the radio can advertise a `PowerGeniusXL`-compatible amplifier to AetherSDR/SmartSDR.
 
 `amplifier_ip` must be the Windows bridge IP that macOS AetherSDR can reach. AetherSDR should use that IP for its direct PGXL connection on `amplifier_port`.
 
 The configured `handle` is an EGB log/config label. The real Flex amplifier object handle is assigned by the radio and observed by AetherSDR through normal radio status.
 
-This mode does not implement operate/RF commands, meter creation, interlock creation, proxying, TLS, or WAN exposure.
+`full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
+
+This mode does not implement live radio-side meter value streaming, proxying, TLS, or WAN exposure. Operate remains RF-risk gated by `kpa500.allow_rf_risk`.
 
 ## Soak Test
 

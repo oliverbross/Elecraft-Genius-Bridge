@@ -322,6 +322,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             aethersdr_compat: cfg.pgxl.aethersdr_compat,
             strict_emulation: cfg.pgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.pgxl.startup_delay_ms),
+            force_direct_connected_test: cfg.pgxl.force_direct_connected_test,
         };
         tokio::spawn(async move {
             if let Err(err) = pgxl_emulator::run_with_options(addr, state, options).await {
@@ -387,6 +388,9 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             serial: cfg.flex_injection.serial.clone(),
             handle_label: cfg.flex_injection.handle.clone(),
             ant_map: cfg.flex_injection.ant_map.clone(),
+            full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
+            create_meters: cfg.flex_injection.create_meters,
+            create_interlock: cfg.flex_injection.create_interlock,
             allow_rf_risk: cfg.kpa500.allow_rf_risk,
             reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
             reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
@@ -601,6 +605,7 @@ async fn status_json(state: &SharedState) -> String {
             "pgxl_client_count": guard.clients.pgxl_client_count,
             "tgxl_client_count": guard.clients.tgxl_client_count,
         },
+        "flex_injection": guard.flex_injection,
         "protocol": guard.protocol,
     })
     .to_string()

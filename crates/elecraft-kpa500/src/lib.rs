@@ -6,7 +6,7 @@ use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 // KPA500 Programmer Reference caret-prefixed command set.
 // Keep all mappings isolated here so hardware transcripts can correct them
@@ -115,6 +115,7 @@ pub struct CommandOutcome {
     pub command: ElecraftCommand,
     pub response: Option<String>,
     pub error: Option<String>,
+    pub unsolicited: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +354,7 @@ impl Kpa500Driver {
                     command: *command,
                     response: Some("MOCK;".to_string()),
                     error: None,
+                    unsolicited: Vec::new(),
                 })
                 .collect());
         }
@@ -654,13 +656,16 @@ impl Kpa500Driver {
         let started = Instant::now();
         let mut outcomes = Vec::with_capacity(read_only_poll_commands().len());
         for command in read_only_poll_commands() {
-            match send_command(port, *command, Duration::from_millis(1000), transcript).await {
-                Ok(response) => {
-                    debug!(command = command.label, response = %response, "KPA500 status response");
+            match send_command_collect(port, *command, Duration::from_millis(1000), transcript)
+                .await
+            {
+                Ok(read) => {
+                    debug!(command = command.label, response = %read.response, unsolicited_count = read.unsolicited.len(), "KPA500 status response");
                     outcomes.push(CommandOutcome {
                         command: *command,
-                        response: Some(response),
+                        response: Some(read.response),
                         error: None,
+                        unsolicited: read.unsolicited,
                     });
                 }
                 Err(err) => {
@@ -669,6 +674,7 @@ impl Kpa500Driver {
                         command: *command,
                         response: None,
                         error: Some(err.to_string()),
+                        unsolicited: Vec::new(),
                     });
                 }
             }
@@ -691,6 +697,9 @@ impl Kpa500Driver {
                     guard.amp.runtime.poll_failure_count.saturating_add(1);
             }
             for outcome in &outcomes {
+                for unsolicited in &outcome.unsolicited {
+                    parse_kpa500_response(unsolicited, &mut guard.amp);
+                }
                 if let Some(response) = &outcome.response {
                     push_capability(&mut guard.amp.capabilities, outcome.command.label);
                     parse_kpa500_response(response, &mut guard.amp);
@@ -907,34 +916,124 @@ async fn send_command(
     wait: Duration,
     transcript: &mut SerialTranscript,
 ) -> Result<String> {
+    Ok(send_command_collect(port, command, wait, transcript)
+        .await?
+        .response)
+}
+
+struct SerialRead {
+    response: String,
+    unsolicited: Vec<String>,
+}
+
+async fn send_command_collect(
+    port: &mut SerialStream,
+    command: ElecraftCommand,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<SerialRead> {
     transcript.write_line("TX", command.wire).await;
     port.write_all(command.wire.as_bytes())
         .await
         .with_context(|| format!("failed to write serial command {}", command.label))?;
     port.flush().await.context("failed to flush serial port")?;
 
-    let mut buf = Vec::new();
-    timeout(wait, async {
+    let expected_prefixes = expected_prefixes(command);
+    let mut unsolicited = Vec::new();
+    let response = timeout(wait, async {
         loop {
-            let mut byte = [0_u8; 1];
-            let n = port.read(&mut byte).await?;
-            if n == 0 {
-                continue;
+            let response = read_serial_line(port).await?;
+            transcript.write_line("RX", &response).await;
+            if matches_expected_response(&response, expected_prefixes) {
+                debug!(
+                    device = "KPA500",
+                    command = command.label,
+                    expected_prefix = ?expected_prefixes,
+                    received = %response,
+                    classification = "matched",
+                    "KPA500 serial response matched command"
+                );
+                break Ok::<String, std::io::Error>(response);
             }
-            buf.push(byte[0]);
-            if byte[0] == b';' || byte[0] == b'\n' {
-                break;
+            let classification = if response == command.wire {
+                "echo_only"
+            } else if is_unsolicited_response(&response) {
+                "unsolicited"
+            } else {
+                "mismatched"
+            };
+            if classification == "unsolicited" || classification == "echo_only" {
+                trace!(
+                    device = "KPA500",
+                    command = command.label,
+                    expected_prefix = ?expected_prefixes,
+                    received = %response,
+                    classification,
+                    "KPA500 serial response did not match current command"
+                );
+            } else {
+                debug!(
+                    device = "KPA500",
+                    command = command.label,
+                    expected_prefix = ?expected_prefixes,
+                    received = %response,
+                    classification,
+                    "KPA500 serial response did not match current command"
+                );
             }
+            unsolicited.push(response);
         }
-        Ok::<(), std::io::Error>(())
     })
     .await
     .context("serial response timed out")?
     .context("failed reading serial response")?;
 
-    let response = String::from_utf8_lossy(&buf).trim().to_string();
-    transcript.write_line("RX", &response).await;
-    Ok(response)
+    Ok(SerialRead {
+        response,
+        unsolicited,
+    })
+}
+
+async fn read_serial_line(port: &mut SerialStream) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let n = port.read(&mut byte).await?;
+        if n == 0 {
+            continue;
+        }
+        buf.push(byte[0]);
+        if byte[0] == b';' || byte[0] == b'\n' {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+fn expected_prefixes(command: ElecraftCommand) -> &'static [&'static str] {
+    match command.label {
+        "read_firmware" => &["^RVM"],
+        "read_serial_number" => &["^SN"],
+        "read_operate_status" => &["^OS"],
+        "read_power_swr" => &["^WS"],
+        "read_temperature" => &["^TM"],
+        "read_volts_current" => &["^VI"],
+        "read_fault" => &["^FL"],
+        _ => &[],
+    }
+}
+
+fn matches_expected_response(response: &str, expected_prefixes: &[&str]) -> bool {
+    expected_prefixes
+        .iter()
+        .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
+}
+
+fn is_unsolicited_response(response: &str) -> bool {
+    const PREFIXES: &[&str] = &["^RVM", "^SN", "^OS", "^WS", "^TM", "^VI", "^FL"];
+    PREFIXES
+        .iter()
+        .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
 }
 
 async fn send_no_ack_command(
@@ -1145,6 +1244,30 @@ mod tests {
         }
         assert_eq!(amp.forward_power_watts, 30.0);
         assert_eq!(amp.swr, 1.1);
+    }
+
+    #[test]
+    fn response_matching_ignores_out_of_order_kpa_lines() {
+        let fixture = include_str!("../../../tests/fixtures/kpa500-out-of-order-com21.txt");
+        assert!(fixture.contains("RX ^FL00;"));
+        assert!(fixture.contains("RX ^WS000 000;"));
+        assert!(!matches_expected_response(
+            "^FL00;",
+            expected_prefixes(CMD_OPERATE_STATUS)
+        ));
+        assert!(is_unsolicited_response("^FL00;"));
+        assert!(matches_expected_response(
+            "^OS0;",
+            expected_prefixes(CMD_OPERATE_STATUS)
+        ));
+        assert!(!matches_expected_response(
+            "^OS0;",
+            expected_prefixes(CMD_POWER_SWR)
+        ));
+        assert!(matches_expected_response(
+            "^WS030 011;",
+            expected_prefixes(CMD_POWER_SWR)
+        ));
     }
 
     #[test]

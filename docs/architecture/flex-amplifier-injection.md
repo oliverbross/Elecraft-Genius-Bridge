@@ -1,6 +1,6 @@
 # Flex Amplifier Presence Injection
 
-Status: Phase 18 control observation prototype implemented. RF-risk operate remains gated.
+Status: Phase 19 full PGXL radio-side registration prototype implemented. RF-risk operate remains gated.
 
 ## Research Sources
 
@@ -12,14 +12,22 @@ Status: Phase 18 control observation prototype implemented. RF-risk operate rema
 
 ## Mechanism
 
-EGB now has an optional Flex API registration client:
+EGB now has an optional Flex API registration client. Phase 19 sends the broader PGXL registration sequence described by the FlexRadio PGXL Amplifier-to-Radio API:
 
 ```text
 EGB -> Flex radio TCP API :4992
   receive V...
   receive H<client-handle>
-  send C1|amplifier create ip=<egb-ip> port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:NONE
-  receive R1|0...
+  send C1|amplifier create ip=<egb-ip> port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB
+  send C2|meter create name=FWD type=AMP min=30.0 max=63.01 units=DBM
+  send C3|meter create name=RL type=AMP min=34.0 max=60.0 units=DB
+  send C4|meter create name=DRV type=AMP min=10.0 max=50.00 units=DBM
+  send C5|meter create name=ID type=AMP min=0.0 max=70.0 units=AMPS
+  send C6|meter create name=TEMP type=AMP min=0.0 max=100.0 units=TEMP_C
+  send C7|interlock create type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial=EGB-KPA500
+  send C8|keepalive enable
+  send C9|sub amplifier all
+  send periodic Cn|ping
 ```
 
 The radio owns the actual amplifier object handle. The configured `flex_injection.handle` is only a stable EGB label for logs and future config. It is not sent as a Flex object handle because the radio assigns handles.
@@ -34,8 +42,8 @@ stateDiagram-v2
     Disabled --> Connecting: flex_injection.enabled=true
     Connecting --> WaitingForHandle: TCP connected
     WaitingForHandle --> Registering: H<handle> received
-    Registering --> Registered: R1|0
-    Registered --> Registered: sub amplifier all / periodic ping
+    Registering --> Registered: registration R<n>|0 responses
+    Registered --> Registered: sub amplifier all / keepalive / periodic ping
     Registered --> Registered: observe operate=0/1 status
     Registered --> Reconnecting: TCP error / timeout
     Reconnecting --> Connecting: exponential backoff
@@ -55,13 +63,29 @@ flex_injection:
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
   handle: amp_1
-  ant_map: ANT1:PORTA,ANT2:NONE
+  ant_map: ANT1:PORTA,ANT2:PORTB
+  full_pgxl_registration: true
+  create_meters: true
+  create_interlock: true
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
 ```
 
 Validation rejects public IPs for both `radio_ip` and `amplifier_ip`. Phase 17 is LAN/local only.
+
+## Registration And Handle Tracking
+
+EGB logs every `R<seq>|...` response for amplifier, meter, interlock, keepalive, subscription, and ping commands. The `/status` endpoint exposes:
+
+- Flex injection connection state.
+- Radio client handle.
+- Created amplifier handle if returned directly or later observed in radio status.
+- Meter handles when the radio returns a non-empty meter-create response body.
+- Interlock handle when the radio returns one.
+- Last command/response and success/failure counters.
+
+If the radio returns an empty response body but later broadcasts an `amplifier <handle> ...` status, EGB records the handle from that status.
 
 ## Telemetry Mapping
 
@@ -87,7 +111,7 @@ Actual panel telemetry still comes from the existing PGXL direct socket on port 
 | `vac` | `0` until safe AC mains equivalent is validated |
 | `meffa` | safe compatibility placeholder |
 
-Phase 17/18 does not create Flex meters or UDP VITA meter streams. If AetherSDR requires radio-side meters in addition to direct PGXL telemetry, that will be a later correction loop.
+Phase 19 creates the documented AMP meter objects. It does not yet publish live meter values through the Flex metering stream. The PGXL API document points to the SmartSDR metering protocol for the meter process, but the exact external-amplifier value publication path has not yet been validated in captures. Until that is known, the authoritative live values remain the PGXL direct socket backed by KPA500 polling.
 
 ## Control Policy
 
@@ -114,8 +138,7 @@ and does not send `^OS1;`.
 
 Not implemented:
 
-- meter creation
-- interlock creation
+- live radio-side meter value publication
 - proxy command interception
 - WAN exposure
 
@@ -127,13 +150,13 @@ With `config.flex-injection-readonly.yaml` adjusted for the real radio IP and Wi
 
 1. EGB connects to the Flex radio API.
 2. EGB logs `Flex API client handle received`.
-3. EGB logs `Flex amplifier object creation sent`.
-4. If the radio accepts registration, EGB logs `Flex amplifier object creation accepted`.
+3. EGB logs all PGXL registration commands, including amplifier, meter, interlock, keepalive, and subscription.
+4. If the radio accepts registration, EGB logs `Flex PGXL registration command accepted` for each command.
 5. AetherSDR should receive a radio-side amplifier presence record.
 6. The PA/AMP applet should become visible.
 7. AetherSDR should connect its PGXL direct socket to EGB at port `9008`.
 
-If PA still does not appear, capture the Flex TCP stream and verify whether the radio broadcast an `amplifier <handle> model=PowerGeniusXL ...` status to AetherSDR after registration.
+If PA still does not appear in SmartSDR, capture the Flex TCP stream and verify whether the radio accepted the meter/interlock creation commands and broadcast an `amplifier <handle> model=PowerGeniusXL ...` status with non-empty amplifier identity.
 
 ## Compatibility Notes
 

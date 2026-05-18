@@ -1,0 +1,5 @@
+Observed in Phase 19:
+- AetherSDR v26.5.2-compatible session shows the AMP pane after Flex radio-side amplifier injection.
+- PGXL direct socket on TCP 9008 continues to accept connections and respond to info/status.
+- AetherSDR Peripherals still reports PGXL Not connected while TGXL reports connected.
+- Working hypothesis: the visible AMP pane is radio-side amplifier object driven; the Peripherals PGXL connected indicator may require additional PGXL direct status/capability fields not yet identified from source/transcripts.

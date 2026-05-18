@@ -1,0 +1,9 @@
+TX ^OS;
+RX ^FL00;
+RX ^OS0;
+TX ^WS;
+RX ^OS0;
+RX ^WS000 000;
+TX ^TM;
+RX ^WS000 000;
+RX ^TM030;

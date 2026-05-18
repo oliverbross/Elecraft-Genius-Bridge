@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use bridge_core::SharedState;
+use bridge_core::{ConnectionState, FlexMeterHandle, SharedState};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,6 +17,9 @@ pub struct FlexInjectionSettings {
     pub serial: String,
     pub handle_label: String,
     pub ant_map: String,
+    pub full_pgxl_registration: bool,
+    pub create_meters: bool,
+    pub create_interlock: bool,
     pub allow_rf_risk: bool,
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
@@ -36,6 +40,11 @@ impl FlexInjectionSettings {
 
 pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
     let mut backoff = settings.reconnect_initial.max(Duration::from_millis(100));
+    {
+        let mut guard = state.write().await;
+        guard.flex_injection.enabled = true;
+        guard.flex_injection.connection_state = ConnectionState::Connecting;
+    }
     loop {
         match run_session(&settings, state.clone()).await {
             Ok(()) => {
@@ -48,6 +57,11 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
                     "Flex amplifier injection session failed"
                 );
             }
+        }
+        {
+            let mut guard = state.write().await;
+            guard.flex_injection.connection_state = ConnectionState::Degraded;
+            guard.flex_injection.amplifier_handle = None;
         }
         sleep(backoff).await;
         backoff = (backoff * 2).min(settings.reconnect_max.max(settings.reconnect_initial));
@@ -72,9 +86,15 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut reader = BufReader::new(reader).lines();
     let mut session = FlexSession::default();
 
-    let create = settings.amplifier_create_command();
-    let mut create_sent = false;
-    let mut subscribe_sent = false;
+    {
+        let mut guard = state.write().await;
+        guard.flex_injection.connection_state = ConnectionState::Connected;
+        guard.flex_injection.last_command = None;
+        guard.flex_injection.last_response = None;
+    }
+
+    let registration = registration_commands(settings);
+    let mut registration_sent = false;
     let mut next_seq = 1_u32;
     let mut ping_timer = Box::pin(sleep(settings.ping_interval));
 
@@ -88,48 +108,35 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     Err(_) => anyhow::bail!("timed out waiting for Flex API traffic"),
                 };
                 session.observe_line(&line);
+                if let Some(handle) = session.handle.clone() {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.client_handle = Some(handle);
+                }
                 trace_flex_rx(&line);
 
-                if session.has_handle && !create_sent {
-                    send_command(&mut writer, next_seq, &create).await?;
-                    info!(
-                        seq = next_seq,
-                        command = %create,
-                        "Flex amplifier object creation sent"
-                    );
-                    next_seq = next_seq.saturating_add(1);
-                    create_sent = true;
+                if session.has_handle && !registration_sent {
+                    for item in &registration {
+                        send_tracked_command(
+                            &mut writer,
+                            &mut session,
+                            &state,
+                            &mut next_seq,
+                            item.clone(),
+                        )
+                        .await?;
+                    }
+                    registration_sent = true;
                 }
 
                 if let Some((seq, code, body)) = parse_response(&line) {
-                    if seq == 1 && code == "0" {
-                        info!(
-                            seq,
-                            body = %body,
-                            "Flex amplifier object creation accepted"
-                        );
-                        log_amp_snapshot(&state).await;
-                        if !subscribe_sent {
-                            send_command(&mut writer, next_seq, "sub amplifier all").await?;
-                            info!(
-                                seq = next_seq,
-                                "Flex amplifier subscription sent"
-                            );
-                            next_seq = next_seq.saturating_add(1);
-                            subscribe_sent = true;
-                        }
-                    } else if seq == 1 {
-                        warn!(
-                            seq,
-                            code = %code,
-                            body = %body,
-                            "Flex amplifier object creation rejected"
-                        );
-                    }
+                    session
+                        .observe_response(settings, &state, seq, &code, &body)
+                        .await;
                 }
 
                 if let Some(status) = parse_amplifier_status(&line) {
                     if session.observe_amplifier_status(settings, &status) {
+                        set_amplifier_handle(&state, &status.handle).await;
                         handle_amplifier_status(
                             settings,
                             &state,
@@ -142,10 +149,20 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 }
             }
             () = &mut ping_timer => {
-                if create_sent {
-                    send_command(&mut writer, next_seq, "ping").await?;
-                    debug!(seq = next_seq, "Flex injection ping sent");
-                    next_seq = next_seq.saturating_add(1);
+                if registration_sent {
+                    send_tracked_command(
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                        PendingCommand::new("ping", "ping", PendingKind::Ping),
+                    )
+                    .await?;
+                    {
+                        let mut guard = state.write().await;
+                        guard.flex_injection.ping_count =
+                            guard.flex_injection.ping_count.saturating_add(1);
+                    }
                     log_amp_snapshot(&state).await;
                 }
                 ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
@@ -168,12 +185,37 @@ async fn send_command(
     Ok(())
 }
 
+async fn send_tracked_command(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    session: &mut FlexSession,
+    state: &SharedState,
+    next_seq: &mut u32,
+    pending: PendingCommand,
+) -> Result<()> {
+    let seq = *next_seq;
+    send_command(writer, seq, &pending.command).await?;
+    info!(
+        seq,
+        label = %pending.label,
+        command = %pending.command,
+        "Flex PGXL registration command sent"
+    );
+    session.pending.insert(seq, pending.clone());
+    {
+        let mut guard = state.write().await;
+        guard.flex_injection.last_command = Some(pending.command);
+    }
+    *next_seq = next_seq.saturating_add(1);
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct FlexSession {
     has_handle: bool,
     handle: Option<String>,
     version: Option<String>,
     amplifier_handle: Option<String>,
+    pending: HashMap<u32, PendingCommand>,
 }
 
 impl FlexSession {
@@ -185,7 +227,70 @@ impl FlexSession {
             let handle = handle.trim().to_string();
             self.handle = Some(handle.clone());
             self.has_handle = true;
+            // The radio assigns this connection handle before accepting any
+            // object creation commands from the external amplifier client.
             info!(%handle, "Flex API client handle received");
+        }
+    }
+
+    async fn observe_response(
+        &mut self,
+        _settings: &FlexInjectionSettings,
+        state: &SharedState,
+        seq: u32,
+        code: &str,
+        body: &str,
+    ) {
+        let pending = self.pending.remove(&seq);
+        let label = pending
+            .as_ref()
+            .map(|pending| pending.label.as_str())
+            .unwrap_or("unknown");
+        if code == "0" {
+            info!(seq, label, body, "Flex PGXL registration command accepted");
+        } else {
+            warn!(
+                seq,
+                label, code, body, "Flex PGXL registration command rejected"
+            );
+        }
+
+        {
+            let mut guard = state.write().await;
+            guard.flex_injection.last_response = Some(format!("R{seq}|{code}|{body}"));
+            if code == "0" {
+                guard.flex_injection.command_success_count =
+                    guard.flex_injection.command_success_count.saturating_add(1);
+            } else {
+                guard.flex_injection.command_failure_count =
+                    guard.flex_injection.command_failure_count.saturating_add(1);
+            }
+        }
+
+        let Some(pending) = pending else {
+            return;
+        };
+        if code != "0" {
+            return;
+        }
+        match pending.kind {
+            PendingKind::AmplifierCreate => {
+                if let Some(handle) = response_object_id(body) {
+                    set_amplifier_handle(state, handle).await;
+                }
+            }
+            PendingKind::MeterCreate { name } => {
+                if let Some(handle) = response_object_id(body) {
+                    upsert_meter_handle(state, name, handle).await;
+                }
+            }
+            PendingKind::InterlockCreate => {
+                if let Some(handle) = response_object_id(body) {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.interlock_handle = Some(handle.to_string());
+                }
+            }
+            PendingKind::KeepaliveEnable | PendingKind::Subscription | PendingKind::Ping => {}
         }
     }
 
@@ -215,6 +320,28 @@ impl FlexSession {
         } else {
             false
         }
+    }
+}
+
+async fn set_amplifier_handle(state: &SharedState, handle: &str) {
+    let mut guard = state.write().await;
+    guard.flex_injection.amplifier_handle = Some(handle.to_string());
+}
+
+async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
+    let mut guard = state.write().await;
+    if let Some(existing) = guard
+        .flex_injection
+        .meter_handles
+        .iter_mut()
+        .find(|meter| meter.name == name)
+    {
+        existing.handle = handle.to_string();
+    } else {
+        guard.flex_injection.meter_handles.push(FlexMeterHandle {
+            name: name.to_string(),
+            handle: handle.to_string(),
+        });
     }
 }
 
@@ -268,6 +395,33 @@ async fn handle_amplifier_status(
         "Flex amplifier state mapped to KPA500 desired state"
     );
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PendingCommand {
+    label: String,
+    command: String,
+    kind: PendingKind,
+}
+
+impl PendingCommand {
+    fn new(label: impl Into<String>, command: impl Into<String>, kind: PendingKind) -> Self {
+        Self {
+            label: label.into(),
+            command: command.into(),
+            kind,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PendingKind {
+    AmplifierCreate,
+    MeterCreate { name: &'static str },
+    InterlockCreate,
+    KeepaliveEnable,
+    Subscription,
+    Ping,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +511,89 @@ pub fn amplifier_create_command(
     )
 }
 
+pub fn registration_command_lines(settings: &FlexInjectionSettings) -> Vec<String> {
+    registration_commands(settings)
+        .into_iter()
+        .map(|pending| pending.command)
+        .collect()
+}
+
+fn registration_commands(settings: &FlexInjectionSettings) -> Vec<PendingCommand> {
+    let mut commands = Vec::new();
+    commands.push(PendingCommand::new(
+        "amplifier_create",
+        settings.amplifier_create_command(),
+        PendingKind::AmplifierCreate,
+    ));
+    if settings.full_pgxl_registration && settings.create_meters {
+        for meter in amp_meter_create_commands() {
+            commands.push(PendingCommand::new(
+                format!("meter_create_{}", meter.name),
+                meter.command,
+                PendingKind::MeterCreate { name: meter.name },
+            ));
+        }
+    }
+    if settings.full_pgxl_registration && settings.create_interlock {
+        commands.push(PendingCommand::new(
+            "interlock_create",
+            interlock_create_command(&settings.serial),
+            PendingKind::InterlockCreate,
+        ));
+    }
+    if settings.full_pgxl_registration {
+        commands.push(PendingCommand::new(
+            "keepalive_enable",
+            "keepalive enable",
+            PendingKind::KeepaliveEnable,
+        ));
+    }
+    commands.push(PendingCommand::new(
+        "sub_amplifier_all",
+        "sub amplifier all",
+        PendingKind::Subscription,
+    ));
+    commands
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MeterCreateCommand {
+    name: &'static str,
+    command: &'static str,
+}
+
+fn amp_meter_create_commands() -> &'static [MeterCreateCommand] {
+    &[
+        MeterCreateCommand {
+            name: "FWD",
+            command: "meter create name=FWD type=AMP min=30.0 max=63.01 units=DBM",
+        },
+        MeterCreateCommand {
+            name: "RL",
+            command: "meter create name=RL type=AMP min=34.0 max=60.0 units=DB",
+        },
+        MeterCreateCommand {
+            name: "DRV",
+            command: "meter create name=DRV type=AMP min=10.0 max=50.00 units=DBM",
+        },
+        MeterCreateCommand {
+            name: "ID",
+            command: "meter create name=ID type=AMP min=0.0 max=70.0 units=AMPS",
+        },
+        MeterCreateCommand {
+            name: "TEMP",
+            command: "meter create name=TEMP type=AMP min=0.0 max=100.0 units=TEMP_C",
+        },
+    ]
+}
+
+fn interlock_create_command(serial: &str) -> String {
+    format!(
+        "interlock create type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial={}",
+        sanitize_token(serial)
+    )
+}
+
 fn sanitize_token(value: &str) -> String {
     value
         .chars()
@@ -371,6 +608,15 @@ pub fn parse_response(line: &str) -> Option<(u32, String, String)> {
     let code = parts.next()?.to_string();
     let body = parts.next().unwrap_or("").to_string();
     Some((seq, code, body))
+}
+
+fn response_object_id(body: &str) -> Option<&str> {
+    let first = body.split('|').next()?.trim();
+    if first.is_empty() || first.eq_ignore_ascii_case("OK") || first.contains(char::is_whitespace) {
+        None
+    } else {
+        Some(first)
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +659,8 @@ mod tests {
             Some((44, "0".to_string(), "32".to_string()))
         );
         assert_eq!(parse_response("S0|amplifier 0x1 model=PowerGeniusXL"), None);
+        assert_eq!(response_object_id("32|OK"), Some("32"));
+        assert_eq!(response_object_id("OK"), None);
     }
 
     #[test]
@@ -429,5 +677,50 @@ mod tests {
             parse_amplifier_status("S1A2B|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
                 .unwrap();
         assert_eq!(standby.requested_operate(), Some(false));
+    }
+
+    #[test]
+    fn full_pgxl_registration_sequence_matches_reference_order() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+        };
+        let commands = registration_command_lines(&settings);
+        assert_eq!(
+            commands[0],
+            "amplifier create ip=192.168.1.50 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB"
+        );
+        assert!(commands
+            .contains(&"meter create name=FWD type=AMP min=30.0 max=63.01 units=DBM".to_string()));
+        assert!(commands
+            .contains(&"meter create name=RL type=AMP min=34.0 max=60.0 units=DB".to_string()));
+        assert!(commands
+            .contains(&"meter create name=DRV type=AMP min=10.0 max=50.00 units=DBM".to_string()));
+        assert!(commands
+            .contains(&"meter create name=ID type=AMP min=0.0 max=70.0 units=AMPS".to_string()));
+        assert!(commands.contains(
+            &"meter create name=TEMP type=AMP min=0.0 max=100.0 units=TEMP_C".to_string()
+        ));
+        assert!(commands.contains(
+            &"interlock create type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial=EGB-KPA500"
+                .to_string()
+        ));
+        assert!(commands.contains(&"keepalive enable".to_string()));
+        assert_eq!(
+            commands.last().map(String::as_str),
+            Some("sub amplifier all")
+        );
     }
 }

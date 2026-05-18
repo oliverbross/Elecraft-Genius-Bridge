@@ -21,6 +21,7 @@ pub struct EmulatorOptions {
     pub aethersdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
+    pub force_direct_connected_test: bool,
 }
 
 pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()> {
@@ -69,6 +70,13 @@ async fn handle_client(
         let mut guard = state.write().await;
         guard.clients.pgxl_connected = true;
         guard.clients.pgxl_client_count += 1;
+    }
+    if options.force_direct_connected_test {
+        info!(
+            protocol = "PGXL",
+            connection_id = %peer,
+            "PGXL direct connected diagnostic mode enabled"
+        );
     }
     maybe_start_strict_startup(&state, &options).await;
     info!(event_id = "client_connected", protocol = "PGXL", connection_id = %peer, "PGXL client connected");

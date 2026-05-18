@@ -145,6 +145,7 @@ pub struct PgxlConfig {
     pub aethersdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
+    pub force_direct_connected_test: bool,
 }
 
 impl Default for PgxlConfig {
@@ -155,6 +156,7 @@ impl Default for PgxlConfig {
             aethersdr_compat: false,
             strict_emulation: false,
             startup_delay_ms: 0,
+            force_direct_connected_test: false,
         }
     }
 }
@@ -308,6 +310,9 @@ pub struct FlexInjectionConfig {
     pub serial: String,
     pub handle: String,
     pub ant_map: String,
+    pub full_pgxl_registration: bool,
+    pub create_meters: bool,
+    pub create_interlock: bool,
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
     pub ping_interval_ms: u64,
@@ -358,7 +363,10 @@ impl Default for FlexInjectionConfig {
             amplifier_model: "PowerGeniusXL".to_string(),
             serial: "EGB-KPA500".to_string(),
             handle: "amp_1".to_string(),
-            ant_map: "ANT1:PORTA,ANT2:NONE".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
             reconnect_initial_ms: 1000,
             reconnect_max_ms: 30000,
             ping_interval_ms: 30000,
