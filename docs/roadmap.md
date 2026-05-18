@@ -38,9 +38,9 @@ Status: in progress.
 ## Phase 4: AetherSDR Applet Activation
 
 - Direct socket bridge: continue PGXL/TGXL protocol correction and real hardware validation.
-- TGXL applet: validate why the tested binary did not show TUN despite direct-presence support in source.
+- TGXL applet: validate Oliver's installed binary against the `0.9.5` direct-presence fix, then reset applet layout if the binary is current.
 - PGXL applet: requires radio-side amplifier presence or an AetherSDR change.
-- Flex API proxy: design exists, keep separate and disabled unless radio-side configuration cannot solve applet presence.
+- Flex API proxy: minimal amplifier-status injection design exists, keep separate and disabled unless radio-side configuration or an AetherSDR patch cannot solve applet presence.
 
 ## Phase 5: Service And Packaging
 

@@ -62,6 +62,8 @@
 
 - Determine whether Flex can be configured to advertise synthetic PGXL/TGXL amplifier records without real Genius hardware.
 - Validate candidate injected `amplifier` status records against AetherSDR in mock mode.
+- Verify Oliver's installed macOS AetherSDR binary is `0.9.5` or newer, or otherwise contains the direct TGXL presence fix from #2250.
+- Run the AetherSDR layout reset helper after confirming the binary contains direct TGXL presence.
 - Keep Flex API proxy mode separate from direct PGXL/TGXL emulation.
 - Decide whether to propose an AetherSDR patch for PGXL direct-presence fallback analogous to TGXL.
 

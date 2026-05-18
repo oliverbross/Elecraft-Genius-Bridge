@@ -1,25 +1,46 @@
 # AetherSDR Applet Layout Reset
 
-Do not delete settings automatically. Use this only as a manual diagnostic step.
+Use this when direct PGXL/TGXL sockets connect and poll but the AetherSDR applet tray may be stale, collapsed, or persisted in a hidden/floating layout.
 
-## Settings Location
+This does not create device presence. It only removes layout preferences so AetherSDR can show present applets normally.
 
-From AetherSDR `AppSettings`:
+## Source-Confirmed Settings Paths
+
+The inspected AetherSDR source stores the main settings file at:
 
 ```text
-macOS/Linux: ~/.config/AetherSDR/AetherSDR.settings
-Windows: %LOCALAPPDATA%\AetherSDR\AetherSDR.settings
+~/.config/AetherSDR/AetherSDR.settings
 ```
 
-On macOS, open Terminal and back up first:
+Older macOS builds may have migrated from:
 
-```bash
-cp ~/.config/AetherSDR/AetherSDR.settings ~/.config/AetherSDR/AetherSDR.settings.phase7-backup
+```text
+~/Library/Preferences/AetherSDR/AetherSDR/AetherSDR.settings
 ```
 
-## Applet-Related Keys
+The in-app Support reset also removes:
 
-Look for these XML elements:
+```text
+~/Library/Preferences/com.aethersdr.AetherSDR.plist
+```
+
+## Safe Layout-Only Reset
+
+Quit AetherSDR first.
+
+Dry-run:
+
+```sh
+scripts/aethersdr/reset-applet-layout.sh
+```
+
+Apply:
+
+```sh
+scripts/aethersdr/reset-applet-layout.sh --apply
+```
+
+The script backs up settings files before editing and removes only applet/layout keys:
 
 ```text
 Applet_TUN
@@ -27,28 +48,22 @@ Applet_AMP
 AppletOrder
 AppletPanelVisible
 AppletPanelFloating
-AppletPanelDockedLeft
+AppletPanelFloatGeometry
 FloatingApplet_TUN_IsFloating
 FloatingApplet_AMP_IsFloating
-AppletPanelFloatGeometry
+FloatingApplet_TUN_Geometry
+FloatingApplet_AMP_Geometry
 ```
 
-## Safe Reset Procedure
+## Full AetherSDR Reset
 
-1. Quit AetherSDR.
-2. Back up `AetherSDR.settings`.
-3. Edit only applet-related keys.
-4. Prefer setting:
+AetherSDR also has an in-app Support reset that removes all app-specific settings and quits the app. Use that only if the layout-only reset does not resolve a confirmed-present applet.
 
-```text
-AppletPanelVisible=True
-AppletPanelFloating=False
-Applet_TUN=True
-Applet_AMP=True
-```
+The full reset does not change settings stored on the radio, but it may remove AetherSDR UI preferences beyond applet layout.
 
-5. Remove `FloatingApplet_TUN_IsFloating`, `FloatingApplet_AMP_IsFloating`, and stale float geometry only if the applet panel appears off-screen.
-6. Start AetherSDR.
-7. Reconnect TGXL direct IP and observe whether TUN appears.
+## Expected Result
 
-This reset cannot create PGXL amplifier presence by itself. It only rules out stale applet layout state.
+After reset:
+
+- `TUN` should appear if the installed AetherSDR binary supports direct TGXL presence and the TGXL direct socket is connected.
+- `AMP` still will not appear from direct PGXL TCP alone in the inspected source. It requires radio-side amplifier presence or an AetherSDR patch/proxy path.

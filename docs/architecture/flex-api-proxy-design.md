@@ -56,26 +56,26 @@ EGB      ---> KPA500/KAT500 serial
 PGXL presence:
 
 ```text
-S<radio-handle>|amplifier 0xEGB50001 model=PowerGeniusXL ip=<egb-ip> state=STANDBY serial_num=EGB-PGXL
+S<radio-handle>|amplifier 0x7E500001 model=PowerGeniusXL ip=<egb-ip> state=STANDBY serial_num=EGB-PGXL
 ```
 
 TGXL presence:
 
 ```text
-S<radio-handle>|amplifier 0xEGB50002 model=TunerGeniusXL ip=<egb-ip> operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 serial_num=EGB-TGXL
+S<radio-handle>|amplifier 0x7E500002 model=TunerGeniusXL ip=<egb-ip> operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 serial_num=EGB-TGXL
 ```
 
-These are candidate shapes only. They must be validated against real AetherSDR sessions before implementation.
+These are candidate shapes only. They must be validated against real AetherSDR sessions before implementation. Handles must be valid hexadecimal because AetherSDR parses TGXL handles with base auto-detection.
 
 ## Command Interception
 
 If applets send radio-side commands for synthetic handles, the proxy must decide whether to:
 
 1. Intercept and translate:
-   - `amplifier set 0xEGB50001 operate=<0|1>` -> KPA500 desired operate/standby.
-   - `tgxl set handle=0xEGB50002 mode=<0|1>` -> KAT500 operate/bypass semantics if validated.
-   - `tgxl set handle=0xEGB50002 bypass=<0|1>` -> KAT500 bypass if validated.
-   - `tgxl autotune handle=0xEGB50002` -> KAT500 autotune if safe.
+   - `amplifier set 0x7E500001 operate=<0|1>` -> KPA500 desired operate/standby.
+   - `tgxl set handle=0x7E500002 mode=<0|1>` -> KAT500 operate/bypass semantics if validated.
+   - `tgxl set handle=0x7E500002 bypass=<0|1>` -> KAT500 bypass if validated.
+   - `tgxl autotune handle=0x7E500002` -> KAT500 autotune if safe.
 2. Forward all other commands unchanged to the radio.
 3. Return a valid Flex API response only for intercepted commands, preserving the client sequence number.
 

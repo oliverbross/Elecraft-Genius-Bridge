@@ -212,3 +212,11 @@ Assessment: preferred if possible, but not yet evidenced.
 2. For TGXL applet visibility, first verify the exact AetherSDR binary against the inspected source because direct TCP should be enough in this revision.
 3. For PGXL applet visibility and operate/standby controls, investigate Flex radio-side configuration first.
 4. If the radio cannot advertise synthetic PGXL/TGXL presence, design optional Flex API proxy mode as a separate Phase 7 feature. Keep it disabled by default and keep direct PGXL/TGXL sockets on `9008/9010`.
+
+## Phase 16 Confirmation
+
+The exact conditional UI code confirms that `Applet_TUN` and `Applet_AMP` settings restore only after presence is true. They are not manual visibility overrides.
+
+The inspected source includes the `0.9.5` release-note entry `TGXL detected via direct TCP only (#2250, chrisb1964)`, so the tested macOS binary should be checked against `0.9.5` or newer before concluding direct TGXL applet activation is broken.
+
+PGXL direct TCP still does not provide AMP presence in this source. The direct PGXL connection feeds `AmpApplet` telemetry only after a radio-side `amplifier` record has already made the AMP applet visible.
