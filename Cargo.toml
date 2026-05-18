@@ -16,7 +16,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/oliverbross/elecraft-genius-bridge"
+repository = "https://github.com/oliverbross/Elecraft-Genius-Bridge"
 rust-version = "1.80"
 
 [workspace.dependencies]
