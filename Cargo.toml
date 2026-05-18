@@ -10,6 +10,7 @@ members = [
     "crates/flex-injection",
     "crates/test-harness",
     "crates/egb",
+    "crates/egb-gui",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-serial = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+eframe = { version = "0.27", default-features = true }
 
 [profile.release]
 codegen-units = 1

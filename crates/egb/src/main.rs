@@ -584,7 +584,18 @@ async fn status_json(state: &SharedState) -> String {
         "amp": {
             "connection_state": guard.amp.connection_state.as_str(),
             "connected": guard.amp.connected,
+            "operate": guard.amp.operate,
+            "state": guard.amp.state.pgxl_state(),
+            "forward_power_watts": guard.amp.forward_power_watts,
+            "reflected_power_watts": guard.amp.reflected_power_watts,
+            "swr": guard.amp.swr,
+            "pa_current_amps": guard.amp.pa_current_amps,
+            "pa_voltage_volts": guard.amp.pa_voltage_volts,
+            "temperature_c": guard.amp.temperature_c,
+            "fault": guard.amp.fault,
+            "warning": guard.amp.warning,
             "firmware_version": guard.amp.firmware_version,
+            "serial_number": guard.amp.serial_number,
             "capabilities": guard.amp.capabilities,
             "last_successful_poll_ms": system_time_ms(guard.amp.last_successful_poll_at),
             "stale_duration_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
@@ -593,7 +604,20 @@ async fn status_json(state: &SharedState) -> String {
         "tuner": {
             "connection_state": guard.tuner.connection_state.as_str(),
             "connected": guard.tuner.connected,
+            "operate": guard.tuner.operate,
+            "mode": tuner_mode_label(&guard.tuner),
+            "bypass": guard.tuner.bypass,
+            "tuning": guard.tuner.tuning,
+            "selected_antenna": guard.tuner.selected_antenna,
+            "relay_c1": guard.tuner.relay_c1,
+            "relay_l": guard.tuner.relay_l,
+            "relay_c2": guard.tuner.relay_c2,
+            "forward_power_watts": guard.tuner.forward_power_watts,
+            "reflected_power_watts": 0.0,
+            "swr": guard.tuner.swr,
+            "fault": guard.tuner.fault,
             "firmware_version": guard.tuner.firmware_version,
+            "serial_number": guard.tuner.serial_number,
             "capabilities": guard.tuner.capabilities,
             "last_successful_poll_ms": system_time_ms(guard.tuner.last_successful_poll_at),
             "stale_duration_ms": stale_duration_ms(guard.tuner.last_successful_poll_at),
@@ -609,6 +633,16 @@ async fn status_json(state: &SharedState) -> String {
         "protocol": guard.protocol,
     })
     .to_string()
+}
+
+fn tuner_mode_label(tuner: &bridge_core::TunerState) -> &'static str {
+    if tuner.bypass {
+        "bypass"
+    } else if tuner.operate {
+        "auto"
+    } else {
+        "manual"
+    }
 }
 
 async fn print_soak_summary(state: &SharedState, elapsed: Duration) {

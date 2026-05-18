@@ -1,0 +1,20 @@
+[package]
+name = "egb-gui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "egb-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egb-config = { path = "../config" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio-serial.workspace = true
