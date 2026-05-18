@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bridge_core::{ConnectionState, FlexMeterHandle, SharedState};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -49,6 +49,7 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
         match run_session(&settings, state.clone()).await {
             Ok(()) => {
                 warn!("Flex amplifier injection session ended");
+                backoff = settings.reconnect_initial.max(Duration::from_millis(100));
             }
             Err(err) => {
                 warn!(
@@ -60,7 +61,12 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
         }
         {
             let mut guard = state.write().await;
+            if guard.flex_injection.connection_state == ConnectionState::Connected {
+                backoff = settings.reconnect_initial.max(Duration::from_millis(100));
+            }
             guard.flex_injection.connection_state = ConnectionState::Degraded;
+            guard.flex_injection.degraded_reason =
+                Some("session ended; reconnect pending".to_string());
             guard.flex_injection.amplifier_handle = None;
         }
         sleep(backoff).await;
@@ -89,6 +95,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     {
         let mut guard = state.write().await;
         guard.flex_injection.connection_state = ConnectionState::Connected;
+        guard.flex_injection.degraded_reason = None;
         guard.flex_injection.last_command = None;
         guard.flex_injection.last_response = None;
     }
@@ -192,6 +199,14 @@ async fn send_tracked_command(
     next_seq: &mut u32,
     pending: PendingCommand,
 ) -> Result<()> {
+    let expired = session.cleanup_pending(Duration::from_secs(120), 128);
+    if expired > 0 {
+        let mut guard = state.write().await;
+        guard.flex_injection.expired_pending_count = guard
+            .flex_injection
+            .expired_pending_count
+            .saturating_add(expired);
+    }
     let seq = *next_seq;
     send_command(writer, seq, &pending.command).await?;
     info!(
@@ -204,6 +219,7 @@ async fn send_tracked_command(
     {
         let mut guard = state.write().await;
         guard.flex_injection.last_command = Some(pending.command);
+        guard.flex_injection.pending_count = session.pending.len();
     }
     *next_seq = next_seq.saturating_add(1);
     Ok(())
@@ -219,6 +235,21 @@ struct FlexSession {
 }
 
 impl FlexSession {
+    fn cleanup_pending(&mut self, ttl: Duration, max_size: usize) -> u64 {
+        let now = Instant::now();
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, pending| now.duration_since(pending.created_at) <= ttl);
+        while self.pending.len() > max_size {
+            if let Some(seq) = self.pending.keys().next().copied() {
+                self.pending.remove(&seq);
+            } else {
+                break;
+            }
+        }
+        (before.saturating_sub(self.pending.len())) as u64
+    }
+
     fn observe_line(&mut self, line: &str) {
         if let Some(version) = line.strip_prefix('V') {
             self.version = Some(version.trim().to_string());
@@ -258,6 +289,7 @@ impl FlexSession {
         {
             let mut guard = state.write().await;
             guard.flex_injection.last_response = Some(format!("R{seq}|{code}|{body}"));
+            guard.flex_injection.pending_count = self.pending.len();
             if code == "0" {
                 guard.flex_injection.command_success_count =
                     guard.flex_injection.command_success_count.saturating_add(1);
@@ -271,6 +303,13 @@ impl FlexSession {
             return;
         };
         if code != "0" {
+            if matches!(pending.kind, PendingKind::Ping) {
+                let mut guard = state.write().await;
+                guard.flex_injection.ping_failure_count =
+                    guard.flex_injection.ping_failure_count.saturating_add(1);
+                guard.flex_injection.degraded_reason =
+                    Some(format!("Flex ping rejected: {code} {body}"));
+            }
             return;
         }
         match pending.kind {
@@ -290,7 +329,19 @@ impl FlexSession {
                     guard.flex_injection.interlock_handle = Some(handle.to_string());
                 }
             }
-            PendingKind::KeepaliveEnable | PendingKind::Subscription | PendingKind::Ping => {}
+            PendingKind::KeepaliveEnable | PendingKind::Subscription => {}
+            PendingKind::Ping => {
+                let mut guard = state.write().await;
+                if code == "0" {
+                    guard.flex_injection.degraded_reason = None;
+                    guard.flex_injection.connection_state = ConnectionState::Connected;
+                } else {
+                    guard.flex_injection.ping_failure_count =
+                        guard.flex_injection.ping_failure_count.saturating_add(1);
+                    guard.flex_injection.degraded_reason =
+                        Some(format!("Flex ping rejected: {code} {body}"));
+                }
+            }
         }
     }
 
@@ -402,6 +453,7 @@ struct PendingCommand {
     label: String,
     command: String,
     kind: PendingKind,
+    created_at: Instant,
 }
 
 impl PendingCommand {
@@ -410,6 +462,7 @@ impl PendingCommand {
             label: label.into(),
             command: command.into(),
             kind,
+            created_at: Instant::now(),
         }
     }
 }
@@ -456,6 +509,9 @@ impl AmplifierStatus {
 }
 
 fn parse_amplifier_status(line: &str) -> Option<AmplifierStatus> {
+    if !line.starts_with('S') {
+        return None;
+    }
     let body = line.split_once('|')?.1;
     let rest = body.strip_prefix("amplifier ")?;
     let mut parts = rest.split_whitespace();
@@ -677,6 +733,11 @@ mod tests {
             parse_amplifier_status("S1A2B|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
                 .unwrap();
         assert_eq!(standby.requested_operate(), Some(false));
+    }
+
+    #[test]
+    fn ignores_response_lines_when_parsing_amplifier_status() {
+        assert!(parse_amplifier_status("R44|0|amplifier 0x42000001 model=PowerGeniusXL").is_none());
     }
 
     #[test]

@@ -167,6 +167,7 @@ pub struct TgxlConfig {
     pub enabled: bool,
     pub port: u16,
     pub aethersdr_compat: bool,
+    pub smartsdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
     pub force_presence_test: bool,
@@ -178,6 +179,7 @@ impl Default for TgxlConfig {
             enabled: true,
             port: 9010,
             aethersdr_compat: false,
+            smartsdr_compat: false,
             strict_emulation: false,
             startup_delay_ms: 0,
             force_presence_test: false,
@@ -389,8 +391,8 @@ fn parse_ip(name: &str, value: &str) -> Result<IpAddr, ConfigError> {
         .map_err(|_| ConfigError::Invalid(format!("{name} is not an IP address: {value}")))
 }
 
-fn validate_lan_or_loopback(name: &str, ip: IpAddr) -> Result<(), ConfigError> {
-    let allowed = match ip {
+pub fn is_lan_or_loopback_or_cgnat(ip: IpAddr) -> bool {
+    match ip {
         IpAddr::V4(ip) => {
             ip.is_loopback()
                 || ip.is_private()
@@ -401,8 +403,11 @@ fn validate_lan_or_loopback(name: &str, ip: IpAddr) -> Result<(), ConfigError> {
             let first = ip.segments()[0];
             ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
         }
-    };
-    if allowed {
+    }
+}
+
+fn validate_lan_or_loopback(name: &str, ip: IpAddr) -> Result<(), ConfigError> {
+    if is_lan_or_loopback_or_cgnat(ip) {
         Ok(())
     } else {
         Err(ConfigError::Invalid(format!(
@@ -464,5 +469,22 @@ pgxl:
         cfg.flex_injection.radio_ip = "192.168.1.100".to_string();
         cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn lan_scope_helper_covers_loopback_private_link_local_and_cgnat() {
+        assert!(is_lan_or_loopback_or_cgnat("127.0.0.1".parse().unwrap()));
+        assert!(is_lan_or_loopback_or_cgnat("192.168.1.10".parse().unwrap()));
+        assert!(is_lan_or_loopback_or_cgnat(
+            "169.254.10.20".parse().unwrap()
+        ));
+        assert!(is_lan_or_loopback_or_cgnat("100.64.1.1".parse().unwrap()));
+        assert!(is_lan_or_loopback_or_cgnat("::1".parse().unwrap()));
+        assert!(is_lan_or_loopback_or_cgnat("fd00::1".parse().unwrap()));
+        assert!(is_lan_or_loopback_or_cgnat("fe80::1".parse().unwrap()));
+        assert!(!is_lan_or_loopback_or_cgnat("8.8.8.8".parse().unwrap()));
+        assert!(!is_lan_or_loopback_or_cgnat(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
     }
 }

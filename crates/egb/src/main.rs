@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
 use bridge_core::{AmpOperatingState, ConnectionState, SharedState};
 use clap::{Parser, Subcommand, ValueEnum};
-use egb_config::BridgeConfig;
+use egb_config::{is_lan_or_loopback_or_cgnat, BridgeConfig};
 use elecraft_kat500::{
     command_map as kat_command_map, read_only_discovery_commands as kat_discovery_commands,
     read_only_poll_commands as kat_poll_commands, CommandOutcome as KatCommandOutcome,
@@ -15,7 +15,7 @@ use elecraft_kpa500::{
     ControlCommandResult as KpaControlCommandResult, Kpa500Driver, Kpa500Settings,
 };
 use flex_injection::FlexInjectionSettings;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,6 +45,12 @@ enum Commands {
         config: PathBuf,
         #[arg(long)]
         duration_hours: f64,
+    },
+    StabilityTest {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        duration_minutes: f64,
     },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
@@ -145,6 +151,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_soak_test(cfg, duration_hours).await
+        }
+        Commands::StabilityTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_stability_test(cfg, duration_minutes).await
         }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
@@ -255,6 +269,7 @@ async fn main() -> Result<()> {
 }
 
 async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
+    let _ = BRIDGE_STARTED_AT.set(SystemTime::now());
     let all_mock = cfg.kpa500.mock && cfg.kat500.mock;
     let state = if all_mock {
         shared_mock_state()
@@ -345,7 +360,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 .as_ref()
                 .map(PathBuf::from),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
-            aethersdr_compat: cfg.tgxl.aethersdr_compat,
+            aethersdr_compat: cfg.tgxl.aethersdr_compat || cfg.tgxl.smartsdr_compat,
             strict_emulation: cfg.tgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.tgxl.startup_delay_ms),
             force_presence_test: cfg.tgxl.force_presence_test,
@@ -468,6 +483,60 @@ async fn run_soak_test(cfg: BridgeConfig, duration_hours: f64) -> Result<()> {
     Ok(())
 }
 
+async fn run_stability_test(cfg: BridgeConfig, duration_minutes: f64) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let state = start_bridge(&cfg).await?;
+    let duration = Duration::from_secs_f64(duration_minutes * 60.0);
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await;
+    info!(
+        event_id = "stability_test_started",
+        duration_minutes,
+        duration_secs = duration.as_secs(),
+        "stability test started"
+    );
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                break;
+            }
+            _ = interval.tick() => {
+                print_soak_summary(&state, started.elapsed()).await;
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for Ctrl+C")?;
+                info!("stability test interrupted by Ctrl+C");
+                break;
+            }
+        }
+    }
+    let path = write_stability_report(&state, started.elapsed()).await?;
+    info!(
+        event_id = "stability_test_completed",
+        report = %path.display(),
+        "stability test completed"
+    );
+    println!("stability report: {}", path.display());
+    Ok(())
+}
+
+async fn write_stability_report(state: &SharedState, elapsed: Duration) -> Result<PathBuf> {
+    tokio::fs::create_dir_all("diagnostics").await?;
+    let path =
+        PathBuf::from("diagnostics").join(format!("egb-stability-{}.json", timestamp_compact()));
+    let status: serde_json::Value = serde_json::from_str(&status_json(state).await)?;
+    let body = serde_json::json!({
+        "elapsed_secs": elapsed.as_secs(),
+        "status": status,
+    });
+    tokio::fs::write(&path, serde_json::to_vec_pretty(&body)?).await?;
+    Ok(path)
+}
+
 async fn apply_mock_config(cfg: &BridgeConfig, state: &SharedState) {
     if !(cfg.kpa500.mock || cfg.kat500.mock) {
         return;
@@ -506,10 +575,22 @@ async fn stale_state_watchdog(
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let now = SystemTime::now();
-        let mut guard = state.write().await;
-        if guard.amp.connection_state == ConnectionState::Connected
-            && is_stale(guard.amp.last_successful_poll_at, now, amp_stale_after)
-        {
+        let (amp_stale, tuner_stale) = {
+            let guard = state.read().await;
+            (
+                guard.amp.connection_state == ConnectionState::Connected
+                    && is_stale(guard.amp.last_successful_poll_at, now, amp_stale_after),
+                guard.tuner.connection_state == ConnectionState::Connected
+                    && is_stale(guard.tuner.last_successful_poll_at, now, tuner_stale_after),
+            )
+        };
+        if amp_stale {
+            let mut guard = state.write().await;
+            if guard.amp.connection_state != ConnectionState::Connected
+                || !is_stale(guard.amp.last_successful_poll_at, now, amp_stale_after)
+            {
+                continue;
+            }
             guard.amp.connection_state = ConnectionState::Degraded;
             guard.amp.connected = false;
             guard.amp.runtime.stale_transition_count =
@@ -521,9 +602,13 @@ async fn stale_state_watchdog(
                 "KPA500 state degraded because polling timestamp is stale"
             );
         }
-        if guard.tuner.connection_state == ConnectionState::Connected
-            && is_stale(guard.tuner.last_successful_poll_at, now, tuner_stale_after)
-        {
+        if tuner_stale {
+            let mut guard = state.write().await;
+            if guard.tuner.connection_state != ConnectionState::Connected
+                || !is_stale(guard.tuner.last_successful_poll_at, now, tuner_stale_after)
+            {
+                continue;
+            }
             guard.tuner.connection_state = ConnectionState::Degraded;
             guard.tuner.connected = false;
             guard.tuner.runtime.stale_transition_count =
@@ -561,16 +646,18 @@ async fn run_metrics_endpoint(addr: SocketAddr, state: SharedState) -> Result<()
             let request = String::from_utf8_lossy(&request[..read]);
             let status = if request.starts_with("GET /status ") {
                 let body = status_json(&state).await;
+                let content_length = http_content_length(&body);
                 format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
+                    content_length,
                     body
                 )
             } else {
                 let body = "{\"error\":\"not_found\"}";
+                let content_length = http_content_length(body);
                 format!(
                     "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                    body.len(),
+                    content_length,
                     body
                 )
             };
@@ -581,8 +668,16 @@ async fn run_metrics_endpoint(addr: SocketAddr, state: SharedState) -> Result<()
     }
 }
 
+#[allow(clippy::needless_as_bytes)]
+fn http_content_length(body: &str) -> usize {
+    body.as_bytes().len()
+}
+
 async fn status_json(state: &SharedState) -> String {
-    let started = *BRIDGE_STARTED_AT.get_or_init(SystemTime::now);
+    let started = BRIDGE_STARTED_AT
+        .get()
+        .copied()
+        .unwrap_or_else(SystemTime::now);
     let guard = state.read().await;
     serde_json::json!({
         "bridge": {
@@ -594,7 +689,7 @@ async fn status_json(state: &SharedState) -> String {
         },
         "amp": {
             "connection_state": guard.amp.connection_state.as_str(),
-            "connected": guard.amp.connected,
+            "connected": guard.amp.is_connected(),
             "operate": guard.amp.operate,
             "state": guard.amp.state.pgxl_state(),
             "forward_power_watts": guard.amp.forward_power_watts,
@@ -614,7 +709,7 @@ async fn status_json(state: &SharedState) -> String {
         },
         "tuner": {
             "connection_state": guard.tuner.connection_state.as_str(),
-            "connected": guard.tuner.connected,
+            "connected": guard.tuner.is_connected(),
             "operate": guard.tuner.operate,
             "mode": tuner_mode_label(&guard.tuner),
             "bypass": guard.tuner.bypass,
@@ -647,7 +742,10 @@ async fn status_json(state: &SharedState) -> String {
         "flex_injection": guard.flex_injection,
         "flex_diagnostics": {
             "ping_count": guard.flex_injection.ping_count,
-            "ping_failures": guard.flex_injection.command_failure_count,
+            "ping_failures": guard.flex_injection.ping_failure_count,
+            "pending_count": guard.flex_injection.pending_count,
+            "expired_pending_count": guard.flex_injection.expired_pending_count,
+            "degraded_reason": guard.flex_injection.degraded_reason,
             "registration_refresh_count": 0,
             "tuner_presence_age_ms": stale_duration_ms(guard.tuner.last_successful_poll_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
@@ -738,6 +836,14 @@ fn system_time_ms(value: Option<SystemTime>) -> Option<u128> {
             .ok()
             .map(|duration| duration.as_millis())
     })
+}
+
+fn timestamp_compact() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
 
 fn stale_duration_ms(value: Option<SystemTime>) -> Option<u128> {
@@ -1379,7 +1485,7 @@ fn parse_ip(label: &str, value: &str) -> Result<IpAddr> {
 fn bind_scope(ip: IpAddr) -> &'static str {
     if ip.is_loopback() {
         "loopback"
-    } else if is_private_lan(ip) {
+    } else if is_lan_or_loopback_or_cgnat(ip) && !ip.is_loopback() {
         "private-lan"
     } else if ip.is_unspecified() {
         "public-or-all-interfaces"
@@ -1389,16 +1495,7 @@ fn bind_scope(ip: IpAddr) -> &'static str {
 }
 
 fn is_local_or_private(ip: IpAddr) -> bool {
-    ip.is_loopback() || is_private_lan(ip)
-}
-
-fn is_private_lan(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(value) => {
-            value.is_private() || (value.octets()[0] == 169 && value.octets()[1] == 254)
-        }
-        IpAddr::V6(value) => value.segments()[0] & 0xfe00 == 0xfc00 || value == Ipv6Addr::LOCALHOST,
-    }
+    is_lan_or_loopback_or_cgnat(ip)
 }
 
 fn command_wires<T>(commands: &[T]) -> String

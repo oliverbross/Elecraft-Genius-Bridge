@@ -821,7 +821,7 @@ fn bool_int(value: bool) -> u8 {
 
 fn watts_to_dbm(watts: f32) -> f32 {
     if watts <= 0.0 {
-        0.0
+        -120.0
     } else {
         10.0 * (watts * 1000.0).log10()
     }
@@ -872,7 +872,7 @@ mod tests {
         let body = status_body(&state, false).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-30.0000 connection_state=connected fault=\n"
+            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000 connection_state=connected fault=\n"
         );
     }
 
@@ -898,7 +898,7 @@ mod tests {
         let body = status_body(&state, true).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-30.0000\n"
+            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000\n"
         );
     }
 

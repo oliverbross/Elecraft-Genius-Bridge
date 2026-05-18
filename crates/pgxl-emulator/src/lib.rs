@@ -1,6 +1,7 @@
 use anyhow::Context;
 use bridge_core::{
-    parse_client_command, response_line, AmpOperatingState, ConnectionState, SharedState,
+    parse_client_command, response_line, AmpOperatingState, ConnectionState, ProtocolClientSession,
+    SharedState,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -66,11 +67,20 @@ async fn handle_client(
     state: SharedState,
     options: EmulatorOptions,
 ) -> anyhow::Result<()> {
-    {
+    let session_id = {
         let mut guard = state.write().await;
         guard.clients.pgxl_connected = true;
         guard.clients.pgxl_client_count += 1;
-    }
+        let id = guard.clients.next_session_id;
+        guard.clients.next_session_id = guard.clients.next_session_id.saturating_add(1);
+        guard.clients.pgxl_sessions.push(ProtocolClientSession::new(
+            id,
+            "PGXL",
+            peer,
+            timestamp_millis(),
+        ));
+        id
+    };
     if options.force_direct_connected_test {
         info!(
             protocol = "PGXL",
@@ -103,6 +113,7 @@ async fn handle_client(
         .await
         .context("failed to write PGXL version greeting")?;
         stats.responses_sent += 1;
+        update_pgxl_session_response(&state, session_id, 0).await;
         increment_responses(&state).await;
 
         let mut lines = BufReader::new(reader).lines();
@@ -123,6 +134,7 @@ async fn handle_client(
             match parse_client_command(&line) {
                 Ok(cmd) => {
                     stats.commands_received += 1;
+                    update_pgxl_session_command(&state, session_id, &cmd.command).await;
                     increment_commands(&state).await;
                     if let Some(previous) = stats.last_sequence {
                         if cmd.seq <= previous {
@@ -142,11 +154,19 @@ async fn handle_client(
                     }
                     stats.last_sequence = Some(cmd.seq);
                     stats.observe_command(&cmd.command);
+                    let command_started = Instant::now();
                     let outcome =
                         handle_command(cmd.seq, &cmd.command, &state, options.aethersdr_compat)
                             .await;
+                    update_pgxl_session_response(
+                        &state,
+                        session_id,
+                        duration_millis_u64(command_started.elapsed()),
+                    )
+                    .await;
                     if outcome.unknown {
                         stats.unknown_commands += 1;
+                        update_pgxl_session_unknown(&state, session_id).await;
                         increment_unknown(&state).await;
                         warn!(
                             event_id = "protocol_parse_failure",
@@ -176,6 +196,7 @@ async fn handle_client(
                 }
                 Err(err) => {
                     stats.parse_failures += 1;
+                    update_pgxl_session_parse_failure(&state, session_id).await;
                     increment_parse_failure(&state).await;
                     warn!(
                         event_id = "protocol_parse_failure",
@@ -197,6 +218,14 @@ async fn handle_client(
         let mut guard = state.write().await;
         guard.clients.pgxl_client_count = guard.clients.pgxl_client_count.saturating_sub(1);
         guard.clients.pgxl_connected = guard.clients.pgxl_client_count > 0;
+        guard
+            .clients
+            .pgxl_sessions
+            .retain(|session| session.id != session_id);
+        guard.clients.pgxl_last_disconnect_reason = Some(match &result {
+            Ok(()) => "client_closed".to_string(),
+            Err(err) => err.to_string(),
+        });
     }
     info!(event_id = "client_disconnected", protocol = "PGXL", connection_id = %peer, "PGXL client disconnected");
     result
@@ -619,9 +648,61 @@ fn timestamp_millis() -> u128 {
         .as_millis()
 }
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn update_pgxl_session_command(state: &SharedState, session_id: u64, command: &str) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .pgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.record_command(command);
+    }
+}
+
+async fn update_pgxl_session_response(state: &SharedState, session_id: u64, latency_ms: u64) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .pgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.record_response(latency_ms);
+    }
+}
+
+async fn update_pgxl_session_parse_failure(state: &SharedState, session_id: u64) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .pgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.parse_failures = session.parse_failures.saturating_add(1);
+    }
+}
+
+async fn update_pgxl_session_unknown(state: &SharedState, session_id: u64) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .pgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.unknown_commands = session.unknown_commands.saturating_add(1);
+    }
+}
+
 fn watts_to_dbm(watts: f32) -> f32 {
     if watts <= 0.0 {
-        0.0
+        -120.0
     } else {
         10.0 * (watts * 1000.0).log10()
     }
@@ -656,7 +737,7 @@ mod tests {
         let body = status_body(&state, false).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|state=STANDBY peakfwd=0.0000 swr=-30.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n"
+            "R2|0|state=STANDBY peakfwd=-120.0000 swr=-30.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n"
         );
     }
 
@@ -682,7 +763,7 @@ mod tests {
         let body = status_body(&state, true).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|state=STANDBY peakfwd=0.0000 swr=-30.0000 temp=32.0 id=0.0 vac=0 meffa=OK\n"
+            "R2|0|state=STANDBY peakfwd=-120.0000 swr=-30.0000 temp=32.0 id=0.0 vac=0 meffa=OK\n"
         );
     }
 

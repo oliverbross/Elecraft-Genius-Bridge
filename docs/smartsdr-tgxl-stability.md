@@ -13,6 +13,11 @@ The TGXL direct TCP server now records active sessions in `/status`:
 ```text
 clients.tgxl_sessions[]
 clients.tgxl_last_disconnect_reason
+flex_diagnostics.ping_count
+flex_diagnostics.ping_failures
+flex_diagnostics.pending_count
+flex_diagnostics.expired_pending_count
+flex_diagnostics.degraded_reason
 ```
 
 Each session includes:
@@ -28,6 +33,8 @@ Each session includes:
 
 The disconnect log also includes the normal session summary.
 
+Phase 22 adds `tgxl.smartsdr_compat: true`. It uses the same conservative direct TGXL formatting as AetherSDR compatibility mode: source-observed fields only and no experimental direct status fields.
+
 ## Current Suspected Causes
 
 Most likely causes to validate with a diagnostics ZIP:
@@ -39,9 +46,17 @@ Most likely causes to validate with a diagnostics ZIP:
 
 ## Next Capture
 
-Run the GUI, start the bridge, reproduce the SmartSDR reconnect, then export diagnostics. Check:
+Run a 10-minute stability capture, reproduce the SmartSDR reconnect if possible, then export diagnostics:
+
+```powershell
+.\target-msvc\debug\egb.exe stability-test --config config.aethersdr-compat-readonly.yaml --duration-minutes 10
+```
+
+Check:
 
 - `clients.tgxl_sessions`
 - `clients.tgxl_last_disconnect_reason`
 - TGXL protocol transcript around the disconnect
 - Flex command responses and ping count
+- `logs\tests`
+- Windows Event Viewer crash entry if SmartSDR crashes

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bridge_core::{ConnectionState, SharedState};
+use bridge_core::{push_capability, ConnectionState, SharedState};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{create_dir_all, File};
@@ -8,7 +8,7 @@ use tokio::time::{sleep, timeout};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tracing::{debug, info, trace, warn};
 
-const DISCOVERY_BAUDS: [u32; 5] = [38400, 19200, 9600, 4800, 38400];
+const DISCOVERY_BAUDS: [u32; 4] = [38400, 19200, 9600, 4800];
 
 // KAT500 Serial Command Reference mappings.
 // `ST` is intentionally absent: the KAT500 uses ST for SWR thresholds, not
@@ -435,7 +435,7 @@ impl Kat500Driver {
             self.settings.transcript_rotate_bytes,
         )
         .await;
-        send_dynamic_command(
+        send_command(
             &mut port,
             command,
             Duration::from_millis(750),
@@ -671,19 +671,13 @@ impl Kat500Driver {
 
     pub async fn set_antenna_serial(port: &mut SerialStream, antenna: u8) -> Result<String> {
         let mut transcript = SerialTranscript::disabled();
-        send_dynamic_command(
+        send_command(
             port,
             antenna_command(antenna),
             Duration::from_millis(750),
             &mut transcript,
         )
         .await
-    }
-}
-
-fn push_capability(capabilities: &mut Vec<String>, capability: &str) {
-    if !capabilities.iter().any(|existing| existing == capability) {
-        capabilities.push(capability.to_string());
     }
 }
 
@@ -873,17 +867,6 @@ async fn wake_kat500(
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("KAT500 wake probe did not run")))
-}
-
-async fn send_dynamic_command(
-    port: &mut SerialStream,
-    command: ElecraftCommand,
-    wait: Duration,
-    transcript: &mut SerialTranscript,
-) -> Result<String> {
-    Ok(send_command_collect(port, command, wait, transcript)
-        .await?
-        .response)
 }
 
 async fn send_wire_command(

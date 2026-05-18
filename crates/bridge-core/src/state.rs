@@ -221,6 +221,12 @@ impl Default for AmpState {
     }
 }
 
+impl AmpState {
+    pub fn is_connected(&self) -> bool {
+        self.connection_state.is_healthy()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunerState {
     pub connected: bool,
@@ -273,6 +279,12 @@ impl Default for TunerState {
     }
 }
 
+impl TunerState {
+    pub fn is_connected(&self) -> bool {
+        self.connection_state.is_healthy()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviceRuntimeStats {
     pub reconnect_count: u64,
@@ -297,6 +309,10 @@ pub struct FlexInjectionState {
     pub command_success_count: u64,
     pub command_failure_count: u64,
     pub ping_count: u64,
+    pub ping_failure_count: u64,
+    pub pending_count: usize,
+    pub expired_pending_count: u64,
+    pub degraded_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +392,12 @@ impl ProtocolClientSession {
         self.responses_sent = self.responses_sent.saturating_add(1);
         self.last_response_latency_ms = latency_ms;
         self.max_response_latency_ms = self.max_response_latency_ms.max(latency_ms);
+    }
+}
+
+pub fn push_capability(capabilities: &mut Vec<String>, capability: &str) {
+    if !capabilities.iter().any(|existing| existing == capability) {
+        capabilities.push(capability.to_string());
     }
 }
 

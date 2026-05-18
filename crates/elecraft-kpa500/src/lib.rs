@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bridge_core::{AmpOperatingState, ConnectionState, SharedState};
+use bridge_core::{push_capability, AmpOperatingState, ConnectionState, SharedState};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{create_dir_all, File};
@@ -741,12 +741,6 @@ impl Kpa500Driver {
             &mut transcript,
         )
         .await
-    }
-}
-
-fn push_capability(capabilities: &mut Vec<String>, capability: &str) {
-    if !capabilities.iter().any(|existing| existing == capability) {
-        capabilities.push(capability.to_string());
     }
 }
 

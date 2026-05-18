@@ -200,7 +200,7 @@ impl GuiApp {
     fn run_egb_command(&mut self, label: &'static str, args: Vec<String>) {
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = run_egb_capture(&args);
+            let result = run_egb_capture_logged(label, &args);
             let message = match result {
                 Ok(output) => AsyncMessage::CommandResult {
                     label: label.to_string(),
@@ -302,7 +302,7 @@ impl GuiApp {
                     self.config.metrics.bind_ip, self.config.metrics.port
                 ));
             }
-            if ui.button("Copy Diagnostics Bundle").clicked() {
+            if ui.button("Export Full Diagnostics Bundle").clicked() {
                 match self.export_diagnostics_bundle() {
                     Ok(path) => {
                         self.push_log(format!("diagnostics bundle written to {}", path.display()))
@@ -564,6 +564,15 @@ impl GuiApp {
                 field(ui, "Flex state", &status.flex_injection.connection_state);
                 field(
                     ui,
+                    "Degraded reason",
+                    status
+                        .flex_injection
+                        .degraded_reason
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
                     "Client handle",
                     status
                         .flex_injection
@@ -607,6 +616,23 @@ impl GuiApp {
                         .tgxl_last_disconnect_reason
                         .as_deref()
                         .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Ping ok/fail",
+                    format!(
+                        "{}/{}",
+                        status.flex_injection.ping_count, status.flex_injection.ping_failure_count
+                    ),
+                );
+                field(
+                    ui,
+                    "Pending/expired",
+                    format!(
+                        "{}/{}",
+                        status.flex_injection.pending_count,
+                        status.flex_injection.expired_pending_count
+                    ),
                 );
                 field(
                     ui,
@@ -739,6 +765,9 @@ impl GuiApp {
                     }
                     Err(err) => self.push_log(format!("log export failed: {err}")),
                 }
+            }
+            if ui.button("Open Test Logs Folder").clicked() {
+                open_path(Path::new("logs/tests"));
             }
         });
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1462,6 +1491,14 @@ struct FlexStatus {
     command_success_count: u64,
     command_failure_count: u64,
     ping_count: u64,
+    #[serde(default)]
+    ping_failure_count: u64,
+    #[serde(default)]
+    pending_count: usize,
+    #[serde(default)]
+    expired_pending_count: u64,
+    #[serde(default)]
+    degraded_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1542,6 +1579,8 @@ fn export_diagnostics_bundle(
     )?;
     add_dir_to_zip(&mut zip, options, Path::new("logs/protocol"), "protocol")?;
     add_dir_to_zip(&mut zip, options, Path::new("logs/serial"), "serial")?;
+    add_dir_to_zip(&mut zip, options, Path::new("logs/tests"), "tests")?;
+    add_dir_to_zip(&mut zip, options, Path::new("logs"), "logs-root")?;
     zip.finish()?;
     Ok(path)
 }
@@ -1651,6 +1690,31 @@ fn run_egb_capture(args: &[String]) -> Result<String> {
     } else {
         anyhow::bail!("egb exited with {}:\n{text}", output.status)
     }
+}
+
+fn run_egb_capture_logged(label: &str, args: &[String]) -> Result<String> {
+    let started = Instant::now();
+    let started_stamp = timestamp_filename();
+    let result = run_egb_capture(args);
+    fs::create_dir_all("logs/tests")?;
+    let path = PathBuf::from("logs/tests").join(format!("{started_stamp}-{label}.log"));
+    let mut body = String::new();
+    body.push_str(&format!("test={label}\n"));
+    body.push_str(&format!("timestamp={started_stamp}\n"));
+    body.push_str(&format!("duration_ms={}\n", started.elapsed().as_millis()));
+    body.push_str(&format!("command=egb {}\n\n", args.join(" ")));
+    match &result {
+        Ok(output) => {
+            body.push_str("exit=0\n\n");
+            body.push_str(output);
+        }
+        Err(err) => {
+            body.push_str("exit=error\n\n");
+            body.push_str(&err.to_string());
+        }
+    }
+    fs::write(path, body)?;
+    result
 }
 
 fn find_egb_binary() -> Result<PathBuf> {
