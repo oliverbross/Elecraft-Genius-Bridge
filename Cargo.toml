@@ -31,6 +31,7 @@ tokio-serial = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 eframe = { version = "0.27", default-features = true }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [profile.release]
 codegen-units = 1

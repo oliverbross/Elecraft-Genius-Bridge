@@ -328,6 +328,55 @@ pub struct ClientState {
     pub tgxl_connected: bool,
     pub pgxl_client_count: usize,
     pub tgxl_client_count: usize,
+    pub next_session_id: u64,
+    pub pgxl_sessions: Vec<ProtocolClientSession>,
+    pub tgxl_sessions: Vec<ProtocolClientSession>,
+    pub pgxl_last_disconnect_reason: Option<String>,
+    pub tgxl_last_disconnect_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProtocolClientSession {
+    pub id: u64,
+    pub protocol: String,
+    pub peer: String,
+    pub connected_at_ms: u128,
+    pub last_command: Option<String>,
+    pub commands_received: u64,
+    pub responses_sent: u64,
+    pub parse_failures: u64,
+    pub unknown_commands: u64,
+    pub last_response_latency_ms: u64,
+    pub max_response_latency_ms: u64,
+}
+
+impl ProtocolClientSession {
+    pub fn new(id: u64, protocol: &str, peer: impl ToString, connected_at_ms: u128) -> Self {
+        Self {
+            id,
+            protocol: protocol.to_string(),
+            peer: peer.to_string(),
+            connected_at_ms,
+            last_command: None,
+            commands_received: 0,
+            responses_sent: 0,
+            parse_failures: 0,
+            unknown_commands: 0,
+            last_response_latency_ms: 0,
+            max_response_latency_ms: 0,
+        }
+    }
+
+    pub fn record_command(&mut self, command: &str) {
+        self.commands_received = self.commands_received.saturating_add(1);
+        self.last_command = Some(command.to_string());
+    }
+
+    pub fn record_response(&mut self, latency_ms: u64) {
+        self.responses_sent = self.responses_sent.saturating_add(1);
+        self.last_response_latency_ms = latency_ms;
+        self.max_response_latency_ms = self.max_response_latency_ms.max(latency_ms);
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

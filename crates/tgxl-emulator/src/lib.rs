@@ -1,6 +1,7 @@
 use anyhow::Context;
 use bridge_core::{
-    parse_client_command, response_line, ConnectionState, ManualTuneRequest, SharedState,
+    parse_client_command, response_line, ConnectionState, ManualTuneRequest, ProtocolClientSession,
+    SharedState,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -67,11 +68,20 @@ async fn handle_client(
     state: SharedState,
     options: EmulatorOptions,
 ) -> anyhow::Result<()> {
-    {
+    let session_id = {
         let mut guard = state.write().await;
         guard.clients.tgxl_connected = true;
         guard.clients.tgxl_client_count += 1;
-    }
+        guard.clients.next_session_id = guard.clients.next_session_id.saturating_add(1);
+        let id = guard.clients.next_session_id;
+        guard.clients.tgxl_sessions.push(ProtocolClientSession::new(
+            id,
+            "TGXL",
+            peer,
+            timestamp_millis(),
+        ));
+        id
+    };
     maybe_start_strict_startup(&state, &options).await;
     if options.force_presence_test {
         info!(
@@ -106,6 +116,7 @@ async fn handle_client(
         .await
         .context("failed to write TGXL version greeting")?;
         stats.responses_sent += 1;
+        update_tgxl_session_response(&state, session_id, 0).await;
         increment_responses(&state).await;
 
         let mut lines = BufReader::new(reader).lines();
@@ -145,11 +156,14 @@ async fn handle_client(
                     }
                     stats.last_sequence = Some(cmd.seq);
                     stats.observe_command(&cmd.command);
+                    update_tgxl_session_command(&state, session_id, &cmd.command).await;
+                    let command_started = Instant::now();
                     let outcome =
                         handle_command(cmd.seq, &cmd.command, &state, options.aethersdr_compat)
                             .await;
                     if outcome.unknown {
                         stats.unknown_commands += 1;
+                        update_tgxl_session_unknown(&state, session_id).await;
                         increment_unknown(&state).await;
                         warn!(
                             event_id = "protocol_parse_failure",
@@ -165,6 +179,7 @@ async fn handle_client(
                         increment_unsupported(&state).await;
                     }
                     debug!(%peer, command = %cmd.command, "TGXL command handled");
+                    let latency_ms = duration_millis_u64(command_started.elapsed());
                     write_protocol_line(
                         &mut writer,
                         &mut transcript,
@@ -175,6 +190,7 @@ async fn handle_client(
                     )
                     .await?;
                     stats.responses_sent += 1;
+                    update_tgxl_session_response(&state, session_id, latency_ms).await;
                     increment_responses(&state).await;
                     for push in outcome.pushes {
                         write_protocol_line(
@@ -187,11 +203,13 @@ async fn handle_client(
                         )
                         .await?;
                         stats.responses_sent += 1;
+                        update_tgxl_session_response(&state, session_id, 0).await;
                         increment_responses(&state).await;
                     }
                 }
                 Err(err) => {
                     stats.parse_failures += 1;
+                    update_tgxl_session_parse_failure(&state, session_id).await;
                     increment_parse_failure(&state).await;
                     warn!(
                         event_id = "protocol_parse_failure",
@@ -213,6 +231,14 @@ async fn handle_client(
         let mut guard = state.write().await;
         guard.clients.tgxl_client_count = guard.clients.tgxl_client_count.saturating_sub(1);
         guard.clients.tgxl_connected = guard.clients.tgxl_client_count > 0;
+        guard
+            .clients
+            .tgxl_sessions
+            .retain(|session| session.id != session_id);
+        guard.clients.tgxl_last_disconnect_reason = Some(match &result {
+            Ok(()) => "client_closed".to_string(),
+            Err(err) => err.to_string(),
+        });
     }
     info!(event_id = "client_disconnected", protocol = "TGXL", connection_id = %peer, "TGXL client disconnected");
     result
@@ -575,6 +601,54 @@ async fn increment_unknown(state: &SharedState) {
     state.write().await.protocol.tgxl.unknown_commands += 1;
 }
 
+async fn update_tgxl_session_command(state: &SharedState, session_id: u64, command: &str) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .tgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.record_command(command);
+    }
+}
+
+async fn update_tgxl_session_response(state: &SharedState, session_id: u64, latency_ms: u64) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .tgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.record_response(latency_ms);
+    }
+}
+
+async fn update_tgxl_session_parse_failure(state: &SharedState, session_id: u64) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .tgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.parse_failures = session.parse_failures.saturating_add(1);
+    }
+}
+
+async fn update_tgxl_session_unknown(state: &SharedState, session_id: u64) {
+    let mut guard = state.write().await;
+    if let Some(session) = guard
+        .clients
+        .tgxl_sessions
+        .iter_mut()
+        .find(|session| session.id == session_id)
+    {
+        session.unknown_commands = session.unknown_commands.saturating_add(1);
+    }
+}
+
 async fn increment_unsupported(state: &SharedState) {
     state.write().await.protocol.tgxl.unsupported_features += 1;
 }
@@ -731,6 +805,10 @@ fn timestamp_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn bool_int(value: bool) -> u8 {

@@ -17,12 +17,15 @@ use elecraft_kpa500::{
 use flex_injection::FlexInjectionSettings;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_serial::{SerialPortBuilderExt, SerialPortType, SerialStream};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+static BRIDGE_STARTED_AT: OnceLock<SystemTime> = OnceLock::new();
 
 #[derive(Debug, Parser)]
 #[command(name = "egb", version, about = "Elecraft Genius Bridge")]
@@ -579,8 +582,16 @@ async fn run_metrics_endpoint(addr: SocketAddr, state: SharedState) -> Result<()
 }
 
 async fn status_json(state: &SharedState) -> String {
+    let started = *BRIDGE_STARTED_AT.get_or_init(SystemTime::now);
     let guard = state.read().await;
     serde_json::json!({
+        "bridge": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "git_commit": option_env!("GIT_HASH").unwrap_or("unknown"),
+            "process_id": std::process::id(),
+            "uptime_ms": SystemTime::now().duration_since(started).unwrap_or_default().as_millis(),
+            "config_path": "unknown",
+        },
         "amp": {
             "connection_state": guard.amp.connection_state.as_str(),
             "connected": guard.amp.connected,
@@ -628,8 +639,19 @@ async fn status_json(state: &SharedState) -> String {
             "tgxl_connected": guard.clients.tgxl_connected,
             "pgxl_client_count": guard.clients.pgxl_client_count,
             "tgxl_client_count": guard.clients.tgxl_client_count,
+            "pgxl_sessions": guard.clients.pgxl_sessions,
+            "tgxl_sessions": guard.clients.tgxl_sessions,
+            "pgxl_last_disconnect_reason": guard.clients.pgxl_last_disconnect_reason,
+            "tgxl_last_disconnect_reason": guard.clients.tgxl_last_disconnect_reason,
         },
         "flex_injection": guard.flex_injection,
+        "flex_diagnostics": {
+            "ping_count": guard.flex_injection.ping_count,
+            "ping_failures": guard.flex_injection.command_failure_count,
+            "registration_refresh_count": 0,
+            "tuner_presence_age_ms": stale_duration_ms(guard.tuner.last_successful_poll_at),
+            "amplifier_presence_age_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
+        },
         "protocol": guard.protocol,
     })
     .to_string()

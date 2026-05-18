@@ -3,3 +3,6 @@ target/
 target-clippy/
 target-msvc/
 logs/
+dist/
+diagnostics/
+egb-gui-settings.yaml

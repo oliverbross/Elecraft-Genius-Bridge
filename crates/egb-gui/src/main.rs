@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use eframe::egui;
 use egb_config::BridgeConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CONFIG: &str = "config.flex-injection-readonly.yaml";
-const LOG_LIMIT: usize = 100;
+const LOG_LIMIT: usize = 500;
+const GUI_SETTINGS_PATH: &str = "egb-gui-settings.yaml";
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -42,6 +43,10 @@ struct GuiApp {
     kpa_probe_result: String,
     kat_probe_result: String,
     diagnostics: VecDeque<String>,
+    settings: GuiSettings,
+    controls: ControlFlags,
+    log_filter: LogFilter,
+    logs_paused: bool,
     tx: Sender<AsyncMessage>,
     rx: Receiver<AsyncMessage>,
 }
@@ -51,6 +56,8 @@ impl GuiApp {
         let (tx, rx) = mpsc::channel();
         let config_path = PathBuf::from(DEFAULT_CONFIG);
         let config = load_config_or_default(&config_path);
+        let settings = GuiSettings::load(Path::new(GUI_SETTINGS_PATH)).unwrap_or_default();
+        let controls = ControlFlags::default();
         let mut app = Self {
             config_path,
             config,
@@ -64,14 +71,24 @@ impl GuiApp {
             kpa_probe_result: String::new(),
             kat_probe_result: String::new(),
             diagnostics: VecDeque::new(),
+            settings,
+            controls,
+            log_filter: LogFilter::All,
+            logs_paused: false,
             tx,
             rx,
         };
         app.push_log("GUI started");
+        if app.settings.start_bridge_on_launch {
+            app.start_bridge();
+        }
         app
     }
 
     fn push_log(&mut self, line: impl Into<String>) {
+        if self.logs_paused {
+            return;
+        }
         self.diagnostics
             .push_back(format!("{} {}", timestamp_hms(), line.into()));
         while self.diagnostics.len() > LOG_LIMIT {
@@ -144,6 +161,9 @@ impl GuiApp {
             self.push_log("refusing to save allow_rf_risk=true until warning is acknowledged");
             return;
         }
+        if let Err(err) = self.settings.save(Path::new(GUI_SETTINGS_PATH)) {
+            self.push_log(format!("GUI settings save failed: {err}"));
+        }
         match save_config(&self.config_path, &self.config) {
             Ok(()) => self.push_log(format!("saved {}", self.config_path.display())),
             Err(err) => self.push_log(format!("save failed: {err}")),
@@ -209,34 +229,52 @@ impl GuiApp {
             let _ = tx.send(AsyncMessage::SerialPorts(ports));
         });
     }
+
+    fn export_diagnostics_bundle(&self) -> Result<PathBuf> {
+        export_diagnostics_bundle(
+            &self.config_path,
+            self.status.as_ref(),
+            &self.diagnostics,
+            &self.settings,
+            self.settings.redact_diagnostics,
+        )
+    }
 }
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        apply_modern_style(ctx);
         self.poll_messages();
         self.poll_status_if_due();
         self.bridge.refresh();
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Elecraft Genius Bridge");
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(190.0)
+            .show(ctx, |ui| {
+                ui.add_space(12.0);
+                ui.heading("EGB");
+                ui.label("Elecraft Genius Bridge");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
-                ui.selectable_value(&mut self.tab, Tab::Config, "Configuration");
-                ui.selectable_value(&mut self.tab, Tab::Diagnostics, "Diagnostics");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                nav_button(ui, &mut self.tab, Tab::Dashboard, "Dashboard");
+                nav_button(ui, &mut self.tab, Tab::Config, "Configuration");
+                nav_button(ui, &mut self.tab, Tab::Controls, "Controls");
+                nav_button(ui, &mut self.tab, Tab::Diagnostics, "Diagnostics");
+                nav_button(ui, &mut self.tab, Tab::Logs, "Logs");
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     process_badge(
                         ui,
                         effective_process_state(self.bridge.state(), self.status.as_ref()),
                     );
                 });
             });
-        });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Dashboard => self.ui_dashboard(ui),
             Tab::Config => self.ui_config(ui),
+            Tab::Controls => self.ui_controls(ui),
             Tab::Diagnostics => self.ui_diagnostics(ui),
+            Tab::Logs => self.ui_logs(ui),
         });
 
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -265,7 +303,7 @@ impl GuiApp {
                 ));
             }
             if ui.button("Copy Diagnostics Bundle").clicked() {
-                match copy_diagnostics_bundle(&self.config_path) {
+                match self.export_diagnostics_bundle() {
                     Ok(path) => {
                         self.push_log(format!("diagnostics bundle written to {}", path.display()))
                     }
@@ -280,13 +318,55 @@ impl GuiApp {
             );
         }
         ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            self.summary_card(
+                ui,
+                "Bridge",
+                self.bridge.state().label(),
+                self.bridge.state().color(),
+            );
+            if let Some(status) = &self.status {
+                self.summary_card(
+                    ui,
+                    "PGXL",
+                    bool_text(Some(status.clients.pgxl_connected)),
+                    status_color(status.clients.pgxl_connected),
+                );
+                self.summary_card(
+                    ui,
+                    "TGXL",
+                    bool_text(Some(status.clients.tgxl_connected)),
+                    status_color(status.clients.tgxl_connected),
+                );
+                self.summary_card(
+                    ui,
+                    "Flex",
+                    &status.flex_injection.connection_state,
+                    connection_color(&status.flex_injection.connection_state),
+                );
+            }
+        });
+        ui.add_space(8.0);
         egui::Grid::new("dashboard_grid")
-            .num_columns(2)
-            .spacing([16.0, 12.0])
+            .num_columns(3)
+            .spacing([14.0, 12.0])
             .show(ui, |ui| {
                 ui.vertical(|ui| self.ui_kpa_panel(ui));
                 ui.vertical(|ui| self.ui_kat_panel(ui));
+                ui.vertical(|ui| self.ui_flex_card(ui));
                 ui.end_row();
+            });
+    }
+
+    fn summary_card(&self, ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(22, 35, 56))
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_min_width(130.0);
+                ui.label(egui::RichText::new(label).color(egui::Color32::from_rgb(160, 178, 205)));
+                ui.label(egui::RichText::new(value).color(color).size(20.0).strong());
             });
     }
 
@@ -477,6 +557,201 @@ impl GuiApp {
         });
     }
 
+    fn ui_flex_card(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.heading("Flex / Clients");
+            if let Some(status) = &self.status {
+                field(ui, "Flex state", &status.flex_injection.connection_state);
+                field(
+                    ui,
+                    "Client handle",
+                    status
+                        .flex_injection
+                        .client_handle
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Amplifier",
+                    status
+                        .flex_injection
+                        .amplifier_handle
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Interlock",
+                    status
+                        .flex_injection
+                        .interlock_handle
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "PGXL clients",
+                    status.clients.pgxl_client_count.to_string(),
+                );
+                field(
+                    ui,
+                    "TGXL clients",
+                    status.clients.tgxl_client_count.to_string(),
+                );
+                field(
+                    ui,
+                    "Last TGXL close",
+                    status
+                        .clients
+                        .tgxl_last_disconnect_reason
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Meters",
+                    status
+                        .flex_injection
+                        .meter_handles
+                        .iter()
+                        .map(|meter| meter.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            } else {
+                ui.label("Start the bridge and enable metrics for live client state.");
+            }
+        });
+    }
+
+    fn ui_controls(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Guarded Controls");
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            "Controls show the exact command path. Risky actions remain off unless explicitly enabled for this GUI session.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.controls.kpa_safe, "Enable KPA safe controls");
+            ui.checkbox(
+                &mut self.controls.kpa_rf_risk,
+                "Enable KPA RF-risk controls",
+            );
+            ui.checkbox(&mut self.controls.kat_safe, "Enable KAT safe controls");
+            ui.checkbox(
+                &mut self.controls.kat_rf_risk,
+                "Enable KAT tune/RF-risk controls",
+            );
+            ui.checkbox(
+                &mut self.controls.kat_antenna,
+                "Enable KAT antenna switching",
+            );
+            ui.checkbox(
+                &mut self.controls.advanced,
+                "Enable destructive/advanced actions",
+            );
+            ui.checkbox(
+                &mut self.controls.remember_rf_confirm,
+                "Remember RF confirmation this session",
+            );
+        });
+        ui.separator();
+        ui.columns(2, |columns| {
+            columns[0].group(|ui| {
+                ui.heading("KPA500");
+                ui.monospace("Standby: Flex amplifier set operate=0 -> KPA500 ^OS0;");
+                if ui
+                    .add_enabled(self.controls.kpa_safe, egui::Button::new("Send Standby"))
+                    .clicked()
+                {
+                    self.run_egb_command(
+                        "kpa-standby",
+                        vec![
+                            "test-kpa".into(),
+                            "--config".into(),
+                            self.config_path.display().to_string(),
+                            "--allow-control".into(),
+                        ],
+                    );
+                }
+                ui.monospace("Operate: Flex amplifier set operate=1 -> KPA500 ^OS1;");
+                let operate_enabled = self.controls.kpa_rf_risk
+                    && self.config.kpa500.allow_rf_risk
+                    && (self.controls.remember_rf_confirm || self.rf_acknowledged);
+                if ui
+                    .add_enabled(
+                        operate_enabled,
+                        egui::Button::new("Operate Then Fail-Safe Standby"),
+                    )
+                    .clicked()
+                {
+                    self.run_egb_command(
+                        "kpa-operate",
+                        vec![
+                            "test-kpa-operate".into(),
+                            "--config".into(),
+                            self.config_path.display().to_string(),
+                            "--allow-rf-risk".into(),
+                        ],
+                    );
+                }
+                ui.add_enabled(false, egui::Button::new("Clear Fault (^FLC;)"));
+            });
+            columns[1].group(|ui| {
+                ui.heading("KAT500");
+                ui.monospace("Tune: TGXL autotune -> KAT500 tune command path");
+                ui.add_enabled(
+                    self.controls.kat_rf_risk,
+                    egui::Button::new("Tune (not wired yet)"),
+                );
+                ui.monospace("Bypass: BYP control command, disabled until validated");
+                ui.add_enabled(self.controls.kat_safe, egui::Button::new("Bypass On/Off"));
+                ui.monospace("Antenna: AN1;/AN2;/AN3;");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(self.controls.kat_antenna, egui::Button::new("ANT 1"));
+                    ui.add_enabled(self.controls.kat_antenna, egui::Button::new("ANT 2"));
+                    ui.add_enabled(self.controls.kat_antenna, egui::Button::new("ANT 3"));
+                });
+            });
+        });
+    }
+
+    fn ui_logs(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Logs");
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("Filter")
+                .selected_text(self.log_filter.label())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.log_filter, LogFilter::All, "all");
+                    ui.selectable_value(&mut self.log_filter, LogFilter::Error, "error");
+                    ui.selectable_value(&mut self.log_filter, LogFilter::Warn, "warn");
+                    ui.selectable_value(&mut self.log_filter, LogFilter::Info, "info");
+                    ui.selectable_value(&mut self.log_filter, LogFilter::Debug, "debug");
+                });
+            ui.checkbox(&mut self.logs_paused, "Pause");
+            if ui.button("Clear View").clicked() {
+                self.diagnostics.clear();
+            }
+            if ui.button("Export Visible Logs").clicked() {
+                match export_visible_logs(&self.diagnostics, self.log_filter) {
+                    Ok(path) => {
+                        self.push_log(format!("visible logs exported to {}", path.display()))
+                    }
+                    Err(err) => self.push_log(format!("log export failed: {err}")),
+                }
+            }
+        });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for line in self
+                .diagnostics
+                .iter()
+                .filter(|line| self.log_filter.matches(line))
+            {
+                ui.monospace(line);
+            }
+        });
+    }
+
     fn ui_config(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Config file");
@@ -498,6 +773,14 @@ impl GuiApp {
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Network");
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.settings.start_bridge_on_launch, "Start bridge when GUI launches");
+                ui.checkbox(&mut self.settings.start_minimized_to_tray, "Start minimized to tray");
+                ui.checkbox(&mut self.settings.close_to_tray, "Close to tray");
+                ui.checkbox(&mut self.settings.redact_diagnostics, "Redact diagnostics export");
+            });
+            ui.label("Native tray menu is planned; these settings are persisted and documented for service-like operation.");
+            ui.separator();
             text_field(ui, "Bind IP", &mut self.config.server.bind_ip);
             port_field(ui, "PGXL port", &mut self.config.pgxl.port);
             port_field(ui, "TGXL port", &mut self.config.tgxl.port);
@@ -511,7 +794,7 @@ impl GuiApp {
 
             ui.separator();
             ui.heading("KPA500");
-            text_field(ui, "KPA500 COM port", &mut self.config.kpa500.com_port);
+            serial_port_field(ui, "KPA500 COM port", &mut self.config.kpa500.com_port, &self.serial_ports);
             u32_field(ui, "KPA500 baud", &mut self.config.kpa500.baud);
             checkbox(ui, "KPA500 dry run", &mut self.config.kpa500.dry_run);
             let mut rf = self.config.kpa500.allow_rf_risk;
@@ -531,7 +814,7 @@ impl GuiApp {
 
             ui.separator();
             ui.heading("KAT500");
-            text_field(ui, "KAT500 COM port", &mut self.config.kat500.com_port);
+            serial_port_field(ui, "KAT500 COM port", &mut self.config.kat500.com_port, &self.serial_ports);
             u32_field(ui, "KAT500 baud", &mut self.config.kat500.baud);
             checkbox(ui, "KAT500 dry run", &mut self.config.kat500.dry_run);
 
@@ -610,6 +893,43 @@ impl GuiApp {
     fn ui_diagnostics(&mut self, ui: &mut egui::Ui) {
         ui.heading("Diagnostics");
         if let Some(status) = &self.status {
+            ui.group(|ui| {
+                ui.heading("Bridge");
+                field(
+                    ui,
+                    "Version",
+                    status.bridge.version.as_deref().unwrap_or("unknown"),
+                );
+                field(
+                    ui,
+                    "Commit",
+                    status.bridge.git_commit.as_deref().unwrap_or("unknown"),
+                );
+                field(
+                    ui,
+                    "PID",
+                    status
+                        .bridge
+                        .process_id
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                field(
+                    ui,
+                    "Uptime",
+                    status
+                        .bridge
+                        .uptime_ms
+                        .map(|value| format!("{value} ms"))
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                field(
+                    ui,
+                    "Config path",
+                    status.bridge.config_path.as_deref().unwrap_or("unknown"),
+                );
+            });
+            ui.separator();
             ui.group(|ui| {
                 ui.heading("Flex Injection");
                 field(
@@ -710,6 +1030,24 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "PGXL last close",
+                    status
+                        .clients
+                        .pgxl_last_disconnect_reason
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "TGXL last close",
+                    status
+                        .clients
+                        .tgxl_last_disconnect_reason
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
                     "KPA reconnects",
                     status.amp.runtime.reconnect_count.to_string(),
                 );
@@ -751,6 +1089,52 @@ impl GuiApp {
                     ),
                 );
             });
+            ui.separator();
+            ui.group(|ui| {
+                ui.heading("TGXL Sessions");
+                for session in &status.clients.tgxl_sessions {
+                    field(
+                        ui,
+                        &format!("{} #{} {}", session.protocol, session.id, session.peer),
+                        format!(
+                            "cmd={} rsp={} parse={} unknown={} last={} max={} connected_at={}",
+                            session.commands_received,
+                            session.responses_sent,
+                            session.parse_failures,
+                            session.unknown_commands,
+                            session.last_response_latency_ms,
+                            session.max_response_latency_ms,
+                            session.connected_at_ms
+                        ),
+                    );
+                    if let Some(command) = &session.last_command {
+                        field(ui, "last command", command);
+                    }
+                }
+                if status.clients.tgxl_sessions.is_empty() {
+                    ui.label("No active TGXL sessions.");
+                }
+                ui.heading("PGXL Sessions");
+                for session in &status.clients.pgxl_sessions {
+                    field(
+                        ui,
+                        &format!("{} #{} {}", session.protocol, session.id, session.peer),
+                        format!(
+                            "cmd={} rsp={} parse={} unknown={} last={} max={} connected_at={}",
+                            session.commands_received,
+                            session.responses_sent,
+                            session.parse_failures,
+                            session.unknown_commands,
+                            session.last_response_latency_ms,
+                            session.max_response_latency_ms,
+                            session.connected_at_ms
+                        ),
+                    );
+                }
+                if status.clients.pgxl_sessions.is_empty() {
+                    ui.label("No active PGXL sessions.");
+                }
+            });
         }
         ui.separator();
         ui.heading("Last Important Events");
@@ -770,7 +1154,82 @@ impl GuiApp {
 enum Tab {
     Dashboard,
     Config,
+    Controls,
     Diagnostics,
+    Logs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuiSettings {
+    start_bridge_on_launch: bool,
+    start_minimized_to_tray: bool,
+    close_to_tray: bool,
+    redact_diagnostics: bool,
+}
+
+impl Default for GuiSettings {
+    fn default() -> Self {
+        Self {
+            start_bridge_on_launch: false,
+            start_minimized_to_tray: false,
+            close_to_tray: true,
+            redact_diagnostics: true,
+        }
+    }
+}
+
+impl GuiSettings {
+    fn load(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)?;
+        serde_yaml::from_str(&text).context("failed to parse GUI settings")
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        fs::write(path, serde_yaml::to_string(self)?).context("failed to write GUI settings")
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ControlFlags {
+    kpa_safe: bool,
+    kpa_rf_risk: bool,
+    kat_safe: bool,
+    kat_rf_risk: bool,
+    kat_antenna: bool,
+    advanced: bool,
+    remember_rf_confirm: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFilter {
+    All,
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl LogFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+
+    fn matches(self, line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        match self {
+            Self::All => true,
+            Self::Error => lower.contains("error"),
+            Self::Warn => lower.contains("warn"),
+            Self::Info => lower.contains("info"),
+            Self::Debug => lower.contains("debug"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -849,6 +1308,28 @@ enum ProcessState {
     Error,
 }
 
+impl ProcessState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Degraded => "degraded",
+            Self::Error => "error",
+        }
+    }
+
+    fn color(self) -> egui::Color32 {
+        match self {
+            Self::Stopped => egui::Color32::GRAY,
+            Self::Starting => egui::Color32::YELLOW,
+            Self::Running => egui::Color32::GREEN,
+            Self::Degraded => egui::Color32::YELLOW,
+            Self::Error => egui::Color32::RED,
+        }
+    }
+}
+
 enum AsyncMessage {
     SerialPorts(Vec<String>),
     CommandResult { label: String, output: String },
@@ -868,15 +1349,26 @@ where
     });
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct StatusSnapshot {
+    #[serde(default)]
+    bridge: BridgeStatus,
     amp: DeviceStatus,
     tuner: DeviceStatus,
     clients: ClientStatus,
     flex_injection: FlexStatus,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct BridgeStatus {
+    version: Option<String>,
+    git_commit: Option<String>,
+    process_id: Option<u32>,
+    uptime_ms: Option<u128>,
+    config_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct DeviceStatus {
     connection_state: String,
     connected: bool,
@@ -915,7 +1407,7 @@ struct DeviceStatus {
     unsolicited_count: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RuntimeStatus {
     reconnect_count: u64,
     poll_success_count: u64,
@@ -926,15 +1418,38 @@ struct RuntimeStatus {
     average_poll_latency_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ClientStatus {
     pgxl_connected: bool,
     tgxl_connected: bool,
     pgxl_client_count: usize,
     tgxl_client_count: usize,
+    #[serde(default)]
+    pgxl_sessions: Vec<ClientSession>,
+    #[serde(default)]
+    tgxl_sessions: Vec<ClientSession>,
+    #[serde(default)]
+    pgxl_last_disconnect_reason: Option<String>,
+    #[serde(default)]
+    tgxl_last_disconnect_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ClientSession {
+    id: u64,
+    protocol: String,
+    peer: String,
+    connected_at_ms: u128,
+    last_command: Option<String>,
+    commands_received: u64,
+    responses_sent: u64,
+    parse_failures: u64,
+    unknown_commands: u64,
+    last_response_latency_ms: u64,
+    max_response_latency_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 struct FlexStatus {
     enabled: bool,
     connection_state: String,
@@ -949,7 +1464,7 @@ struct FlexStatus {
     ping_count: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct MeterHandle {
     name: String,
     handle: String,
@@ -963,6 +1478,144 @@ fn save_config(path: &Path, config: &BridgeConfig) -> Result<()> {
     config.validate()?;
     let text = serde_yaml::to_string(config).context("failed to encode YAML")?;
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn export_diagnostics_bundle(
+    config_path: &Path,
+    status: Option<&StatusSnapshot>,
+    logs: &VecDeque<String>,
+    settings: &GuiSettings,
+    redact: bool,
+) -> Result<PathBuf> {
+    let dir = PathBuf::from("diagnostics");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("egb-diagnostics-{}.zip", timestamp_filename()));
+    let file = fs::File::create(&path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let config_text = fs::read_to_string(config_path).unwrap_or_default();
+    zip_text(
+        &mut zip,
+        options,
+        "config.yaml",
+        if redact {
+            redact_text(&config_text)
+        } else {
+            config_text
+        },
+    )?;
+    zip_text(
+        &mut zip,
+        options,
+        "gui-settings.yaml",
+        serde_yaml::to_string(settings)?,
+    )?;
+    zip_text(
+        &mut zip,
+        options,
+        "gui-visible-logs.txt",
+        logs.iter().cloned().collect::<Vec<_>>().join("\n"),
+    )?;
+    if let Some(status) = status {
+        zip_text(
+            &mut zip,
+            options,
+            "status.json",
+            serde_json::to_string_pretty(status)?,
+        )?;
+    }
+    zip_text(&mut zip, options, "windows-info.txt", windows_info())?;
+    zip_text(
+        &mut zip,
+        options,
+        "serial-ports.txt",
+        tokio_serial::available_ports()
+            .map(|ports| {
+                ports
+                    .into_iter()
+                    .map(|port| port.port_name)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|err| format!("serial port scan failed: {err}")),
+    )?;
+    add_dir_to_zip(&mut zip, options, Path::new("logs/protocol"), "protocol")?;
+    add_dir_to_zip(&mut zip, options, Path::new("logs/serial"), "serial")?;
+    zip.finish()?;
+    Ok(path)
+}
+
+fn zip_text<W: Write + Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::FileOptions,
+    name: &str,
+    text: String,
+) -> Result<()> {
+    zip.start_file(name, options)?;
+    zip.write_all(text.as_bytes())?;
+    Ok(())
+}
+
+fn add_dir_to_zip<W: Write + Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::FileOptions,
+    dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
+            zip.start_file(name, options)?;
+            zip.write_all(&fs::read(entry.path())?)?;
+        }
+    }
+    Ok(())
+}
+
+fn redact_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("radio_ip:")
+                || trimmed.starts_with("amplifier_ip:")
+                || trimmed.starts_with("bind_ip:")
+                || trimmed.starts_with("token:")
+            {
+                let indent = &line[..line.len() - trimmed.len()];
+                format!(
+                    "{indent}{}: <redacted>",
+                    trimmed.split(':').next().unwrap_or("value")
+                )
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn windows_info() -> String {
+    #[cfg(windows)]
+    {
+        run_command_text("cmd", &["/C", "ver"])
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
+fn run_command_text(program: &str, args: &[&str]) -> String {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+        .unwrap_or_else(|err| format!("failed to run {program}: {err}"))
 }
 
 fn fetch_status(host: &str, port: u16) -> Result<StatusSnapshot> {
@@ -1019,27 +1672,38 @@ fn find_egb_binary() -> Result<PathBuf> {
     Ok(PathBuf::from("egb.exe"))
 }
 
-fn copy_diagnostics_bundle(config_path: &Path) -> Result<PathBuf> {
-    let out_dir = PathBuf::from("logs").join(format!("diagnostics-{}", timestamp_compact()));
-    fs::create_dir_all(&out_dir)?;
-    if config_path.exists() {
-        let _ = fs::copy(config_path, out_dir.join("config.yaml"));
+fn export_visible_logs(logs: &VecDeque<String>, filter: LogFilter) -> Result<PathBuf> {
+    fs::create_dir_all("logs")?;
+    let path = PathBuf::from("logs").join(format!("egb-visible-logs-{}.txt", timestamp_filename()));
+    let body = logs
+        .iter()
+        .filter(|line| filter.matches(line))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, body)?;
+    Ok(path)
+}
+
+fn apply_modern_style(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = egui::Color32::from_rgb(10, 16, 28);
+    visuals.window_fill = egui::Color32::from_rgb(16, 24, 39);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(31, 45, 70);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(42, 77, 122);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(56, 112, 180);
+    visuals.selection.bg_fill = egui::Color32::from_rgb(43, 124, 220);
+    ctx.set_visuals(visuals);
+}
+
+fn nav_button(ui: &mut egui::Ui, tab: &mut Tab, candidate: Tab, label: &str) {
+    let selected = *tab == candidate;
+    if ui
+        .add_sized([160.0, 32.0], egui::SelectableLabel::new(selected, label))
+        .clicked()
+    {
+        *tab = candidate;
     }
-    for dir in ["logs/protocol", "logs/serial"] {
-        let path = Path::new(dir);
-        if !path.exists() {
-            continue;
-        }
-        let target = out_dir.join(path.file_name().unwrap_or_default());
-        fs::create_dir_all(&target)?;
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                let _ = fs::copy(entry.path(), target.join(entry.file_name()));
-            }
-        }
-    }
-    Ok(out_dir)
 }
 
 fn process_badge(ui: &mut egui::Ui, state: ProcessState) {
@@ -1051,6 +1715,24 @@ fn process_badge(ui: &mut egui::Ui, state: ProcessState) {
         ProcessState::Error => ("error", egui::Color32::RED),
     };
     ui.colored_label(color, text);
+}
+
+fn status_color(ok: bool) -> egui::Color32 {
+    if ok {
+        egui::Color32::from_rgb(72, 210, 135)
+    } else {
+        egui::Color32::from_rgb(225, 96, 96)
+    }
+}
+
+fn connection_color(state: &str) -> egui::Color32 {
+    match state {
+        "connected" => egui::Color32::from_rgb(72, 210, 135),
+        "connecting" => egui::Color32::YELLOW,
+        "degraded" => egui::Color32::YELLOW,
+        "error" => egui::Color32::RED,
+        _ => egui::Color32::GRAY,
+    }
 }
 
 fn effective_process_state(state: ProcessState, status: Option<&StatusSnapshot>) -> ProcessState {
@@ -1081,6 +1763,23 @@ fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         ui.label(label);
         ui.text_edit_singleline(value);
+    });
+}
+
+fn serial_port_field(ui: &mut egui::Ui, label: &str, value: &mut String, ports: &[String]) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ports.is_empty() {
+            ui.text_edit_singleline(value);
+        } else {
+            egui::ComboBox::from_id_source(label)
+                .selected_text(value.as_str())
+                .show_ui(ui, |ui| {
+                    for port in ports {
+                        ui.selectable_value(value, port.clone(), port);
+                    }
+                });
+        }
     });
 }
 
@@ -1204,6 +1903,10 @@ fn timestamp_compact() -> String {
         .to_string()
 }
 
+fn timestamp_filename() -> String {
+    timestamp_compact()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,6 +1923,7 @@ mod tests {
     #[test]
     fn parses_status_json_with_live_fields() {
         let json = r#"{
+          "bridge": {"version": "0.1.0", "git_commit": "test", "process_id": 42, "uptime_ms": 100, "config_path": "config.yaml"},
           "amp": {
             "connection_state": "connected",
             "connected": true,
@@ -1260,5 +1964,45 @@ mod tests {
         assert_eq!(status.amp.forward_power_watts, Some(30.0));
         assert_eq!(status.tuner.selected_antenna, Some(2));
         assert_eq!(status.flex_injection.meter_handles[0].name, "FWD");
+        assert_eq!(status.bridge.process_id, Some(42));
+    }
+
+    #[test]
+    fn diagnostics_redaction_masks_local_values() {
+        let text = "bind_ip: 192.168.0.10\nradio_ip: 192.168.0.199\namplifier_ip: 192.168.0.189\ntoken: secret\n";
+        let redacted = redact_text(text);
+        assert!(redacted.contains("bind_ip: <redacted>"));
+        assert!(redacted.contains("radio_ip: <redacted>"));
+        assert!(!redacted.contains("192.168.0.199"));
+    }
+
+    #[test]
+    fn gui_settings_round_trip() {
+        let settings = GuiSettings {
+            start_bridge_on_launch: true,
+            start_minimized_to_tray: true,
+            close_to_tray: true,
+            redact_diagnostics: true,
+        };
+        let text = serde_yaml::to_string(&settings).unwrap();
+        let parsed: GuiSettings = serde_yaml::from_str(&text).unwrap();
+        assert!(parsed.start_bridge_on_launch);
+        assert!(parsed.redact_diagnostics);
+    }
+
+    #[test]
+    fn diagnostics_bundle_is_created() {
+        let mut logs = VecDeque::new();
+        logs.push_back("INFO test diagnostic line".to_string());
+        let path = export_diagnostics_bundle(
+            Path::new("does-not-exist-test-config.yaml"),
+            None,
+            &logs,
+            &GuiSettings::default(),
+            true,
+        )
+        .unwrap();
+        assert!(path.exists());
+        let _ = fs::remove_file(path);
     }
 }

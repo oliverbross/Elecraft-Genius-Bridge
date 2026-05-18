@@ -2,6 +2,14 @@
 
 `egb-gui.exe` is a Windows-first desktop companion for Elecraft Genius Bridge. It uses Rust `egui`/`eframe`, not Electron.
 
+Phase 21 redesigns the GUI around a dark operational dashboard with sidebar navigation:
+
+- Dashboard
+- Configuration
+- Controls
+- Diagnostics
+- Logs
+
 ## Build
 
 From PowerShell:
@@ -17,7 +25,11 @@ target-msvc\release\egb.exe
 target-msvc\release\egb-gui.exe
 ```
 
-The GUI expects `egb.exe` beside `egb-gui.exe`. The build script builds both binaries into the same release directory.
+The GUI expects `egb.exe` beside `egb-gui.exe`. The build script builds both binaries into the same release directory and also prepares:
+
+```text
+dist\ElecraftGeniusBridge-Windows\
+```
 
 ## Run
 
@@ -40,8 +52,9 @@ config.flex-injection-readonly.yaml
 - Lists serial ports.
 - Runs read-only KPA500/KAT500 tests through the existing CLI.
 - Runs a KPA500 `^RVM;` serial probe for busy-port/timeout diagnosis.
-- Captures the last 100 GUI/bridge log lines shown in the Diagnostics tab.
-- Copies config and current protocol/serial logs into a timestamped diagnostics folder.
+- Captures the last 500 GUI/bridge log lines shown in the Logs tab.
+- Exports a ZIP diagnostics bundle under `diagnostics\`.
+- Stores GUI settings in `egb-gui-settings.yaml`.
 
 ## Safety Defaults
 
@@ -73,4 +86,4 @@ If the probe times out or the COM port fails to open:
 - The GUI is not yet an installer or Windows service manager.
 - It polls the local `/status` endpoint; metrics must be enabled for live dashboard data.
 - Live radio-side Flex meter value streaming is still unverified.
-- Screenshots should be captured manually after building/running on the Windows desktop.
+- Native system tray integration is not wired in this phase. Service-like settings and autostart scripts are present; see `docs/tray-autostart.md`.
