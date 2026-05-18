@@ -101,6 +101,32 @@ When enabled, `GET /status` returns localhost-only JSON with connection states, 
 
 Phase 14 adds serial runtime counters to `/status`: poll successes/failures, reconnects, stale-state transitions, last/average/max poll latency, and stale duration.
 
+## Flex Amplifier Injection
+
+```yaml
+flex_injection:
+  enabled: false
+  radio_ip: 127.0.0.1
+  radio_port: 4992
+  amplifier_ip: 127.0.0.1
+  amplifier_port: 9008
+  amplifier_model: PowerGeniusXL
+  serial: EGB-KPA500
+  handle: amp_1
+  ant_map: ANT1:PORTA,ANT2:NONE
+  reconnect_initial_ms: 1000
+  reconnect_max_ms: 30000
+  ping_interval_ms: 30000
+```
+
+Phase 17 `flex_injection` is a passive LAN/local-only registration client. It connects to the Flex radio TCP API on port `4992` and sends `amplifier create` so the radio can advertise a `PowerGeniusXL`-compatible amplifier to AetherSDR.
+
+`amplifier_ip` must be the Windows bridge IP that macOS AetherSDR can reach. AetherSDR should use that IP for its direct PGXL connection on `amplifier_port`.
+
+The configured `handle` is an EGB log/config label. The real Flex amplifier object handle is assigned by the radio and observed by AetherSDR through normal radio status.
+
+This mode does not implement operate/RF commands, meter creation, interlock creation, proxying, TLS, or WAN exposure.
+
 ## Soak Test
 
 Use soak mode for long-duration validation:
@@ -136,4 +162,5 @@ No-ACK control commands use this delay before a follow-up verification query. KP
 - `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation and TGXL direct-presence diagnostics enabled.
 - `config.hardware-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true`.
 - `config.aethersdr-compat-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true` and compatibility response formatting enabled for AetherSDR disconnect/app visibility testing.
+- `config.flex-injection-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true`, AetherSDR compatibility formatting, and passive Flex amplifier registration enabled. Edit `flex_injection.radio_ip` and `flex_injection.amplifier_ip` before use.
 - `config.hardware-control-local-only.yaml`: COM21 KPA500 control mode with `dry_run: false`, COM8 KAT500 still `dry_run: true`, loopback bind by default. Use only locally or on a private LAN after read-only validation.

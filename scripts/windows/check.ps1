@@ -63,3 +63,4 @@ Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.mock.
 Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.hardware-readonly.yaml }
 Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.hardware-control-local-only.yaml }
 Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.aethersdr-compat-readonly.yaml }
+Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.flex-injection-readonly.yaml }

@@ -34,6 +34,7 @@ pub struct BridgeConfig {
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
     pub control: ControlConfig,
+    pub flex_injection: FlexInjectionConfig,
     pub mock: MockConfig,
 }
 
@@ -71,6 +72,7 @@ impl BridgeConfig {
             })?;
             validate_port("metrics.port", self.metrics.port)?;
         }
+        self.flex_injection.validate()?;
         self.kpa500.validate("kpa500")?;
         self.kat500.validate("kat500")?;
         if self.control.verify_delay_ms == 0 {
@@ -113,6 +115,7 @@ impl Default for BridgeConfig {
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             control: ControlConfig::default(),
+            flex_injection: FlexInjectionConfig::default(),
             mock: MockConfig::default(),
         }
     }
@@ -289,10 +292,120 @@ impl Default for ControlConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlexInjectionConfig {
+    pub enabled: bool,
+    pub radio_ip: String,
+    pub radio_port: u16,
+    pub amplifier_ip: String,
+    pub amplifier_port: u16,
+    pub amplifier_model: String,
+    pub serial: String,
+    pub handle: String,
+    pub ant_map: String,
+    pub reconnect_initial_ms: u64,
+    pub reconnect_max_ms: u64,
+    pub ping_interval_ms: u64,
+}
+
+impl FlexInjectionConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let radio_ip = parse_ip("flex_injection.radio_ip", &self.radio_ip)?;
+        let amplifier_ip = parse_ip("flex_injection.amplifier_ip", &self.amplifier_ip)?;
+        validate_lan_or_loopback("flex_injection.radio_ip", radio_ip)?;
+        validate_lan_or_loopback("flex_injection.amplifier_ip", amplifier_ip)?;
+        validate_port("flex_injection.radio_port", self.radio_port)?;
+        validate_port("flex_injection.amplifier_port", self.amplifier_port)?;
+        validate_nonempty_token("flex_injection.amplifier_model", &self.amplifier_model)?;
+        validate_nonempty_token("flex_injection.serial", &self.serial)?;
+        validate_nonempty_token("flex_injection.handle", &self.handle)?;
+        validate_nonempty_token("flex_injection.ant_map", &self.ant_map)?;
+        if self.reconnect_initial_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "flex_injection.reconnect_initial_ms must be > 0".to_string(),
+            ));
+        }
+        if self.reconnect_max_ms < self.reconnect_initial_ms {
+            return Err(ConfigError::Invalid(
+                "flex_injection.reconnect_max_ms must be >= reconnect_initial_ms".to_string(),
+            ));
+        }
+        if self.ping_interval_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "flex_injection.ping_interval_ms must be > 0".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for FlexInjectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            radio_ip: "127.0.0.1".to_string(),
+            radio_port: 4992,
+            amplifier_ip: "127.0.0.1".to_string(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:NONE".to_string(),
+            reconnect_initial_ms: 1000,
+            reconnect_max_ms: 30000,
+            ping_interval_ms: 30000,
+        }
+    }
+}
+
 fn validate_port(name: &str, port: u16) -> Result<(), ConfigError> {
     if port == 0 {
         return Err(ConfigError::Invalid(format!(
             "{name} must be between 1 and 65535"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_ip(name: &str, value: &str) -> Result<IpAddr, ConfigError> {
+    value
+        .parse::<IpAddr>()
+        .map_err(|_| ConfigError::Invalid(format!("{name} is not an IP address: {value}")))
+}
+
+fn validate_lan_or_loopback(name: &str, ip: IpAddr) -> Result<(), ConfigError> {
+    let allowed = match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "{name} must be loopback, private LAN, link-local, or CGNAT for Phase 17 injection"
+        )))
+    }
+}
+
+fn validate_nonempty_token(name: &str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Invalid(format!("{name} must not be empty")));
+    }
+    if value.contains('|') || value.chars().any(char::is_whitespace) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must not contain whitespace or pipe characters"
         )));
     }
     Ok(())
@@ -327,5 +440,17 @@ pgxl:
         .unwrap();
         assert_eq!(cfg.pgxl.port, 9008);
         assert_eq!(cfg.tgxl.port, 9010);
+    }
+
+    #[test]
+    fn validates_lan_only_flex_injection() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "8.8.8.8".to_string();
+        assert!(cfg.validate().is_err());
+
+        cfg.flex_injection.radio_ip = "192.168.1.100".to_string();
+        cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
+        cfg.validate().unwrap();
     }
 }

@@ -14,6 +14,7 @@ use elecraft_kpa500::{
     CommandResultState as KpaCommandResultState, CommandSafety as KpaCommandSafety,
     ControlCommandResult as KpaControlCommandResult, Kpa500Driver, Kpa500Settings,
 };
+use flex_injection::FlexInjectionSettings;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -140,8 +141,13 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             println!("config OK: {}", config.display());
             println!(
-                "bind={} pgxl={} tgxl={} kpa_mock={} kat_mock={}",
-                cfg.server.bind_ip, cfg.pgxl.port, cfg.tgxl.port, cfg.kpa500.mock, cfg.kat500.mock
+                "bind={} pgxl={} tgxl={} kpa_mock={} kat_mock={} flex_injection={}",
+                cfg.server.bind_ip,
+                cfg.pgxl.port,
+                cfg.tgxl.port,
+                cfg.kpa500.mock,
+                cfg.kat500.mock,
+                cfg.flex_injection.enabled
             );
             Ok(())
         }
@@ -344,6 +350,35 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             if let Err(err) = run_metrics_endpoint(addr, state).await {
                 error!(error = %err, "metrics endpoint stopped");
             }
+        });
+    }
+
+    if cfg.flex_injection.enabled {
+        let radio_ip: IpAddr = cfg
+            .flex_injection
+            .radio_ip
+            .parse()
+            .context("flex_injection.radio_ip passed validation but failed to parse")?;
+        let amplifier_ip: IpAddr = cfg
+            .flex_injection
+            .amplifier_ip
+            .parse()
+            .context("flex_injection.amplifier_ip passed validation but failed to parse")?;
+        let settings = FlexInjectionSettings {
+            radio_addr: SocketAddr::new(radio_ip, cfg.flex_injection.radio_port),
+            amplifier_ip,
+            amplifier_port: cfg.flex_injection.amplifier_port,
+            amplifier_model: cfg.flex_injection.amplifier_model.clone(),
+            serial: cfg.flex_injection.serial.clone(),
+            handle_label: cfg.flex_injection.handle.clone(),
+            ant_map: cfg.flex_injection.ant_map.clone(),
+            reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
+            reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
+            ping_interval: Duration::from_millis(cfg.flex_injection.ping_interval_ms),
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            flex_injection::run(settings, state).await;
         });
     }
 

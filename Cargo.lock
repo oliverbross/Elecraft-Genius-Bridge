@@ -179,6 +179,7 @@ dependencies = [
  "egb-config",
  "elecraft-kat500",
  "elecraft-kpa500",
+ "flex-injection",
  "pgxl-emulator",
  "serde_json",
  "test-harness",
@@ -235,6 +236,16 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "flex-injection"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bridge-core",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

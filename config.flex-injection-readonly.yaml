@@ -1,18 +1,18 @@
 server:
-  # Safe default for MVP. Use 0.0.0.0 only after you understand the security notes.
+  # Replace with the Windows bridge LAN IP when testing from macOS.
   bind_ip: 127.0.0.1
 
 pgxl:
   enabled: true
   port: 9008
-  aethersdr_compat: false
+  aethersdr_compat: true
   strict_emulation: false
   startup_delay_ms: 0
 
 tgxl:
   enabled: true
   port: 9010
-  aethersdr_compat: false
+  aethersdr_compat: true
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false
@@ -22,7 +22,7 @@ kpa500:
   com_port: COM21
   baud: 38400
   polling_interval_ms: 1000
-  mock: true
+  mock: false
   dry_run: true
 
 kat500:
@@ -30,24 +30,21 @@ kat500:
   com_port: COM8
   baud: 38400
   polling_interval_ms: 1000
-  mock: true
+  mock: false
   dry_run: true
 
 security:
-  # Reserved for a later authenticated API/control plane.
   token:
 
 logging:
-  level: info
-  protocol_trace: false
-  # When set, EGB writes one raw PGXL/TGXL transcript file per client session.
-  protocol_transcript_dir:
-  # When set, EGB writes one raw serial transcript file per device session.
-  serial_transcript_dir:
+  level: debug
+  protocol_trace: true
+  protocol_transcript_dir: logs/protocol
+  serial_transcript_dir: logs/serial
   transcript_rotate_bytes: 1048576
 
 metrics:
-  enabled: false
+  enabled: true
   bind_ip: 127.0.0.1
   port: 9160
 
@@ -55,11 +52,12 @@ control:
   verify_delay_ms: 200
 
 flex_injection:
-  # Phase 17 passive Flex API registration. Disabled by default.
-  enabled: false
-  radio_ip: 127.0.0.1
+  enabled: true
+  # Replace this with the Flex radio LAN IP.
+  radio_ip: 192.168.1.100
   radio_port: 4992
-  amplifier_ip: 127.0.0.1
+  # Replace this with the Windows bridge LAN IP that AetherSDR can reach.
+  amplifier_ip: 192.168.1.50
   amplifier_port: 9008
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500

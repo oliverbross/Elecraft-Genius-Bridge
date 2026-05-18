@@ -59,11 +59,16 @@ These are not PGXL/TGXL direct TCP response fields. They are Flex radio-model pr
 
 | Radio API object | Field | Source | Confidence | Current Implementation |
 | --- | --- | --- | --- | --- |
-| `amplifier <handle>` | `model=PowerGeniusXL` or other non-empty non-TGXL model | `RadioModel.cpp` amplifier parser | High | Not implemented |
+| `amplifier create` | `ip=<addr>` | Flex `amplifier create` docs and AetherSDR auto-connect path | High | Implemented in Phase 17 Flex injection config |
+| `amplifier create` | `port=<port>` | Flex `amplifier create` docs | High | Implemented as PGXL port, normally `9008` |
+| `amplifier create` | `model=PowerGeniusXL` | Flex `amplifier create` docs and `RadioModel.cpp` amplifier parser | High | Implemented |
+| `amplifier create` | `serial_num=<serial>` | Flex `amplifier create` docs | High | Implemented as configured serial |
+| `amplifier create` | `ant=<radio_ant:amp_ant,...>` | Flex `amplifier create` docs | Medium | Implemented as configured antenna map |
+| `amplifier <handle>` | `model=PowerGeniusXL` or other non-empty non-TGXL model | `RadioModel.cpp` amplifier parser | High | Expected radio broadcast after Phase 17 `amplifier create`; pending hardware validation |
 | `amplifier <handle>` | `model=TunerGeniusXL` | `RadioModel.cpp` TGXL routing | High | Not implemented |
-| `amplifier <handle>` | `ip=<addr>` | `RadioModel.cpp`, `TunerModel.cpp`, `MainWindow.cpp` auto-connect | High | Not implemented |
+| `amplifier <handle>` | `ip=<addr>` | `RadioModel.cpp`, `TunerModel.cpp`, `MainWindow.cpp` auto-connect | High | Expected radio broadcast after Phase 17 `amplifier create`; pending hardware validation |
 | `amplifier <handle>` | `operate` | `RadioModel.cpp`, `TunerModel.cpp` | High | Not implemented |
 | `amplifier <handle>` | `bypass` | `TunerModel.cpp` | High | Not implemented |
-| `amplifier <handle>` | `serial_num` | `TunerModel.cpp` | Medium | Not implemented |
+| `amplifier <handle>` | `serial_num` | `TunerModel.cpp` | Medium | Expected radio broadcast after Phase 17 `amplifier create`; pending hardware validation |
 
-Current conclusion: hidden applets are probably caused by missing radio API presence fields, not missing direct TCP polling fields.
+Current conclusion: hidden PGXL/PA applet is caused by missing radio API presence fields, not missing direct TCP polling fields. Phase 17 uses Flex `amplifier create` to ask the real radio to publish those fields.

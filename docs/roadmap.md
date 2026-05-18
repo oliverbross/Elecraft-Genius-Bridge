@@ -39,8 +39,8 @@ Status: in progress.
 
 - Direct socket bridge: continue PGXL/TGXL protocol correction and real hardware validation.
 - TGXL applet: validate Oliver's installed binary against the `0.9.5` direct-presence fix, then reset applet layout if the binary is current.
-- PGXL applet: requires radio-side amplifier presence or an AetherSDR change.
-- Flex API proxy: minimal amplifier-status injection design exists, keep separate and disabled unless radio-side configuration or an AetherSDR patch cannot solve applet presence.
+- PGXL applet: Phase 17 passive Flex `amplifier create` registration prototype added for LAN-only read-only validation.
+- Flex API proxy: keep as fallback only if native amplifier registration does not cause the radio to broadcast usable amplifier presence.
 
 ## Phase 5: Service And Packaging
 

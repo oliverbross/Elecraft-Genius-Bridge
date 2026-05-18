@@ -51,6 +51,20 @@ metrics:
 control:
   verify_delay_ms: 200
 
+flex_injection:
+  enabled: false
+  radio_ip: 127.0.0.1
+  radio_port: 4992
+  amplifier_ip: 127.0.0.1
+  amplifier_port: 9008
+  amplifier_model: PowerGeniusXL
+  serial: EGB-KPA500
+  handle: amp_1
+  ant_map: ANT1:PORTA,ANT2:NONE
+  reconnect_initial_ms: 1000
+  reconnect_max_ms: 30000
+  ping_interval_ms: 30000
+
 mock:
   pgxl_fault: false
   tgxl_fault: false
