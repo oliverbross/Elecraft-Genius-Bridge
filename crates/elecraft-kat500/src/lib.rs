@@ -621,26 +621,28 @@ impl Kat500Driver {
                 }
             }
         }
-        let mut guard = self.state.write().await;
-        guard.tuner.connected = true;
-        guard.tuner.connection_state = ConnectionState::Connected;
-        guard.tuner.last_serial_command_at = Some(SystemTime::now());
-        if outcomes.iter().any(|outcome| outcome.response.is_some()) {
-            guard.tuner.last_serial_response_at = Some(SystemTime::now());
-            guard.tuner.last_successful_poll_at = Some(SystemTime::now());
-            guard
-                .tuner
-                .runtime
-                .record_poll_success(duration_millis_u64(started.elapsed()));
-        } else {
-            guard.tuner.connection_state = ConnectionState::Degraded;
-            guard.tuner.runtime.poll_failure_count =
-                guard.tuner.runtime.poll_failure_count.saturating_add(1);
-        }
-        for outcome in &outcomes {
-            if let Some(response) = &outcome.response {
-                push_capability(&mut guard.tuner.capabilities, outcome.command.label);
-                parse_kat500_response(response, &mut guard.tuner);
+        {
+            let mut guard = self.state.write().await;
+            guard.tuner.connected = true;
+            guard.tuner.connection_state = ConnectionState::Connected;
+            guard.tuner.last_serial_command_at = Some(SystemTime::now());
+            if outcomes.iter().any(|outcome| outcome.response.is_some()) {
+                guard.tuner.last_serial_response_at = Some(SystemTime::now());
+                guard.tuner.last_successful_poll_at = Some(SystemTime::now());
+                guard
+                    .tuner
+                    .runtime
+                    .record_poll_success(duration_millis_u64(started.elapsed()));
+            } else {
+                guard.tuner.connection_state = ConnectionState::Degraded;
+                guard.tuner.runtime.poll_failure_count =
+                    guard.tuner.runtime.poll_failure_count.saturating_add(1);
+            }
+            for outcome in &outcomes {
+                if let Some(response) = &outcome.response {
+                    push_capability(&mut guard.tuner.capabilities, outcome.command.label);
+                    parse_kat500_response(response, &mut guard.tuner);
+                }
             }
         }
         sleep(self.settings.polling_interval).await;

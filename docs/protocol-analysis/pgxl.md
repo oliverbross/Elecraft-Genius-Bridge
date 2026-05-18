@@ -165,7 +165,7 @@ Evidence: `AmpApplet.cpp:115-120`.
 These are inferred from AetherSDR source, not independently validated against PGXL firmware:
 
 - `peakfwd` is dBm. AetherSDR converts watts as `10^((dBm - 30) / 10)`.
-- `swr` is treated as return loss in dB. AetherSDR takes absolute value and converts return loss to SWR.
+- `swr` is treated as return loss in dB. AetherSDR takes absolute value and converts return loss to SWR. EGB therefore emits negative return-loss values instead of SWR ratio values.
 - `state` beginning with `TRANSMIT` forces TX meter mode.
 
 Do not freeze these conventions as final protocol truth until validated with real PGXL or trusted captures.

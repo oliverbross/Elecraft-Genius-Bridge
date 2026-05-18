@@ -23,14 +23,28 @@ if (Test-Path $Rustdoc) {
     $env:RUSTDOC = $Rustdoc
 }
 
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ScriptBlock]$Command
+    )
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code $LASTEXITCODE"
+    }
+}
+
 & $Cargo fmt --all -- --check
+if ($LASTEXITCODE -ne 0) {
+    throw "cargo fmt failed with exit code $LASTEXITCODE"
+}
 
 if (Test-Path (Join-Path $MsysTools "cargo-clippy.exe")) {
     Write-Host "Running clippy with isolated target-clippy"
     Remove-Item Env:RUSTC -ErrorAction SilentlyContinue
     Remove-Item Env:RUSTDOC -ErrorAction SilentlyContinue
     $env:CARGO_TARGET_DIR = "target-clippy"
-    & cargo clippy --workspace --all-targets -- -D warnings
+    Invoke-NativeChecked { cargo clippy --workspace --all-targets -- -D warnings }
 } else {
     throw "cargo-clippy was not found. Install rustup component clippy or provide C:\JTSDK64-Tools\tools\msys64\mingw64\bin\cargo-clippy.exe."
 }
@@ -43,8 +57,9 @@ if (Test-Path $Rustdoc) {
 }
 $env:CARGO_TARGET_DIR = "target-msvc"
 Write-Host "Running tests and config validation with isolated target-msvc"
-& $Cargo test --workspace
-& $Cargo run -p egb -- check-config --config config.example.yaml
-& $Cargo run -p egb -- check-config --config config.mock.yaml
-& $Cargo run -p egb -- check-config --config config.hardware-readonly.yaml
-& $Cargo run -p egb -- check-config --config config.hardware-control-local-only.yaml
+Invoke-NativeChecked { & $Cargo test --workspace }
+Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.example.yaml }
+Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.mock.yaml }
+Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.hardware-readonly.yaml }
+Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.hardware-control-local-only.yaml }
+Invoke-NativeChecked { & $Cargo run -p egb -- check-config --config config.aethersdr-compat-readonly.yaml }

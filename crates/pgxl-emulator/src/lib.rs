@@ -18,6 +18,7 @@ pub struct EmulatorOptions {
     pub protocol_trace: bool,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
+    pub aethersdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
 }
@@ -53,7 +54,9 @@ pub async fn replay_line(
     state: &SharedState,
 ) -> Result<String, bridge_core::ProtocolError> {
     let cmd = parse_client_command(line)?;
-    Ok(handle_command(cmd.seq, &cmd.command, state).await.response)
+    Ok(handle_command(cmd.seq, &cmd.command, state, false)
+        .await
+        .response)
 }
 
 async fn handle_client(
@@ -131,7 +134,9 @@ async fn handle_client(
                     }
                     stats.last_sequence = Some(cmd.seq);
                     stats.observe_command(&cmd.command);
-                    let outcome = handle_command(cmd.seq, &cmd.command, &state).await;
+                    let outcome =
+                        handle_command(cmd.seq, &cmd.command, &state, options.aethersdr_compat)
+                            .await;
                     if outcome.unknown {
                         stats.unknown_commands += 1;
                         increment_unknown(&state).await;
@@ -205,22 +210,39 @@ impl CommandOutcome {
     }
 }
 
-async fn handle_command(seq: u32, command: &str, state: &SharedState) -> CommandOutcome {
+async fn handle_command(
+    seq: u32,
+    command: &str,
+    state: &SharedState,
+    aethersdr_compat: bool,
+) -> CommandOutcome {
     match command {
-        "info" => CommandOutcome::ok(response_line(seq, 0, info_body())),
-        "status" => CommandOutcome::ok(response_line(seq, 0, status_body(state).await)),
+        "info" => CommandOutcome::ok(response_line(seq, 0, info_body(aethersdr_compat))),
+        "status" => CommandOutcome::ok(response_line(
+            seq,
+            0,
+            status_body(state, aethersdr_compat).await,
+        )),
         // AetherSDR currently routes PGXL operate/standby through the Flex radio
         // amplifier API, not direct TCP. These direct commands are accepted only
         // as desired-state requests for manual harness testing.
         "operate" => {
             let mut guard = state.write().await;
             guard.desired.amp_operate = Some(true);
-            CommandOutcome::ok(response_line(seq, 0, status_body_from_amp(&guard.amp)))
+            CommandOutcome::ok(response_line(
+                seq,
+                0,
+                status_body_from_amp(&guard.amp, aethersdr_compat),
+            ))
         }
         "standby" => {
             let mut guard = state.write().await;
             guard.desired.amp_operate = Some(false);
-            CommandOutcome::ok(response_line(seq, 0, status_body_from_amp(&guard.amp)))
+            CommandOutcome::ok(response_line(
+                seq,
+                0,
+                status_body_from_amp(&guard.amp, aethersdr_compat),
+            ))
         }
         _ => CommandOutcome {
             response: response_line(seq, 1, "error=unknown_command"),
@@ -263,18 +285,22 @@ async fn maybe_start_strict_startup(state: &SharedState, options: &EmulatorOptio
     });
 }
 
-fn info_body() -> String {
-    format!(
-        "model=PowerGeniusXL serial_num=EGB-PGXL version={VERSION} firmware={VERSION} capabilities=direct_tcp,status"
-    )
+fn info_body(aethersdr_compat: bool) -> String {
+    if aethersdr_compat {
+        format!("model=PowerGeniusXL serial_num=EGB-PGXL version={VERSION}")
+    } else {
+        format!(
+            "model=PowerGeniusXL serial_num=EGB-PGXL version={VERSION} firmware={VERSION} capabilities=direct_tcp,status"
+        )
+    }
 }
 
-async fn status_body(state: &SharedState) -> String {
+async fn status_body(state: &SharedState, aethersdr_compat: bool) -> String {
     let guard = state.read().await;
-    status_body_from_amp(&guard.amp)
+    status_body_from_amp(&guard.amp, aethersdr_compat)
 }
 
-fn status_body_from_amp(amp: &bridge_core::AmpState) -> String {
+fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> String {
     let degraded = matches!(
         amp.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
@@ -290,14 +316,21 @@ fn status_body_from_amp(amp: &bridge_core::AmpState) -> String {
         .fault
         .as_deref()
         .unwrap_or(if degraded { "device_degraded" } else { "" });
-    format!(
-        "state={state} peakfwd={peakfwd:.4} swr={swr:.4} temp={:.1} id={:.1} vac={} meffa={} fault={fault} connection_state={}",
+    let native = format!(
+        "state={state} peakfwd={peakfwd:.4} swr={swr:.4} temp={:.1} id={:.1} vac={} meffa={}",
         amp.temperature_c,
         amp.pa_current_amps,
         pgxl_vac_value(amp),
-        amp.meffa,
-        amp.connection_state.as_str()
-    )
+        amp.meffa
+    );
+    if aethersdr_compat {
+        native
+    } else {
+        format!(
+            "{native} fault={fault} connection_state={}",
+            amp.connection_state.as_str()
+        )
+    }
 }
 
 fn pgxl_vac_value(amp: &bridge_core::AmpState) -> u16 {
@@ -587,10 +620,11 @@ fn watts_to_dbm(watts: f32) -> f32 {
 }
 
 fn protocol_swr_value(swr: f32) -> f32 {
-    if swr.is_finite() && swr >= 1.0 {
-        swr
+    if swr.is_finite() && swr > 1.0 {
+        let rho = ((swr - 1.0) / (swr + 1.0)).clamp(0.001, 0.999);
+        20.0 * rho.log10()
     } else {
-        1.0
+        -30.0
     }
 }
 
@@ -602,7 +636,7 @@ mod tests {
     #[tokio::test]
     async fn status_contains_aethersdr_fields() {
         let state = shared_mock_state();
-        let body = status_body(&state).await;
+        let body = status_body(&state, false).await;
         assert!(body.contains("state=STANDBY"));
         assert!(body.contains("peakfwd="));
         assert!(body.contains("meffa="));
@@ -611,26 +645,44 @@ mod tests {
     #[tokio::test]
     async fn golden_pgxl_mock_status_response_is_stable() {
         let state = shared_mock_state();
-        let body = status_body(&state).await;
+        let body = status_body(&state, false).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|state=STANDBY peakfwd=0.0000 swr=1.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n"
+            "R2|0|state=STANDBY peakfwd=0.0000 swr=-30.0000 temp=32.0 id=0.0 vac=0 meffa=OK fault= connection_state=connected\n"
         );
     }
 
     #[tokio::test]
     async fn mock_status_never_reports_extreme_swr() {
         let state = shared_mock_state();
-        let body = status_body(&state).await;
-        assert!(body.contains("swr=1.0000"));
+        let body = status_body(&state, false).await;
+        assert!(body.contains("swr=-30.0000"));
         assert!(!body.contains("swr=32."));
     }
 
     #[test]
     fn golden_pgxl_info_response_is_stable() {
         assert_eq!(
-            response_line(1, 0, info_body()),
+            response_line(1, 0, info_body(false)),
             "R1|0|model=PowerGeniusXL serial_num=EGB-PGXL version=0.1.0-egb-pgxl firmware=0.1.0-egb-pgxl capabilities=direct_tcp,status\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn aethersdr_compat_status_removes_unverified_fields() {
+        let state = shared_mock_state();
+        let body = status_body(&state, true).await;
+        assert_eq!(
+            response_line(2, 0, body),
+            "R2|0|state=STANDBY peakfwd=0.0000 swr=-30.0000 temp=32.0 id=0.0 vac=0 meffa=OK\n"
+        );
+    }
+
+    #[test]
+    fn aethersdr_compat_info_removes_capabilities() {
+        assert_eq!(
+            response_line(1, 0, info_body(true)),
+            "R1|0|model=PowerGeniusXL serial_num=EGB-PGXL version=0.1.0-egb-pgxl\n"
         );
     }
 }

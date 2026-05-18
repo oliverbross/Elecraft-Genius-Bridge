@@ -298,6 +298,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 .as_ref()
                 .map(PathBuf::from),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
+            aethersdr_compat: cfg.pgxl.aethersdr_compat,
             strict_emulation: cfg.pgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.pgxl.startup_delay_ms),
         };
@@ -319,6 +320,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 .as_ref()
                 .map(PathBuf::from),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
+            aethersdr_compat: cfg.tgxl.aethersdr_compat,
             strict_emulation: cfg.tgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.tgxl.startup_delay_ms),
             force_presence_test: cfg.tgxl.force_presence_test,

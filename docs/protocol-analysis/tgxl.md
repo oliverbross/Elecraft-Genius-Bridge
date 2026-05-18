@@ -229,7 +229,7 @@ After `tuning` changes from `1` to `0`, the UI captures SWR for `400 ms` before 
 These are inferred from AetherSDR source, not independently validated against TGXL firmware:
 
 - `fwd` is dBm. AetherSDR converts watts as `10^(dBm / 10) / 1000`.
-- `swr` is return loss in dB and is expected to be negative from TGXL.
+- `swr` is return loss in dB and is expected to be negative from TGXL. Sending an SWR ratio such as `1.11` is wrong for AetherSDR's direct TGXL parser and can produce an extreme displayed SWR.
 - `antA` is zero-indexed in received status but `activate ant=N` is one-indexed.
 - `one_by_three=1` means show ANT 1/2/3 controls.
 
@@ -284,6 +284,10 @@ Minimum to make AetherSDR show a connected TGXL telemetry source:
 7. Include `one_by_three=1` and `antA=<0..2>` if exposing antenna switching.
 8. Implement `tune relay=<0|1|2> move=<+1|-1>`, `autotune`, and `activate ant=<1..3>` as state-changing commands.
 9. Emit `S0|state ...` after state changes so the UI updates without waiting for the next poll.
+
+## Phase 15 Compatibility Correction
+
+Real hardware transcripts initially showed EGB sending `swr=1.1100` / `swr=1.1400` as an SWR ratio. AetherSDR source treats direct TGXL `swr` as return loss in dB. EGB now converts SWR ratio to negative return loss for PGXL/TGXL protocol responses and offers `aethersdr_compat` mode to remove unverified fields while testing AetherSDR disconnect/app visibility.
 
 ## Phase 5 Applet Visibility Finding
 

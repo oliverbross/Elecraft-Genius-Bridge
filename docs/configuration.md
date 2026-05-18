@@ -17,16 +17,20 @@ Default is loopback for safety. Use a LAN IP for AetherSDR on another machine. A
 pgxl:
   enabled: true
   port: 9008
+  aethersdr_compat: false
   strict_emulation: false
   startup_delay_ms: 0
 
 tgxl:
   enabled: true
   port: 9010
+  aethersdr_compat: false
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false
 ```
+
+Set `aethersdr_compat: true` while diagnosing AetherSDR direct PGXL/TGXL behaviour. Compatibility mode emits only source-observed fields, removes unverified `capabilities`, `firmware`, `connection_state`, and `fault` fields from protocol bodies, and reports `swr` as return loss dB because AetherSDR converts it back to an SWR ratio.
 
 Set `strict_emulation: true` in mock mode to simulate a more realistic device startup sequence. The emulator sends the required `V` greeting immediately, but shared mock state reports transitional readiness until `startup_delay_ms` expires.
 
@@ -131,4 +135,5 @@ No-ACK control commands use this delay before a follow-up verification query. KP
 
 - `config.mock.yaml`: no hardware required, protocol trace enabled, strict startup simulation and TGXL direct-presence diagnostics enabled.
 - `config.hardware-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true`.
+- `config.aethersdr-compat-readonly.yaml`: COM8/COM21 hardware mode with `dry_run: true` and compatibility response formatting enabled for AetherSDR disconnect/app visibility testing.
 - `config.hardware-control-local-only.yaml`: COM21 KPA500 control mode with `dry_run: false`, COM8 KAT500 still `dry_run: true`, loopback bind by default. Use only locally or on a private LAN after read-only validation.

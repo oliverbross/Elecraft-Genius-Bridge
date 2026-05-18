@@ -18,6 +18,7 @@ pub struct EmulatorOptions {
     pub protocol_trace: bool,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
+    pub aethersdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
     pub force_presence_test: bool,
@@ -54,7 +55,7 @@ pub async fn replay_line(
     state: &SharedState,
 ) -> Result<Vec<String>, bridge_core::ProtocolError> {
     let cmd = parse_client_command(line)?;
-    let outcome = handle_command(cmd.seq, &cmd.command, state).await;
+    let outcome = handle_command(cmd.seq, &cmd.command, state, false).await;
     let mut lines = vec![outcome.response];
     lines.extend(outcome.pushes);
     Ok(lines)
@@ -144,7 +145,9 @@ async fn handle_client(
                     }
                     stats.last_sequence = Some(cmd.seq);
                     stats.observe_command(&cmd.command);
-                    let outcome = handle_command(cmd.seq, &cmd.command, &state).await;
+                    let outcome =
+                        handle_command(cmd.seq, &cmd.command, &state, options.aethersdr_compat)
+                            .await;
                     if outcome.unknown {
                         stats.unknown_commands += 1;
                         increment_unknown(&state).await;
@@ -270,18 +273,30 @@ impl CommandOutcome {
     }
 }
 
-async fn handle_command(seq: u32, command: &str, state: &SharedState) -> CommandOutcome {
+async fn handle_command(
+    seq: u32,
+    command: &str,
+    state: &SharedState,
+    aethersdr_compat: bool,
+) -> CommandOutcome {
     match command {
-        "info" => CommandOutcome::ok(response_line(seq, 0, info_body())),
-        "status" => CommandOutcome::ok(response_line(seq, 0, status_body(state).await)),
+        "info" => CommandOutcome::ok(response_line(seq, 0, info_body(aethersdr_compat))),
+        "status" => CommandOutcome::ok(response_line(
+            seq,
+            0,
+            status_body(state, aethersdr_compat).await,
+        )),
         "autotune" => {
             {
                 let mut guard = state.write().await;
                 guard.desired.tuner_autotune_requested = true;
             }
-            let pushes = vec![state_push(state).await];
+            let pushes = vec![state_push(state, aethersdr_compat).await];
             sleep(Duration::from_millis(800)).await;
-            CommandOutcome::with_pushes(response_line(seq, 0, status_body(state).await), pushes)
+            CommandOutcome::with_pushes(
+                response_line(seq, 0, status_body(state, aethersdr_compat).await),
+                pushes,
+            )
         }
         _ if command.starts_with("activate ant=") => {
             let ant = command
@@ -293,8 +308,12 @@ async fn handle_command(seq: u32, command: &str, state: &SharedState) -> Command
                 let mut guard = state.write().await;
                 guard.desired.tuner_selected_antenna = Some(ant);
                 CommandOutcome {
-                    response: response_line(seq, 0, status_body_from_tuner(&guard.tuner)),
-                    pushes: vec![state_push_from_tuner(&guard.tuner)],
+                    response: response_line(
+                        seq,
+                        0,
+                        status_body_from_tuner(&guard.tuner, aethersdr_compat),
+                    ),
+                    pushes: vec![state_push_from_tuner(&guard.tuner, aethersdr_compat)],
                     unknown: false,
                     unsupported: false,
                 }
@@ -311,8 +330,8 @@ async fn handle_command(seq: u32, command: &str, state: &SharedState) -> Command
             let result = apply_relay_command(command, state).await;
             match result {
                 Ok(()) => CommandOutcome::with_pushes(
-                    response_line(seq, 0, status_body(state).await),
-                    vec![state_push(state).await],
+                    response_line(seq, 0, status_body(state, aethersdr_compat).await),
+                    vec![state_push(state, aethersdr_compat).await],
                 ),
                 Err(error) => CommandOutcome {
                     response: response_line(seq, 2, format!("error={error}")),
@@ -362,10 +381,14 @@ async fn maybe_start_strict_startup(state: &SharedState, options: &EmulatorOptio
     });
 }
 
-fn info_body() -> String {
-    format!(
-        "model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} firmware={VERSION} one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune"
-    )
+fn info_body(aethersdr_compat: bool) -> String {
+    if aethersdr_compat {
+        format!("model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} one_by_three=1")
+    } else {
+        format!(
+            "model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} firmware={VERSION} one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune"
+        )
+    }
 }
 
 async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &'static str> {
@@ -390,43 +413,57 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
     Ok(())
 }
 
-async fn status_body(state: &SharedState) -> String {
+async fn status_body(state: &SharedState, aethersdr_compat: bool) -> String {
     let guard = state.read().await;
-    status_body_from_tuner(&guard.tuner)
+    status_body_from_tuner(&guard.tuner, aethersdr_compat)
 }
 
-fn status_body_from_tuner(tuner: &bridge_core::TunerState) -> String {
+fn status_body_from_tuner(tuner: &bridge_core::TunerState, aethersdr_compat: bool) -> String {
     let fwd = watts_to_dbm(tuner.forward_power_watts);
     let swr = protocol_swr_value(tuner.swr);
     let degraded = matches!(
         tuner.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
     );
-    format!(
-        "operate={} bypass={} tuning={} relayC1={} relayL={} relayC2={} antA={} one_by_three=1 fwd={fwd:.4} swr={swr:.4} connection_state={} fault={}",
-        bool_int(tuner.operate),
+    let operate = if aethersdr_compat {
+        false
+    } else {
+        tuner.operate
+    };
+    let native = format!(
+        "operate={} bypass={} tuning={} relayC1={} relayL={} relayC2={} antA={} one_by_three=1 fwd={fwd:.4} swr={swr:.4}",
+        bool_int(operate),
         bool_int(tuner.bypass),
         bool_int(tuner.tuning || degraded),
         tuner.relay_c1,
         tuner.relay_l,
         tuner.relay_c2,
-        tuner.selected_antenna.unwrap_or(0),
-        tuner.connection_state.as_str(),
-        tuner.fault.as_deref().unwrap_or(if degraded {
-            "device_degraded"
-        } else {
-            ""
-        }),
-    )
+        tuner.selected_antenna.unwrap_or(0)
+    );
+    if aethersdr_compat {
+        native
+    } else {
+        format!(
+            "{native} connection_state={} fault={}",
+            tuner.connection_state.as_str(),
+            tuner
+                .fault
+                .as_deref()
+                .unwrap_or(if degraded { "device_degraded" } else { "" }),
+        )
+    }
 }
 
-async fn state_push(state: &SharedState) -> String {
+async fn state_push(state: &SharedState, aethersdr_compat: bool) -> String {
     let guard = state.read().await;
-    state_push_from_tuner(&guard.tuner)
+    state_push_from_tuner(&guard.tuner, aethersdr_compat)
 }
 
-fn state_push_from_tuner(tuner: &bridge_core::TunerState) -> String {
-    format!("S0|state {}\n", status_body_from_tuner(tuner))
+fn state_push_from_tuner(tuner: &bridge_core::TunerState, aethersdr_compat: bool) -> String {
+    format!(
+        "S0|state {}\n",
+        status_body_from_tuner(tuner, aethersdr_compat)
+    )
 }
 
 struct SessionStats {
@@ -713,10 +750,11 @@ fn watts_to_dbm(watts: f32) -> f32 {
 }
 
 fn protocol_swr_value(swr: f32) -> f32 {
-    if swr.is_finite() && swr >= 1.0 {
-        swr
+    if swr.is_finite() && swr > 1.0 {
+        let rho = ((swr - 1.0) / (swr + 1.0)).clamp(0.001, 0.999);
+        20.0 * rho.log10()
     } else {
-        1.0
+        -30.0
     }
 }
 
@@ -728,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn status_contains_aethersdr_fields() {
         let state = shared_mock_state();
-        let body = status_body(&state).await;
+        let body = status_body(&state, false).await;
         assert!(body.contains("operate=0"));
         assert!(body.contains("relayC1="));
         assert!(body.contains("one_by_three=1"));
@@ -753,27 +791,44 @@ mod tests {
     #[tokio::test]
     async fn golden_tgxl_mock_status_response_is_stable() {
         let state = shared_mock_state();
-        let body = status_body(&state).await;
+        let body = status_body(&state, false).await;
         assert_eq!(
             response_line(2, 0, body),
-            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=1.0000 connection_state=connected fault=\n"
+            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-30.0000 connection_state=connected fault=\n"
         );
     }
 
     #[tokio::test]
-    async fn mock_status_never_reports_negative_or_extreme_swr() {
+    async fn mock_status_reports_return_loss_not_swr_ratio() {
         let state = shared_mock_state();
-        let body = status_body(&state).await;
-        assert!(body.contains("swr=1.0000"));
-        assert!(!body.contains("swr=-"));
+        let body = status_body(&state, false).await;
+        assert!(body.contains("swr=-30.0000"));
         assert!(!body.contains("swr=32."));
     }
 
     #[test]
     fn golden_tgxl_info_response_is_stable() {
         assert_eq!(
-            response_line(1, 0, info_body()),
+            response_line(1, 0, info_body(false)),
             "R1|0|model=TunerGeniusXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl firmware=0.1.0-egb-tgxl one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn aethersdr_compat_status_removes_unverified_fields() {
+        let state = shared_mock_state();
+        let body = status_body(&state, true).await;
+        assert_eq!(
+            response_line(2, 0, body),
+            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=0.0000 swr=-30.0000\n"
+        );
+    }
+
+    #[test]
+    fn aethersdr_compat_info_removes_capabilities() {
+        assert_eq!(
+            response_line(1, 0, info_body(true)),
+            "R1|0|model=TunerGeniusXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl one_by_three=1\n"
         );
     }
 }

@@ -582,26 +582,28 @@ impl Kpa500Driver {
                 }
             }
         }
-        let mut guard = self.state.write().await;
-        guard.amp.connected = true;
-        guard.amp.connection_state = ConnectionState::Connected;
-        guard.amp.last_serial_command_at = Some(SystemTime::now());
-        if outcomes.iter().any(|outcome| outcome.response.is_some()) {
-            guard.amp.last_serial_response_at = Some(SystemTime::now());
-            guard.amp.last_successful_poll_at = Some(SystemTime::now());
-            guard
-                .amp
-                .runtime
-                .record_poll_success(duration_millis_u64(started.elapsed()));
-        } else {
-            guard.amp.connection_state = ConnectionState::Degraded;
-            guard.amp.runtime.poll_failure_count =
-                guard.amp.runtime.poll_failure_count.saturating_add(1);
-        }
-        for outcome in &outcomes {
-            if let Some(response) = &outcome.response {
-                push_capability(&mut guard.amp.capabilities, outcome.command.label);
-                parse_kpa500_response(response, &mut guard.amp);
+        {
+            let mut guard = self.state.write().await;
+            guard.amp.connected = true;
+            guard.amp.connection_state = ConnectionState::Connected;
+            guard.amp.last_serial_command_at = Some(SystemTime::now());
+            if outcomes.iter().any(|outcome| outcome.response.is_some()) {
+                guard.amp.last_serial_response_at = Some(SystemTime::now());
+                guard.amp.last_successful_poll_at = Some(SystemTime::now());
+                guard
+                    .amp
+                    .runtime
+                    .record_poll_success(duration_millis_u64(started.elapsed()));
+            } else {
+                guard.amp.connection_state = ConnectionState::Degraded;
+                guard.amp.runtime.poll_failure_count =
+                    guard.amp.runtime.poll_failure_count.saturating_add(1);
+            }
+            for outcome in &outcomes {
+                if let Some(response) = &outcome.response {
+                    push_capability(&mut guard.amp.capabilities, outcome.command.label);
+                    parse_kpa500_response(response, &mut guard.amp);
+                }
             }
         }
         sleep(self.settings.polling_interval).await;

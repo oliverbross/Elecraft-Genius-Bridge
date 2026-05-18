@@ -26,6 +26,8 @@ Status labels:
 | `status` | `fault` | Bridge degraded-state reporting | Low | Yes, tolerated by parser | Optional | Implemented |
 | `status` | `connection_state` | Bridge degraded-state reporting | Low | Yes, tolerated by parser | Optional | Implemented |
 
+Compatibility mode removes `firmware`, `capabilities`, `fault`, and `connection_state` from PGXL direct responses.
+
 ## TGXL Direct TCP
 
 | Response | Field | Source | Confidence | Observed By AetherSDR | Mandatory Guess | Current Status |
@@ -48,6 +50,8 @@ Status labels:
 | `status` / `state` | `swr` | `TunerModel.cpp` treats value as return loss | High | Yes | Expected for SWR display | Implemented |
 | `status` / `state` | `connection_state` | Bridge degraded-state reporting | Low | Yes, tolerated by parser | Optional | Implemented |
 | `status` / `state` | `fault` | Bridge degraded-state reporting | Low | Yes, tolerated by parser | Optional | Implemented |
+
+Compatibility mode removes `firmware`, `capabilities`, `connection_state`, and `fault` from TGXL direct responses. It also forces TGXL direct `operate=0` during read-only compatibility testing and emits `swr` as negative return loss dB, matching AetherSDR direct parsing.
 
 ## Applet Activation Fields
 

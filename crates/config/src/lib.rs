@@ -137,6 +137,7 @@ impl Default for ServerConfig {
 pub struct PgxlConfig {
     pub enabled: bool,
     pub port: u16,
+    pub aethersdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
 }
@@ -146,6 +147,7 @@ impl Default for PgxlConfig {
         Self {
             enabled: true,
             port: 9008,
+            aethersdr_compat: false,
             strict_emulation: false,
             startup_delay_ms: 0,
         }
@@ -157,6 +159,7 @@ impl Default for PgxlConfig {
 pub struct TgxlConfig {
     pub enabled: bool,
     pub port: u16,
+    pub aethersdr_compat: bool,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
     pub force_presence_test: bool,
@@ -167,6 +170,7 @@ impl Default for TgxlConfig {
         Self {
             enabled: true,
             port: 9010,
+            aethersdr_compat: false,
             strict_emulation: false,
             startup_delay_ms: 0,
             force_presence_test: false,
