@@ -313,6 +313,12 @@ pub struct FlexInjectionState {
     pub pending_count: usize,
     pub expired_pending_count: u64,
     pub degraded_reason: Option<String>,
+    pub tuner_handle: Option<String>,
+    pub tuner_appeared_count: u64,
+    pub tuner_disappeared_count: u64,
+    pub last_tuner_disappearance_reason: Option<String>,
+    #[serde(skip)]
+    pub tuner_last_seen_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +350,8 @@ pub struct ClientState {
     pub tgxl_connected: bool,
     pub pgxl_client_count: usize,
     pub tgxl_client_count: usize,
+    pub pgxl_session_started_count: u64,
+    pub tgxl_session_started_count: u64,
     pub next_session_id: u64,
     pub pgxl_sessions: Vec<ProtocolClientSession>,
     pub tgxl_sessions: Vec<ProtocolClientSession>,

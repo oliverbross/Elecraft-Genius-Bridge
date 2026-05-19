@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bridge_core::{ConnectionState, FlexMeterHandle, SharedState};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -142,6 +142,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 }
 
                 if let Some(status) = parse_amplifier_status(&line) {
+                    observe_tuner_presence(&state, &status).await;
                     if session.observe_amplifier_status(settings, &status) {
                         set_amplifier_handle(&state, &status.handle).await;
                         handle_amplifier_status(
@@ -396,6 +397,50 @@ async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
     }
 }
 
+async fn observe_tuner_presence(state: &SharedState, status: &AmplifierStatus) {
+    let is_tuner = status
+        .value("model")
+        .is_some_and(|model| model == "TunerGeniusXL");
+    let disappearance = status.tuner_disappearance_reason();
+    let mut guard = state.write().await;
+
+    if is_tuner && disappearance.is_none() {
+        let appeared = guard.flex_injection.tuner_handle.as_deref() != Some(status.handle.as_str());
+        guard.flex_injection.tuner_handle = Some(status.handle.clone());
+        guard.flex_injection.tuner_last_seen_at = Some(SystemTime::now());
+        if appeared {
+            guard.flex_injection.tuner_appeared_count =
+                guard.flex_injection.tuner_appeared_count.saturating_add(1);
+            info!(
+                event_id = "smartsdr_tuner_presence_appeared",
+                tuner_handle = %status.handle,
+                raw = %status.raw,
+                "Flex tuner presence appeared"
+            );
+        }
+    }
+
+    if let Some(reason) = disappearance {
+        let matches_known_handle =
+            guard.flex_injection.tuner_handle.as_deref() == Some(status.handle.as_str());
+        if is_tuner || matches_known_handle {
+            guard.flex_injection.tuner_disappeared_count = guard
+                .flex_injection
+                .tuner_disappeared_count
+                .saturating_add(1);
+            guard.flex_injection.last_tuner_disappearance_reason = Some(reason.to_string());
+            guard.flex_injection.tuner_handle = None;
+            warn!(
+                event_id = "smartsdr_tuner_presence_disappeared",
+                tuner_handle = %status.handle,
+                reason,
+                raw = %status.raw,
+                "Flex tuner presence disappeared"
+            );
+        }
+    }
+}
+
 async fn handle_amplifier_status(
     settings: &FlexInjectionSettings,
     state: &SharedState,
@@ -505,6 +550,41 @@ impl AmplifierStatus {
             state.as_str(),
             "IDLE" | "OPERATE" | "TRANSMIT" | "TRANSMIT_A" | "TRANSMIT_B"
         ))
+    }
+
+    fn tuner_disappearance_reason(&self) -> Option<&'static str> {
+        for key in ["connected", "online", "present"] {
+            if let Some(value) = self.value(key) {
+                if matches!(value, "0" | "false" | "False" | "FALSE") {
+                    return Some(match key {
+                        "connected" => "connected=0",
+                        "online" => "online=0",
+                        "present" => "present=0",
+                        _ => "presence_false",
+                    });
+                }
+            }
+        }
+        for key in ["removed", "deleted"] {
+            if let Some(value) = self.value(key) {
+                if matches!(value, "1" | "true" | "True" | "TRUE") {
+                    return Some(if key == "removed" {
+                        "removed=1"
+                    } else {
+                        "deleted=1"
+                    });
+                }
+            }
+        }
+        if let Some(state) = self.value("state") {
+            if matches!(
+                state.to_ascii_uppercase().as_str(),
+                "REMOVED" | "DISCONNECTED" | "OFFLINE" | "UNKNOWN"
+            ) {
+                return Some("state_removed_or_disconnected");
+            }
+        }
+        None
     }
 }
 
@@ -738,6 +818,41 @@ mod tests {
     #[test]
     fn ignores_response_lines_when_parsing_amplifier_status() {
         assert!(parse_amplifier_status("R44|0|amplifier 0x42000001 model=PowerGeniusXL").is_none());
+    }
+
+    #[tokio::test]
+    async fn tracks_flex_tuner_presence_changes() {
+        let state = bridge_core::state::shared_default_state();
+        let appeared = parse_amplifier_status(
+            "S1A2B|amplifier 0x54000001 model=TunerGeniusXL ip=192.168.0.10 connected=1",
+        )
+        .unwrap();
+        observe_tuner_presence(&state, &appeared).await;
+        {
+            let guard = state.read().await;
+            assert_eq!(
+                guard.flex_injection.tuner_handle.as_deref(),
+                Some("0x54000001")
+            );
+            assert_eq!(guard.flex_injection.tuner_appeared_count, 1);
+            assert_eq!(guard.flex_injection.tuner_disappeared_count, 0);
+            assert!(guard.flex_injection.tuner_last_seen_at.is_some());
+        }
+
+        let disappeared =
+            parse_amplifier_status("S1A2B|amplifier 0x54000001 model=TunerGeniusXL connected=0")
+                .unwrap();
+        observe_tuner_presence(&state, &disappeared).await;
+        let guard = state.read().await;
+        assert_eq!(guard.flex_injection.tuner_handle, None);
+        assert_eq!(guard.flex_injection.tuner_disappeared_count, 1);
+        assert_eq!(
+            guard
+                .flex_injection
+                .last_tuner_disappearance_reason
+                .as_deref(),
+            Some("connected=0")
+        );
     }
 
     #[test]

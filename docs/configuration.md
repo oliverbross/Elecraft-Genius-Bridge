@@ -136,7 +136,7 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 This mode does not implement live radio-side meter value streaming, proxying, TLS, or WAN exposure. Operate remains RF-risk gated by `kpa500.allow_rf_risk`.
 
-## Soak Test
+## Soak And Stability Tests
 
 Use soak mode for long-duration validation:
 
@@ -144,7 +144,13 @@ Use soak mode for long-duration validation:
 cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-hours 4
 ```
 
-It starts the normal bridge runtime and prints a health summary every 60 seconds. See `docs/soak-testing.md`.
+Use stability mode for a bounded SmartSDR/Flex reconnect capture:
+
+```powershell
+.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+```
+
+Both start the normal bridge runtime. `stability-test` also writes a JSON report to `diagnostics`. See `docs/soak-testing.md`.
 
 ## Mock Fault Simulation
 

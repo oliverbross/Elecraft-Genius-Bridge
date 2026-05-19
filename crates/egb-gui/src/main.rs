@@ -113,6 +113,22 @@ impl GuiApp {
                         self.kat_probe_result = output.clone();
                     }
                     self.push_log(format!("{label} completed"));
+                    if label.starts_with("stability-test") {
+                        if output.contains("warning:") {
+                            self.push_log(
+                                "stability test reported warnings; export includes report",
+                            );
+                        }
+                        match self.export_diagnostics_bundle() {
+                            Ok(path) => self.push_log(format!(
+                                "stability diagnostics bundle written to {}",
+                                path.display()
+                            )),
+                            Err(err) => {
+                                self.push_log(format!("stability diagnostics export failed: {err}"))
+                            }
+                        }
+                    }
                 }
                 AsyncMessage::CommandError { label, error } => {
                     self.push_log(format!("{label} failed: {error}"));
@@ -292,6 +308,20 @@ impl GuiApp {
             }
             if ui.button("Restart Bridge").clicked() {
                 self.restart_bridge();
+            }
+            if ui.button("Start 10-minute Stability Test").clicked() {
+                self.tab = Tab::Dashboard;
+                self.run_egb_command(
+                    "stability-test-10min",
+                    vec![
+                        "stability-test".into(),
+                        "--config".into(),
+                        self.config_path.display().to_string(),
+                        "--duration-minutes".into(),
+                        "10".into(),
+                    ],
+                );
+                self.push_log("10-minute stability test started");
             }
             if ui.button("Open Logs Folder").clicked() {
                 open_path(Path::new("logs"));
@@ -610,6 +640,15 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "Sessions seen",
+                    format!(
+                        "PGXL {} / TGXL {}",
+                        status.clients.pgxl_session_started_count,
+                        status.clients.tgxl_session_started_count
+                    ),
+                );
+                field(
+                    ui,
                     "Last TGXL close",
                     status
                         .clients
@@ -624,6 +663,29 @@ impl GuiApp {
                         "{}/{}",
                         status.flex_injection.ping_count, status.flex_injection.ping_failure_count
                     ),
+                );
+                field(
+                    ui,
+                    "SmartSDR tuner",
+                    format!(
+                        "appeared {} / disappeared {}",
+                        status.flex_diagnostics.smartsdr_tuner_appeared_count,
+                        status.flex_diagnostics.smartsdr_tuner_disappeared_count
+                    ),
+                );
+                field(
+                    ui,
+                    "Tuner disappear",
+                    status
+                        .flex_diagnostics
+                        .smartsdr_tuner_last_disappearance_reason
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Flex tuner age",
+                    format_ms_age(status.flex_diagnostics.flex_tuner_presence_age_ms),
                 );
                 field(
                     ui,
@@ -1386,6 +1448,8 @@ struct StatusSnapshot {
     tuner: DeviceStatus,
     clients: ClientStatus,
     flex_injection: FlexStatus,
+    #[serde(default)]
+    flex_diagnostics: FlexDiagnostics,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -1454,6 +1518,10 @@ struct ClientStatus {
     pgxl_client_count: usize,
     tgxl_client_count: usize,
     #[serde(default)]
+    pgxl_session_started_count: u64,
+    #[serde(default)]
+    tgxl_session_started_count: u64,
+    #[serde(default)]
     pgxl_sessions: Vec<ClientSession>,
     #[serde(default)]
     tgxl_sessions: Vec<ClientSession>,
@@ -1499,6 +1567,36 @@ struct FlexStatus {
     expired_pending_count: u64,
     #[serde(default)]
     degraded_reason: Option<String>,
+    #[serde(default)]
+    tuner_handle: Option<String>,
+    #[serde(default)]
+    tuner_appeared_count: u64,
+    #[serde(default)]
+    tuner_disappeared_count: u64,
+    #[serde(default)]
+    last_tuner_disappearance_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct FlexDiagnostics {
+    #[serde(default)]
+    ping_count: u64,
+    #[serde(default)]
+    ping_failures: u64,
+    #[serde(default)]
+    pending_count: usize,
+    #[serde(default)]
+    expired_pending_count: u64,
+    #[serde(default)]
+    degraded_reason: Option<String>,
+    #[serde(default)]
+    smartsdr_tuner_appeared_count: u64,
+    #[serde(default)]
+    smartsdr_tuner_disappeared_count: u64,
+    #[serde(default)]
+    smartsdr_tuner_last_disappearance_reason: Option<String>,
+    #[serde(default)]
+    flex_tuner_presence_age_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1581,6 +1679,7 @@ fn export_diagnostics_bundle(
     add_dir_to_zip(&mut zip, options, Path::new("logs/serial"), "serial")?;
     add_dir_to_zip(&mut zip, options, Path::new("logs/tests"), "tests")?;
     add_dir_to_zip(&mut zip, options, Path::new("logs"), "logs-root")?;
+    add_dir_to_zip(&mut zip, options, Path::new("diagnostics"), "diagnostics")?;
     zip.finish()?;
     Ok(path)
 }
@@ -1608,6 +1707,9 @@ fn add_dir_to_zip<W: Write + Seek>(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_file() {
+            if entry.path().extension().is_some_and(|ext| ext == "zip") {
+                continue;
+            }
             let name = format!("{prefix}/{}", entry.file_name().to_string_lossy());
             zip.start_file(name, options)?;
             zip.write_all(&fs::read(entry.path())?)?;

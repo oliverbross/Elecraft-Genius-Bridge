@@ -529,11 +529,46 @@ async fn write_stability_report(state: &SharedState, elapsed: Duration) -> Resul
     let path =
         PathBuf::from("diagnostics").join(format!("egb-stability-{}.json", timestamp_compact()));
     let status: serde_json::Value = serde_json::from_str(&status_json(state).await)?;
+    let guard = state.read().await;
+    let mut warnings = Vec::new();
+    if guard.clients.pgxl_session_started_count == 0
+        && guard.clients.tgxl_session_started_count == 0
+    {
+        warnings.push("No PGXL/TGXL direct client connected during the stability test.");
+    }
+    if guard.flex_injection.enabled && guard.flex_injection.tuner_appeared_count == 0 {
+        warnings.push("No Flex-side SmartSDR/TGXL tuner presence was observed.");
+    }
+    if guard.flex_injection.tuner_disappeared_count > 0 {
+        warnings.push("Flex-side SmartSDR/TGXL tuner presence disappeared during the test.");
+    }
     let body = serde_json::json!({
         "elapsed_secs": elapsed.as_secs(),
+        "warnings": warnings,
+        "summary": {
+            "pgxl_session_started_count": guard.clients.pgxl_session_started_count,
+            "tgxl_session_started_count": guard.clients.tgxl_session_started_count,
+            "smartsdr_tuner_appeared_count": guard.flex_injection.tuner_appeared_count,
+            "smartsdr_tuner_disappeared_count": guard.flex_injection.tuner_disappeared_count,
+            "last_tuner_disappearance_reason": guard.flex_injection.last_tuner_disappearance_reason,
+            "flex_ping_success": guard.flex_injection.ping_count.saturating_sub(guard.flex_injection.ping_failure_count),
+            "flex_ping_fail": guard.flex_injection.ping_failure_count,
+        },
         "status": status,
     });
+    drop(guard);
     tokio::fs::write(&path, serde_json::to_vec_pretty(&body)?).await?;
+    if !warnings.is_empty() {
+        warn!(
+            event_id = "stability_test_warning",
+            warning_count = warnings.len(),
+            warnings = ?warnings,
+            "stability test completed with warnings"
+        );
+        for warning in warnings {
+            println!("warning: {warning}");
+        }
+    }
     Ok(path)
 }
 
@@ -734,6 +769,8 @@ async fn status_json(state: &SharedState) -> String {
             "tgxl_connected": guard.clients.tgxl_connected,
             "pgxl_client_count": guard.clients.pgxl_client_count,
             "tgxl_client_count": guard.clients.tgxl_client_count,
+            "pgxl_session_started_count": guard.clients.pgxl_session_started_count,
+            "tgxl_session_started_count": guard.clients.tgxl_session_started_count,
             "pgxl_sessions": guard.clients.pgxl_sessions,
             "tgxl_sessions": guard.clients.tgxl_sessions,
             "pgxl_last_disconnect_reason": guard.clients.pgxl_last_disconnect_reason,
@@ -746,8 +783,12 @@ async fn status_json(state: &SharedState) -> String {
             "pending_count": guard.flex_injection.pending_count,
             "expired_pending_count": guard.flex_injection.expired_pending_count,
             "degraded_reason": guard.flex_injection.degraded_reason,
+            "smartsdr_tuner_appeared_count": guard.flex_injection.tuner_appeared_count,
+            "smartsdr_tuner_disappeared_count": guard.flex_injection.tuner_disappeared_count,
+            "smartsdr_tuner_last_disappearance_reason": guard.flex_injection.last_tuner_disappearance_reason,
+            "flex_tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "registration_refresh_count": 0,
-            "tuner_presence_age_ms": stale_duration_ms(guard.tuner.last_successful_poll_at),
+            "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
         },
         "protocol": guard.protocol,

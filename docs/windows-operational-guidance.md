@@ -34,12 +34,18 @@ Until a real Windows service is implemented, use Task Scheduler for unattended r
 - Settings: restart on failure after a delay.
 - Stop task if it runs longer than the planned validation window unless intentionally soaking.
 
-## Soak-Test Practice
+## Soak/Stability Test Practice
 
 Run the bridge in read-only mode first:
 
 ```powershell
 cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-hours 4
+```
+
+For the GUI/SmartSDR reconnect investigation, use:
+
+```powershell
+.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
 Save:

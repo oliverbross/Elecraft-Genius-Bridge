@@ -71,6 +71,8 @@ async fn handle_client(
         let mut guard = state.write().await;
         guard.clients.pgxl_connected = true;
         guard.clients.pgxl_client_count += 1;
+        guard.clients.pgxl_session_started_count =
+            guard.clients.pgxl_session_started_count.saturating_add(1);
         let id = guard.clients.next_session_id;
         guard.clients.next_session_id = guard.clients.next_session_id.saturating_add(1);
         guard.clients.pgxl_sessions.push(ProtocolClientSession::new(

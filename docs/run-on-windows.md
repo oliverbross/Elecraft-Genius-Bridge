@@ -34,7 +34,7 @@ scripts\windows\run-hardware-control-local.ps1
 
 Use `run-hardware-readonly.ps1` before any local control profile. It uses `config.hardware-readonly.yaml`, where both real devices have `dry_run: true`.
 
-## Soak Test
+## Soak And Stability Tests
 
 For long-duration read-only validation:
 
@@ -42,7 +42,13 @@ For long-duration read-only validation:
 cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-hours 4
 ```
 
-The command starts the normal bridge runtime and prints one health summary per minute. Keep `dry_run: true` until read-only soak results are stable.
+For a 10-minute SmartSDR reconnect capture:
+
+```powershell
+.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+```
+
+Both commands start the normal bridge runtime. Keep `dry_run: true` until read-only soak results are stable.
 
 ## Scheduled Task Placeholder
 
