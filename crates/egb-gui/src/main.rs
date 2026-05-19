@@ -954,9 +954,22 @@ impl GuiApp {
             port_field(ui, "PGXL port", &mut self.config.pgxl.port);
             port_field(ui, "TGXL port", &mut self.config.tgxl.port);
             checkbox(ui, "PGXL AetherSDR compatibility", &mut self.config.pgxl.aethersdr_compat);
+            egui::ComboBox::from_label("PGXL compatibility profile")
+                .selected_text(self.config.pgxl.compat_profile.as_str())
+                .show_ui(ui, |ui| {
+                    for profile in ["strict", "aethersdr", "smartsdr", "permissive"] {
+                        ui.selectable_value(
+                            &mut self.config.pgxl.compat_profile,
+                            profile.to_string(),
+                            profile,
+                        );
+                    }
+                });
             checkbox(ui, "PGXL direct connected diagnostic", &mut self.config.pgxl.force_direct_connected_test);
             checkbox(ui, "TGXL AetherSDR compatibility", &mut self.config.tgxl.aethersdr_compat);
+            checkbox(ui, "TGXL SmartSDR compatibility", &mut self.config.tgxl.smartsdr_compat);
             checkbox(ui, "TGXL direct presence test", &mut self.config.tgxl.force_presence_test);
+            checkbox(ui, "TGXL experimental presence refresh", &mut self.config.tgxl.experimental_presence_refresh);
             checkbox(ui, "Metrics enabled", &mut self.config.metrics.enabled);
             text_field(ui, "Metrics bind IP", &mut self.config.metrics.bind_ip);
             port_field(ui, "Metrics/status port", &mut self.config.metrics.port);
@@ -1000,6 +1013,11 @@ impl GuiApp {
             checkbox(ui, "Full PGXL registration", &mut self.config.flex_injection.full_pgxl_registration);
             checkbox(ui, "Create AMP meters", &mut self.config.flex_injection.create_meters);
             checkbox(ui, "Create AMP interlock", &mut self.config.flex_injection.create_interlock);
+            u64_field(
+                ui,
+                "Tuner refresh interval ms",
+                &mut self.config.flex_injection.tuner_refresh_interval_ms,
+            );
 
             ui.separator();
             ui.horizontal(|ui| {
@@ -2072,6 +2090,18 @@ fn u32_field(ui: &mut egui::Ui, label: &str, value: &mut u32) {
         ui.label(label);
         if ui.text_edit_singleline(&mut text).lost_focus() {
             if let Ok(parsed) = text.parse::<u32>() {
+                *value = parsed;
+            }
+        }
+    });
+}
+
+fn u64_field(ui: &mut egui::Ui, label: &str, value: &mut u64) {
+    let mut text = value.to_string();
+    ui.horizontal(|ui| {
+        ui.label(label);
+        if ui.text_edit_singleline(&mut text).lost_focus() {
+            if let Ok(parsed) = text.parse::<u64>() {
                 *value = parsed;
             }
         }

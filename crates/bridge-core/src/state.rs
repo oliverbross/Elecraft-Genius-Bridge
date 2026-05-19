@@ -316,6 +316,9 @@ pub struct FlexInjectionState {
     pub tuner_handle: Option<String>,
     pub tuner_appeared_count: u64,
     pub tuner_disappeared_count: u64,
+    pub tuner_registration_refresh_count: u64,
+    pub tuner_presence_expired_count: u64,
+    pub tuner_reannounce_count: u64,
     pub last_tuner_disappearance_reason: Option<String>,
     #[serde(skip)]
     pub tuner_last_seen_at: Option<SystemTime>,

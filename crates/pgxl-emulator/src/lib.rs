@@ -20,9 +20,20 @@ pub struct EmulatorOptions {
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
     pub aethersdr_compat: bool,
+    pub compat_profile: String,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
     pub force_direct_connected_test: bool,
+}
+
+impl EmulatorOptions {
+    fn effective_aethersdr_compat(&self) -> bool {
+        self.aethersdr_compat
+            || matches!(
+                self.compat_profile.as_str(),
+                "" | "aethersdr" | "smartsdr" | "permissive"
+            )
+    }
 }
 
 pub async fn run(bind_addr: SocketAddr, state: SharedState) -> anyhow::Result<()> {
@@ -99,15 +110,25 @@ async fn handle_client(
             "PGXL direct connected diagnostic mode enabled"
         );
     }
+    info!(
+        protocol = "PGXL",
+        connection_id = %peer,
+        compat_profile = %options.compat_profile,
+        aethersdr_compat = options.effective_aethersdr_compat(),
+        "PGXL session compatibility profile selected"
+    );
     maybe_start_strict_startup(&state, &options).await;
     info!(event_id = "client_connected", protocol = "PGXL", connection_id = %peer, "PGXL client connected");
 
     let result = async {
         let (reader, mut writer) = socket.into_split();
         let mut transcript = Transcript::new(
-            "pgxl",
+            "pgxl-session",
             peer,
-            options.transcript_dir.clone(),
+            options
+                .transcript_dir
+                .clone()
+                .or_else(|| Some(PathBuf::from("logs/protocol"))),
             options.transcript_rotate_bytes,
         )
         .await;
@@ -141,7 +162,12 @@ async fn handle_client(
                 options.protocol_trace,
             )
             .await?;
-            debug!(%peer, command_line_len = line.len(), "PGXL command received");
+            debug!(
+                %peer,
+                command_line_len = line.len(),
+                raw_hex = %hex_bytes(line.as_bytes()),
+                "PGXL command received"
+            );
             match parse_client_command(&line) {
                 Ok(cmd) => {
                     stats.commands_received += 1;
@@ -166,9 +192,13 @@ async fn handle_client(
                     stats.last_sequence = Some(cmd.seq);
                     stats.observe_command(&cmd.command);
                     let command_started = Instant::now();
-                    let outcome =
-                        handle_command(cmd.seq, &cmd.command, &state, options.aethersdr_compat)
-                            .await;
+                    let outcome = handle_command(
+                        cmd.seq,
+                        &cmd.command,
+                        &state,
+                        options.effective_aethersdr_compat(),
+                    )
+                    .await;
                     update_pgxl_session_response(
                         &state,
                         session_id,
@@ -645,7 +675,12 @@ where
     W: AsyncWrite + Unpin,
 {
     trace_protocol_line(transcript, device, direction, line, protocol_trace).await?;
-    writer.write_all(format!("{line}\n").as_bytes()).await?;
+    let framed = format!("{line}\n");
+    append_evidence_line(
+        "pgxl-protocol.log",
+        format!("{device} TX raw_hex={}", hex_bytes(framed.as_bytes())),
+    );
+    writer.write_all(framed.as_bytes()).await?;
     Ok(())
 }
 
@@ -659,8 +694,22 @@ async fn trace_protocol_line(
     if protocol_trace {
         info!("{device} {direction} {line}");
     }
-    append_evidence_line("pgxl-protocol.log", format!("{device} {direction} {line}"));
+    append_evidence_line(
+        "pgxl-protocol.log",
+        format!(
+            "{device} {direction} {line} raw_hex={}",
+            hex_bytes(line.as_bytes())
+        ),
+    );
     transcript.write_line(device, direction, line).await
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn timestamp_millis() -> u128 {

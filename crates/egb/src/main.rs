@@ -388,7 +388,12 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 .as_ref()
                 .map(PathBuf::from),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
-            aethersdr_compat: cfg.pgxl.aethersdr_compat,
+            aethersdr_compat: cfg.pgxl.aethersdr_compat
+                || matches!(
+                    cfg.pgxl.compat_profile.as_str(),
+                    "aethersdr" | "smartsdr" | "permissive"
+                ),
+            compat_profile: cfg.pgxl.compat_profile.clone(),
             strict_emulation: cfg.pgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.pgxl.startup_delay_ms),
             force_direct_connected_test: cfg.pgxl.force_direct_connected_test,
@@ -464,6 +469,10 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
             reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
             ping_interval: Duration::from_millis(cfg.flex_injection.ping_interval_ms),
+            tuner_presence_refresh: cfg.tgxl.experimental_presence_refresh,
+            tuner_refresh_interval: Duration::from_millis(
+                cfg.flex_injection.tuner_refresh_interval_ms,
+            ),
         };
         let state = state.clone();
         tokio::spawn(async move {
@@ -635,6 +644,9 @@ async fn write_stability_report(
             "smartsdr_tuner_appeared_count": guard.flex_injection.tuner_appeared_count,
             "smartsdr_tuner_disappeared_count": guard.flex_injection.tuner_disappeared_count,
             "last_tuner_disappearance_reason": guard.flex_injection.last_tuner_disappearance_reason,
+            "tuner_registration_refresh_count": guard.flex_injection.tuner_registration_refresh_count,
+            "tuner_presence_expired_count": guard.flex_injection.tuner_presence_expired_count,
+            "tuner_reannounce_count": guard.flex_injection.tuner_reannounce_count,
             "flex_ping_success": guard.flex_injection.ping_count.saturating_sub(guard.flex_injection.ping_failure_count),
             "flex_ping_fail": guard.flex_injection.ping_failure_count,
         },
@@ -752,6 +764,8 @@ impl EvidenceRun {
         self.write_status("status-end.json", state).await?;
         let summary = evidence_summary_markdown(state, elapsed).await;
         tokio::fs::write(self.dir.join("summary.md"), summary).await?;
+        let analysis = protocol_analysis_markdown(state).await;
+        tokio::fs::write(self.dir.join("pgxl-vs-tgxl-analysis.md"), analysis).await?;
         zip_dir(&self.dir, &self.zip_path)?;
         println!("evidence bundle: {}", self.zip_path.display());
         Ok(self.zip_path.clone())
@@ -861,8 +875,27 @@ async fn evidence_summary_markdown(state: &SharedState, elapsed: Option<Duration
             .unwrap_or("none")
     ));
     body.push_str(&format!(
+        "- Tuner refresh/reannounce/expired counters: {}/{}/{}\n",
+        guard.flex_injection.tuner_registration_refresh_count,
+        guard.flex_injection.tuner_reannounce_count,
+        guard.flex_injection.tuner_presence_expired_count
+    ));
+    body.push_str(&format!(
         "- PGXL/TGXL sessions started: {}/{}\n",
         guard.clients.pgxl_session_started_count, guard.clients.tgxl_session_started_count
+    ));
+    body.push_str(&format!(
+        "- Last PGXL/TGXL disconnect: {}/{}\n",
+        guard
+            .clients
+            .pgxl_last_disconnect_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .clients
+            .tgxl_last_disconnect_reason
+            .as_deref()
+            .unwrap_or("none")
     ));
     if !warnings.is_empty() {
         body.push_str("\n## Warnings\n\n");
@@ -873,10 +906,111 @@ async fn evidence_summary_markdown(state: &SharedState, elapsed: Option<Duration
     body.push_str("\n## Recommended Next Action\n\n");
     if guard.flex_injection.tuner_disappeared_count > 0 {
         body.push_str("Inspect `disconnect-events.jsonl`, `flex-rx.log`, and `flex-tx.log` around the tuner disappearance.\n");
+    } else if guard.clients.pgxl_session_started_count == 0
+        && guard.flex_injection.amplifier_handle.is_some()
+    {
+        body.push_str("The AMP pane can be radio-side visible while direct PGXL never connects; inspect AetherSDR PGXL manual connection settings and `pgxl-protocol.log`.\n");
     } else {
         body.push_str("If the target issue was not reproduced, run another evidence test while SmartSDR is connected.\n");
     }
     body
+}
+
+async fn protocol_analysis_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let pgxl_command_count: u64 = guard
+        .clients
+        .pgxl_sessions
+        .iter()
+        .map(|session| session.commands_received)
+        .sum();
+    let tgxl_command_count: u64 = guard
+        .clients
+        .tgxl_sessions
+        .iter()
+        .map(|session| session.commands_received)
+        .sum();
+    let likely_pgxl = if guard.flex_injection.amplifier_handle.is_some()
+        && guard.clients.pgxl_session_started_count == 0
+    {
+        "AMP applet is radio-side visible but direct PGXL never connected; likely AetherSDR direct PGXL endpoint is not configured or rejected before TCP connect."
+    } else if guard.clients.pgxl_session_started_count > 0
+        && guard.clients.pgxl_client_count == 0
+        && guard.clients.pgxl_last_disconnect_reason.is_some()
+    {
+        "PGXL accepted TCP but disconnected; likely handshake/field/timing mismatch. Inspect pgxl-protocol.log raw_hex entries."
+    } else if guard.clients.pgxl_client_count > 0 {
+        "PGXL direct session is currently connected."
+    } else {
+        "No PGXL direct evidence captured."
+    };
+    let likely_tgxl = if guard.flex_injection.tuner_disappeared_count > 0 {
+        "SmartSDR tuner presence disappeared during the run; likely Flex-side presence expiry or SmartSDR rejecting stale tuner lifecycle state."
+    } else if guard.clients.tgxl_session_started_count == 0
+        && guard.flex_injection.tuner_appeared_count > 0
+    {
+        "Flex-side tuner presence appeared without a direct TGXL client; SmartSDR may be using radio-side visibility but not opening 9010 in this run."
+    } else if guard.clients.tgxl_client_count > 0 {
+        "TGXL direct session is currently connected."
+    } else {
+        "No TGXL direct disconnect evidence captured."
+    };
+    format!(
+        "# PGXL vs TGXL Protocol Analysis\n\n\
+        ## Counts\n\n\
+        - PGXL sessions started: {}\n\
+        - TGXL sessions started: {}\n\
+        - PGXL active clients: {}\n\
+        - TGXL active clients: {}\n\
+        - PGXL commands in active sessions: {}\n\
+        - TGXL commands in active sessions: {}\n\
+        - PGXL last disconnect: {}\n\
+        - TGXL last disconnect: {}\n\
+        - Unknown commands: {}\n\
+        - Parse failures: {}\n\
+        - Unsupported features: {}\n\n\
+        ## Likely Cause Heuristics\n\n\
+        - PGXL: {}\n\
+        - TGXL/SmartSDR tuner: {}\n\n\
+        ## Files To Inspect\n\n\
+        - `pgxl-protocol.log` for raw PGXL RX/TX and raw hex framing.\n\
+        - `tgxl-protocol.log` for TGXL RX/TX.\n\
+        - `disconnect-events.jsonl` for client and tuner lifecycle events.\n\
+        - `flex-rx.log` and `flex-tx.log` for radio-side tuner/amplifier presence.\n",
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard.clients.tgxl_client_count,
+        pgxl_command_count,
+        tgxl_command_count,
+        guard
+            .clients
+            .pgxl_last_disconnect_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .clients
+            .tgxl_last_disconnect_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .protocol
+            .pgxl
+            .unknown_commands
+            .saturating_add(guard.protocol.tgxl.unknown_commands),
+        guard
+            .protocol
+            .pgxl
+            .parse_failures
+            .saturating_add(guard.protocol.tgxl.parse_failures),
+        guard
+            .protocol
+            .pgxl
+            .unsupported_features
+            .saturating_add(guard.protocol.tgxl.unsupported_features),
+        likely_pgxl,
+        likely_tgxl,
+    )
 }
 
 fn zip_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -1150,7 +1284,9 @@ async fn status_json(state: &SharedState) -> String {
             "smartsdr_tuner_disappeared_count": guard.flex_injection.tuner_disappeared_count,
             "smartsdr_tuner_last_disappearance_reason": guard.flex_injection.last_tuner_disappearance_reason,
             "flex_tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
-            "registration_refresh_count": 0,
+            "registration_refresh_count": guard.flex_injection.tuner_registration_refresh_count,
+            "tuner_presence_expired_count": guard.flex_injection.tuner_presence_expired_count,
+            "tuner_reannounce_count": guard.flex_injection.tuner_reannounce_count,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
         },
@@ -1744,6 +1880,14 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             cfg.control.verify_delay_ms
         );
         println!("  rollback: verify-or-force standby (^OS0;) after control test");
+        if cfg.kpa500.dry_run {
+            println!("KPA500 read-only validation passed.");
+            println!(
+                "KPA500 safe control blocked intentionally: dry_run=true, so ^OS0; was not sent."
+            );
+            println!("Result: PASS/WARN (hardware read-only path passed; control path intentionally blocked).");
+            return Ok(());
+        }
         println!("KPA500 control test: sending set_standby wire=^OS0; safety=StateChangeSafe");
         let result = driver.set_standby().await?;
         print_kpa_control_result("set_standby", &result);
@@ -1753,6 +1897,11 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
     }
     if allow_rf_risk {
         ensure_local_or_lan_bind(cfg)?;
+        if cfg.kpa500.dry_run {
+            println!("KPA500 RF-risk control blocked intentionally: dry_run=true, so ^OS1; was not sent.");
+            println!("Result: PASS/WARN (RF-risk request was gated by dry-run safety).");
+            return Ok(());
+        }
         println!("KPA500 RF-risk test: sending set_operate wire=^OS1; safety=RfRisk");
         let operate = driver.set_operate_verified().await?;
         print_kpa_control_result("set_operate", &operate);
@@ -1779,6 +1928,11 @@ async fn test_kpa_operate(cfg: &BridgeConfig, allow_rf_risk: bool) -> Result<()>
         cfg.kpa500.allow_rf_risk || allow_rf_risk
     );
     println!("  workflow: verify standby -> ^OS1; verify ^OS1; immediate ^OS0; verify ^OS0;");
+    if cfg.kpa500.dry_run {
+        println!("KPA500 operate validation blocked intentionally: dry_run=true, so ^OS1; and ^OS0; were not sent.");
+        println!("Result: PASS/WARN (serial/config path loaded; RF-risk control requires dry_run=false).");
+        return Ok(());
+    }
     let state = shared_default_state();
     let driver = Kpa500Driver::new(
         Kpa500Settings {

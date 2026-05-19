@@ -6,6 +6,7 @@ pgxl:
   enabled: true
   port: 9008
   aethersdr_compat: false
+  compat_profile: aethersdr
   strict_emulation: false
   startup_delay_ms: 0
   force_direct_connected_test: false
@@ -14,9 +15,11 @@ tgxl:
   enabled: true
   port: 9010
   aethersdr_compat: false
+  smartsdr_compat: false
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false
+  experimental_presence_refresh: false
 
 kpa500:
   enabled: true
@@ -74,6 +77,7 @@ flex_injection:
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
+  tuner_refresh_interval_ms: 5000
 
 mock:
   pgxl_fault: false

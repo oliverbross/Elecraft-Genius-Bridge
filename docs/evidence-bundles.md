@@ -37,6 +37,9 @@ diagnostics\runs\YYYYMMDD-HHMMSS-<mode>.zip
 - `config-effective.yaml`
 - `command.txt`
 - `summary.md`
+- `pgxl-vs-tgxl-analysis.md`
 - `stability-report.json` for bounded evidence/stability tests
 
 Start with `summary.md`. For SmartSDR ATU instability, inspect `disconnect-events.jsonl`, then the surrounding `flex-rx.log` and `flex-tx.log` lines.
+
+For PGXL direct connection failures, inspect `pgxl-vs-tgxl-analysis.md` first, then `pgxl-protocol.log`. PGXL protocol lines include raw hex framing to catch CR/LF, spacing, and empty-field differences.

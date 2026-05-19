@@ -63,6 +63,7 @@ impl BridgeConfig {
         })?;
         validate_port("pgxl.port", self.pgxl.port)?;
         validate_port("tgxl.port", self.tgxl.port)?;
+        self.pgxl.validate()?;
         if self.metrics.enabled {
             self.metrics.bind_ip.parse::<IpAddr>().map_err(|_| {
                 ConfigError::Invalid(format!(
@@ -143,9 +144,21 @@ pub struct PgxlConfig {
     pub enabled: bool,
     pub port: u16,
     pub aethersdr_compat: bool,
+    pub compat_profile: String,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
     pub force_direct_connected_test: bool,
+}
+
+impl PgxlConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self.compat_profile.as_str() {
+            "strict" | "aethersdr" | "smartsdr" | "permissive" => Ok(()),
+            other => Err(ConfigError::Invalid(format!(
+                "pgxl.compat_profile must be one of strict, aethersdr, smartsdr, permissive; got {other}"
+            ))),
+        }
+    }
 }
 
 impl Default for PgxlConfig {
@@ -154,6 +167,7 @@ impl Default for PgxlConfig {
             enabled: true,
             port: 9008,
             aethersdr_compat: false,
+            compat_profile: "aethersdr".to_string(),
             strict_emulation: false,
             startup_delay_ms: 0,
             force_direct_connected_test: false,
@@ -171,6 +185,7 @@ pub struct TgxlConfig {
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
     pub force_presence_test: bool,
+    pub experimental_presence_refresh: bool,
 }
 
 impl Default for TgxlConfig {
@@ -183,6 +198,7 @@ impl Default for TgxlConfig {
             strict_emulation: false,
             startup_delay_ms: 0,
             force_presence_test: false,
+            experimental_presence_refresh: false,
         }
     }
 }
@@ -318,6 +334,7 @@ pub struct FlexInjectionConfig {
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
     pub ping_interval_ms: u64,
+    pub tuner_refresh_interval_ms: u64,
 }
 
 impl FlexInjectionConfig {
@@ -350,6 +367,11 @@ impl FlexInjectionConfig {
                 "flex_injection.ping_interval_ms must be > 0".to_string(),
             ));
         }
+        if self.tuner_refresh_interval_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "flex_injection.tuner_refresh_interval_ms must be > 0".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -372,6 +394,7 @@ impl Default for FlexInjectionConfig {
             reconnect_initial_ms: 1000,
             reconnect_max_ms: 30000,
             ping_interval_ms: 30000,
+            tuner_refresh_interval_ms: 5000,
         }
     }
 }
@@ -457,6 +480,16 @@ pgxl:
         .unwrap();
         assert_eq!(cfg.pgxl.port, 9008);
         assert_eq!(cfg.tgxl.port, 9010);
+    }
+
+    #[test]
+    fn validates_pgxl_compat_profile() {
+        let mut cfg = BridgeConfig::default();
+        cfg.pgxl.compat_profile = "smartsdr".to_string();
+        cfg.validate().unwrap();
+
+        cfg.pgxl.compat_profile = "unknown".to_string();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

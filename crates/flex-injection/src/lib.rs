@@ -26,6 +26,8 @@ pub struct FlexInjectionSettings {
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
     pub ping_interval: Duration,
+    pub tuner_presence_refresh: bool,
+    pub tuner_refresh_interval: Duration,
 }
 
 impl FlexInjectionSettings {
@@ -106,6 +108,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut registration_sent = false;
     let mut next_seq = 1_u32;
     let mut ping_timer = Box::pin(sleep(settings.ping_interval));
+    let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
 
     loop {
         tokio::select! {
@@ -176,6 +179,42 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     log_amp_snapshot(&state).await;
                 }
                 ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
+            }
+            () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
+                if registration_sent {
+                    send_tracked_command(
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                        PendingCommand::new(
+                            "tuner_presence_refresh",
+                            "sub amplifier all",
+                            PendingKind::TunerPresenceRefresh,
+                        ),
+                    )
+                    .await?;
+                    {
+                        let mut guard = state.write().await;
+                        guard.flex_injection.tuner_registration_refresh_count =
+                            guard.flex_injection.tuner_registration_refresh_count.saturating_add(1);
+                        guard.flex_injection.tuner_reannounce_count =
+                            guard.flex_injection.tuner_reannounce_count.saturating_add(1);
+                    }
+                    append_evidence_json(
+                        "disconnect-events.jsonl",
+                        &serde_json::json!({
+                            "event": "tuner_presence_refreshed",
+                            "source": "flex_injection",
+                            "command": "sub amplifier all",
+                        }),
+                    );
+                    info!(
+                        event_id = "tuner_presence_refreshed",
+                        "Flex tuner presence refresh query sent"
+                    );
+                }
+                tuner_refresh_timer.as_mut().reset(tokio::time::Instant::now() + settings.tuner_refresh_interval);
             }
         }
     }
@@ -332,7 +371,9 @@ impl FlexSession {
                     guard.flex_injection.interlock_handle = Some(handle.to_string());
                 }
             }
-            PendingKind::KeepaliveEnable | PendingKind::Subscription => {}
+            PendingKind::KeepaliveEnable
+            | PendingKind::Subscription
+            | PendingKind::TunerPresenceRefresh => {}
             PendingKind::Ping => {
                 let mut guard = state.write().await;
                 if code == "0" {
@@ -538,6 +579,7 @@ enum PendingKind {
     InterlockCreate,
     KeepaliveEnable,
     Subscription,
+    TunerPresenceRefresh,
     Ping,
 }
 
@@ -893,6 +935,8 @@ mod tests {
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
             ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
         };
         let commands = registration_command_lines(&settings);
         assert_eq!(
