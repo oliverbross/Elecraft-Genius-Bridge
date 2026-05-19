@@ -49,7 +49,7 @@ Most likely causes to validate with a diagnostics ZIP:
 Run a 10-minute stability capture, reproduce the SmartSDR reconnect if possible, then export diagnostics:
 
 ```powershell
-.\target-msvc\debug\egb.exe stability-test --config config.aethersdr-compat-readonly.yaml --duration-minutes 10
+.\target-msvc\debug\egb.exe evidence-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
 Check:

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use bridge_core::{ConnectionState, FlexMeterHandle, SharedState};
+use bridge_core::{
+    append_evidence_json, append_evidence_line, ConnectionState, FlexMeterHandle, SharedState,
+};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime};
@@ -415,7 +417,15 @@ async fn observe_tuner_presence(state: &SharedState, status: &AmplifierStatus) {
                 event_id = "smartsdr_tuner_presence_appeared",
                 tuner_handle = %status.handle,
                 raw = %status.raw,
-                "Flex tuner presence appeared"
+            "Flex tuner presence appeared"
+            );
+            append_evidence_json(
+                "disconnect-events.jsonl",
+                &serde_json::json!({
+                    "event": "tuner_registered",
+                    "handle": status.handle,
+                    "raw": status.raw,
+                }),
             );
         }
     }
@@ -436,6 +446,15 @@ async fn observe_tuner_presence(state: &SharedState, status: &AmplifierStatus) {
                 reason,
                 raw = %status.raw,
                 "Flex tuner presence disappeared"
+            );
+            append_evidence_json(
+                "disconnect-events.jsonl",
+                &serde_json::json!({
+                    "event": "smartsdr_tuner_disconnected",
+                    "handle": status.handle,
+                    "reason": reason,
+                    "raw": status.raw,
+                }),
             );
         }
     }
@@ -626,10 +645,12 @@ async fn log_amp_snapshot(state: &SharedState) {
 
 fn trace_flex_rx(line: &str) {
     debug!(line = %line, "FLEX RX <");
+    append_evidence_line("flex-rx.log", line);
 }
 
 fn trace_flex_tx(line: &str) {
     debug!(line = %line, "FLEX TX >");
+    append_evidence_line("flex-tx.log", line);
 }
 
 pub fn amplifier_create_command(

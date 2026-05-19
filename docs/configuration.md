@@ -144,13 +144,13 @@ Use soak mode for long-duration validation:
 cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-hours 4
 ```
 
-Use stability mode for a bounded SmartSDR/Flex reconnect capture:
+Use evidence mode for a bounded SmartSDR/Flex reconnect capture:
 
 ```powershell
-.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+.\target-msvc\debug\egb.exe evidence-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
-Both start the normal bridge runtime. `stability-test` also writes a JSON report to `diagnostics`. See `docs/soak-testing.md`.
+Both start the normal bridge runtime. `evidence-test` also writes a complete evidence folder and ZIP to `diagnostics\runs`. See `docs/evidence-bundles.md`.
 
 ## Mock Fault Simulation
 

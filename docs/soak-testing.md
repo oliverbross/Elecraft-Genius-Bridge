@@ -6,17 +6,17 @@ Phase 14 added a long-running operational soak mode:
 cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-hours 8
 ```
 
-Phase 23 adds the shorter diagnostics-oriented stability command expected by the GUI:
+Phase 24 adds the shorter diagnostics-oriented evidence command expected by the GUI:
 
 ```powershell
-.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+.\target-msvc\debug\egb.exe evidence-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
 On the current Windows development environment, use the checked script/toolchain setup if `cargo` is not on `PATH`.
 
 ## What It Starts
 
-Both `soak-test` and `stability-test` start the same bridge runtime as `egb run`:
+`soak-test`, `stability-test`, and `evidence-test` start the same bridge runtime as `egb run`:
 
 - KPA500/KAT500 drivers according to the selected config
 - PGXL/TGXL emulators
@@ -28,7 +28,7 @@ It does not enable any additional control commands. Hardware behavior is still g
 
 ## Periodic Summary
 
-`soak-test` prints every 60 seconds. `stability-test` prints every 30 seconds and writes a JSON report in `diagnostics`.
+`soak-test` prints every 60 seconds. `evidence-test` prints every 30 seconds and writes a complete evidence folder and ZIP in `diagnostics\runs`.
 
 - elapsed runtime
 - amp/tuner connection state
@@ -44,7 +44,7 @@ It does not enable any additional control commands. Hardware behavior is still g
 
 These summaries are intended to prove that AetherSDR polling and Elecraft serial polling can run for hours without hidden disconnect loops.
 
-If no PGXL/TGXL direct client connects during `stability-test`, the report includes a warning. This is expected when only the Flex-side SmartSDR tuner path is being exercised, but it means the direct TGXL reconnect loop was not captured.
+If no PGXL/TGXL direct client connects during `evidence-test`, the report includes a warning. This is expected when only the Flex-side SmartSDR tuner path is being exercised, but it means the direct TGXL reconnect loop was not captured.
 
 ## Transcript Rotation
 
@@ -76,7 +76,7 @@ cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-
 For SmartSDR reconnect capture:
 
 ```powershell
-.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+.\target-msvc\debug\egb.exe evidence-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
 For overnight testing, keep `dry_run: true`, leave RF-risk commands disabled, and save serial transcripts plus `/status` snapshots.

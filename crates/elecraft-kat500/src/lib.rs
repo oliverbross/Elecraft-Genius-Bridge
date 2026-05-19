@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bridge_core::{push_capability, ConnectionState, SharedState};
+use bridge_core::{append_evidence_line, push_capability, ConnectionState, SharedState};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{create_dir_all, File};
@@ -1060,6 +1060,7 @@ impl SerialTranscript {
     }
 
     async fn write_line(&mut self, direction: &str, line: &str) {
+        append_evidence_line("kat500-serial.log", format!("{direction} {line}"));
         if self.file.is_none() {
             return;
         }

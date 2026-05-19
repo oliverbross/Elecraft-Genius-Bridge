@@ -1,7 +1,7 @@
 use anyhow::Context;
 use bridge_core::{
-    parse_client_command, response_line, AmpOperatingState, ConnectionState, ProtocolClientSession,
-    SharedState,
+    append_evidence_json, append_evidence_line, parse_client_command, response_line,
+    AmpOperatingState, ConnectionState, ProtocolClientSession, SharedState,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -83,6 +83,15 @@ async fn handle_client(
         ));
         id
     };
+    append_evidence_json(
+        "client-sessions.jsonl",
+        &serde_json::json!({
+            "event": "client_connected",
+            "protocol": "PGXL",
+            "peer": peer.to_string(),
+            "session_id": session_id,
+        }),
+    );
     if options.force_direct_connected_test {
         info!(
             protocol = "PGXL",
@@ -229,6 +238,16 @@ async fn handle_client(
             Err(err) => err.to_string(),
         });
     }
+    append_evidence_json(
+        "disconnect-events.jsonl",
+        &serde_json::json!({
+            "event": "client_disconnected",
+            "protocol": "PGXL",
+            "peer": peer.to_string(),
+            "session_id": session_id,
+            "reason": result.as_ref().err().map(|err| err.to_string()).unwrap_or_else(|| "client_closed".to_string()),
+        }),
+    );
     info!(event_id = "client_disconnected", protocol = "PGXL", connection_id = %peer, "PGXL client disconnected");
     result
 }
@@ -640,6 +659,7 @@ async fn trace_protocol_line(
     if protocol_trace {
         info!("{device} {direction} {line}");
     }
+    append_evidence_line("pgxl-protocol.log", format!("{device} {direction} {line}"));
     transcript.write_line(device, direction, line).await
 }
 

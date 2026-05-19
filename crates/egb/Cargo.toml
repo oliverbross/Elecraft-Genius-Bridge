@@ -16,12 +16,14 @@ elecraft-kpa500 = { path = "../elecraft-kpa500" }
 flex-injection = { path = "../flex-injection" }
 pgxl-emulator = { path = "../pgxl-emulator" }
 serde_json.workspace = true
+serde_yaml.workspace = true
 test-harness = { path = "../test-harness" }
 tgxl-emulator = { path = "../tgxl-emulator" }
 tokio.workspace = true
 tokio-serial.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zip.workspace = true
 
 [[bin]]
 name = "egb"

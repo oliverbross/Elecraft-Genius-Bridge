@@ -43,6 +43,8 @@ struct GuiApp {
     kpa_probe_result: String,
     kat_probe_result: String,
     diagnostics: VecDeque<String>,
+    latest_evidence_bundle: Option<PathBuf>,
+    current_evidence_dir: Option<PathBuf>,
     settings: GuiSettings,
     controls: ControlFlags,
     log_filter: LogFilter,
@@ -71,6 +73,8 @@ impl GuiApp {
             kpa_probe_result: String::new(),
             kat_probe_result: String::new(),
             diagnostics: VecDeque::new(),
+            latest_evidence_bundle: latest_evidence_bundle(),
+            current_evidence_dir: None,
             settings,
             controls,
             log_filter: LogFilter::All,
@@ -113,7 +117,16 @@ impl GuiApp {
                         self.kat_probe_result = output.clone();
                     }
                     self.push_log(format!("{label} completed"));
-                    if label.starts_with("stability-test") {
+                    if let Some(path) = extract_evidence_bundle_path(&output) {
+                        self.latest_evidence_bundle = Some(path.clone());
+                        self.current_evidence_dir = path.file_stem().map(|stem| {
+                            PathBuf::from("diagnostics")
+                                .join("runs")
+                                .join(stem.to_string_lossy().to_string())
+                        });
+                        self.push_log(format!("evidence bundle: {}", path.display()));
+                    }
+                    if label.starts_with("stability-test") || label.starts_with("evidence-test") {
                         if output.contains("warning:") {
                             self.push_log(
                                 "stability test reported warnings; export includes report",
@@ -309,19 +322,40 @@ impl GuiApp {
             if ui.button("Restart Bridge").clicked() {
                 self.restart_bridge();
             }
-            if ui.button("Start 10-minute Stability Test").clicked() {
+            if ui
+                .button("Start Stability Test and Export Evidence")
+                .clicked()
+            {
                 self.tab = Tab::Dashboard;
                 self.run_egb_command(
-                    "stability-test-10min",
+                    "evidence-test-10min",
                     vec![
-                        "stability-test".into(),
+                        "evidence-test".into(),
                         "--config".into(),
                         self.config_path.display().to_string(),
                         "--duration-minutes".into(),
                         "10".into(),
                     ],
                 );
-                self.push_log("10-minute stability test started");
+                self.push_log("10-minute evidence test started");
+            }
+            if ui.button("Export Last Evidence Bundle").clicked() {
+                match self.export_diagnostics_bundle() {
+                    Ok(path) => {
+                        self.latest_evidence_bundle = Some(path.clone());
+                        self.push_log(format!("diagnostics bundle written to {}", path.display()));
+                    }
+                    Err(err) => self.push_log(format!("diagnostics bundle failed: {err}")),
+                }
+            }
+            if ui.button("Open Evidence Folder").clicked() {
+                open_path(Path::new("diagnostics/runs"));
+            }
+            if ui.button("Copy Latest Bundle Path").clicked() {
+                if let Some(path) = &self.latest_evidence_bundle {
+                    ui.output_mut(|out| out.copied_text = path.display().to_string());
+                    self.push_log("latest evidence bundle path copied");
+                }
             }
             if ui.button("Open Logs Folder").clicked() {
                 open_path(Path::new("logs"));
@@ -347,6 +381,40 @@ impl GuiApp {
                 format!("/status unavailable: {error}"),
             );
         }
+        ui.horizontal_wrapped(|ui| {
+            field(
+                ui,
+                "Latest evidence",
+                self.latest_evidence_bundle
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            field(
+                ui,
+                "Current run dir",
+                self.current_evidence_dir
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+            let warning_count = self
+                .diagnostics
+                .iter()
+                .filter(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    lower.contains("warn") || lower.contains("error") || lower.contains("failed")
+                })
+                .count();
+            field(ui, "Captured warnings/errors", warning_count);
+            if let Some(status) = &self.status {
+                field(
+                    ui,
+                    "SmartSDR tuner flaps",
+                    status.flex_diagnostics.smartsdr_tuner_disappeared_count,
+                );
+            }
+        });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             self.summary_card(
@@ -763,9 +831,7 @@ impl GuiApp {
                     );
                 }
                 ui.monospace("Operate: Flex amplifier set operate=1 -> KPA500 ^OS1;");
-                let operate_enabled = self.controls.kpa_rf_risk
-                    && self.config.kpa500.allow_rf_risk
-                    && (self.controls.remember_rf_confirm || self.rf_acknowledged);
+                let operate_enabled = self.controls.kpa_rf_risk;
                 if ui
                     .add_enabled(
                         operate_enabled,
@@ -773,15 +839,27 @@ impl GuiApp {
                     )
                     .clicked()
                 {
-                    self.run_egb_command(
-                        "kpa-operate",
-                        vec![
-                            "test-kpa-operate".into(),
-                            "--config".into(),
-                            self.config_path.display().to_string(),
-                            "--allow-rf-risk".into(),
-                        ],
-                    );
+                    if !self.controls.remember_rf_confirm && !self.rf_acknowledged {
+                        self.rf_acknowledged = true;
+                        self.push_log(
+                            "RF-risk operate armed for one click; press Operate again to execute",
+                        );
+                    } else {
+                        self.run_egb_command(
+                            "kpa-operate",
+                            vec![
+                                "test-kpa-operate".into(),
+                                "--config".into(),
+                                self.config_path.display().to_string(),
+                                "--allow-rf-risk".into(),
+                                "--confirm-rf-risk".into(),
+                                "I understand".into(),
+                            ],
+                        );
+                        if !self.controls.remember_rf_confirm {
+                            self.rf_acknowledged = false;
+                        }
+                    }
                 }
                 ui.add_enabled(false, egui::Button::new("Clear Fault (^FLC;)"));
             });
@@ -1849,6 +1927,29 @@ fn export_visible_logs(logs: &VecDeque<String>, filter: LogFilter) -> Result<Pat
         .join("\n");
     fs::write(&path, body)?;
     Ok(path)
+}
+
+fn extract_evidence_bundle_path(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("evidence bundle:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+fn latest_evidence_bundle() -> Option<PathBuf> {
+    let dir = Path::new("diagnostics/runs");
+    let entries = fs::read_dir(dir).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "zip"))
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
 }
 
 fn apply_modern_style(ctx: &egui::Context) {

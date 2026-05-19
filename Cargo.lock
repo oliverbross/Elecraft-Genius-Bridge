@@ -1100,12 +1100,14 @@ dependencies = [
  "flex-injection",
  "pgxl-emulator",
  "serde_json",
+ "serde_yaml",
  "test-harness",
  "tgxl-emulator",
  "tokio",
  "tokio-serial",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]
@@ -1370,6 +1372,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bridge-core",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -2631,6 +2634,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bridge-core",
+ "serde_json",
  "tokio",
  "tracing",
 ]
@@ -3358,6 +3362,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bridge-core",
+ "serde_json",
  "tokio",
  "tracing",
 ]

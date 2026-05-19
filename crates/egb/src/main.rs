@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
-use bridge_core::{AmpOperatingState, ConnectionState, SharedState};
+use bridge_core::{
+    append_evidence_line, set_evidence_dir, AmpOperatingState, ConnectionState, SharedState,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use egb_config::{is_lan_or_loopback_or_cgnat, BridgeConfig};
 use elecraft_kat500::{
@@ -15,8 +17,10 @@ use elecraft_kpa500::{
     ControlCommandResult as KpaControlCommandResult, Kpa500Driver, Kpa500Settings,
 };
 use flex_injection::FlexInjectionSettings;
+use std::fs::{self, File};
+use std::io::Seek;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,6 +56,12 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    EvidenceTest {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        duration_minutes: f64,
+    },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -65,11 +75,23 @@ enum Commands {
         #[arg(long)]
         allow_rf_risk: bool,
     },
+    TestKpaLive {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        allow_control: bool,
+        #[arg(long)]
+        allow_rf_risk: bool,
+        #[arg(long)]
+        confirm_rf_risk: Option<String>,
+    },
     TestKpaOperate {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
         #[arg(long)]
         allow_rf_risk: bool,
+        #[arg(long)]
+        confirm_rf_risk: Option<String>,
     },
     TestKat {
         #[arg(long, default_value = "config.yaml")]
@@ -142,7 +164,7 @@ async fn main() -> Result<()> {
         Commands::Run { config } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            run_bridge(cfg).await
+            run_bridge(cfg, config).await
         }
         Commands::SoakTest {
             config,
@@ -150,15 +172,19 @@ async fn main() -> Result<()> {
         } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            run_soak_test(cfg, duration_hours).await
+            run_soak_test(cfg, config, duration_hours).await
         }
         Commands::StabilityTest {
+            config,
+            duration_minutes,
+        }
+        | Commands::EvidenceTest {
             config,
             duration_minutes,
         } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            run_stability_test(cfg, duration_minutes).await
+            run_evidence_test(cfg, config, duration_minutes).await
         }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
@@ -185,15 +211,37 @@ async fn main() -> Result<()> {
         } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            test_kpa(&cfg, allow_control, allow_rf_risk).await
+            run_test_with_evidence("test-kpa", &config, &cfg, async {
+                test_kpa(&cfg, allow_control, allow_rf_risk).await
+            })
+            .await
+        }
+        Commands::TestKpaLive {
+            config,
+            allow_control,
+            allow_rf_risk,
+            confirm_rf_risk,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            require_rf_risk_confirmation(allow_rf_risk, confirm_rf_risk.as_deref())?;
+            run_test_with_evidence("test-kpa-live", &config, &cfg, async {
+                test_kpa(&cfg, allow_control, allow_rf_risk).await
+            })
+            .await
         }
         Commands::TestKpaOperate {
             config,
             allow_rf_risk,
+            confirm_rf_risk,
         } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            test_kpa_operate(&cfg, allow_rf_risk).await
+            require_rf_risk_confirmation(allow_rf_risk, confirm_rf_risk.as_deref())?;
+            run_test_with_evidence("test-kpa-operate", &config, &cfg, async {
+                test_kpa_operate(&cfg, allow_rf_risk).await
+            })
+            .await
         }
         Commands::TestKat {
             config,
@@ -202,7 +250,10 @@ async fn main() -> Result<()> {
         } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            test_kat(&cfg, allow_control, allow_rf_risk).await
+            run_test_with_evidence("test-kat", &config, &cfg, async {
+                test_kat(&cfg, allow_control, allow_rf_risk).await
+            })
+            .await
         }
         Commands::SerialProbe {
             port,
@@ -437,21 +488,30 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
     Ok(state)
 }
 
-async fn run_bridge(cfg: BridgeConfig) -> Result<()> {
-    let _state = start_bridge(&cfg).await?;
+async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
+    let evidence = EvidenceRun::start("run", &config_path, &cfg, std::env::args())?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
     info!("Elecraft Genius Bridge running; press Ctrl+C to stop");
     tokio::signal::ctrl_c()
         .await
         .context("failed waiting for Ctrl+C")?;
     info!("shutdown requested");
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    evidence.finish(&state, None).await?;
     Ok(())
 }
 
-async fn run_soak_test(cfg: BridgeConfig, duration_hours: f64) -> Result<()> {
+async fn run_soak_test(cfg: BridgeConfig, config_path: PathBuf, duration_hours: f64) -> Result<()> {
     if !duration_hours.is_finite() || duration_hours <= 0.0 {
         anyhow::bail!("--duration-hours must be a finite value greater than 0");
     }
+    let evidence = EvidenceRun::start("soak-test", &config_path, &cfg, std::env::args())?;
     let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_hours * 3600.0);
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + duration;
@@ -479,15 +539,25 @@ async fn run_soak_test(cfg: BridgeConfig, duration_hours: f64) -> Result<()> {
         }
     }
     print_soak_summary(&state, started.elapsed()).await;
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    evidence.finish(&state, Some(started.elapsed())).await?;
     info!("soak test finished");
     Ok(())
 }
 
-async fn run_stability_test(cfg: BridgeConfig, duration_minutes: f64) -> Result<()> {
+async fn run_evidence_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
     if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
+    let evidence = EvidenceRun::start("evidence-test", &config_path, &cfg, std::env::args())?;
     let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_minutes * 60.0);
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + duration;
@@ -514,20 +584,34 @@ async fn run_stability_test(cfg: BridgeConfig, duration_minutes: f64) -> Result<
             }
         }
     }
-    let path = write_stability_report(&state, started.elapsed()).await?;
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let path = write_stability_report(&state, started.elapsed(), Some(evidence.dir())).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
     info!(
         event_id = "stability_test_completed",
         report = %path.display(),
+        zip = %zip.display(),
         "stability test completed"
     );
     println!("stability report: {}", path.display());
+    println!("evidence bundle: {}", zip.display());
     Ok(())
 }
 
-async fn write_stability_report(state: &SharedState, elapsed: Duration) -> Result<PathBuf> {
-    tokio::fs::create_dir_all("diagnostics").await?;
-    let path =
-        PathBuf::from("diagnostics").join(format!("egb-stability-{}.json", timestamp_compact()));
+async fn write_stability_report(
+    state: &SharedState,
+    elapsed: Duration,
+    dir: Option<&Path>,
+) -> Result<PathBuf> {
+    let path = dir
+        .map(|dir| dir.join("stability-report.json"))
+        .unwrap_or_else(|| {
+            PathBuf::from("diagnostics").join(format!("egb-stability-{}.json", timestamp_compact()))
+        });
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let status: serde_json::Value = serde_json::from_str(&status_json(state).await)?;
     let guard = state.read().await;
     let mut warnings = Vec::new();
@@ -570,6 +654,285 @@ async fn write_stability_report(state: &SharedState, elapsed: Duration) -> Resul
         }
     }
     Ok(path)
+}
+
+struct EvidenceRun {
+    dir: PathBuf,
+    zip_path: PathBuf,
+}
+
+impl EvidenceRun {
+    fn start<I, S>(mode: &str, config_path: &Path, cfg: &BridgeConfig, command: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: ToString,
+    {
+        let stamp = timestamp_ymdhms();
+        let safe_mode = mode.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-', "_");
+        let root = PathBuf::from("diagnostics").join("runs");
+        let dir = root.join(format!("{stamp}-{safe_mode}"));
+        fs::create_dir_all(&dir)?;
+        set_evidence_dir(&dir);
+        fs::write(dir.join("command.txt"), command_line(command))?;
+        fs::write(
+            dir.join("config-effective.yaml"),
+            serde_yaml::to_string(cfg)?,
+        )?;
+        fs::write(
+            dir.join("egb-run.log"),
+            format!(
+                "mode={mode}\nconfig={}\nstarted={stamp}\n",
+                config_path.display()
+            ),
+        )?;
+        for file in [
+            "flex-rx.log",
+            "flex-tx.log",
+            "pgxl-protocol.log",
+            "tgxl-protocol.log",
+            "kpa500-serial.log",
+            "kat500-serial.log",
+            "client-sessions.jsonl",
+            "disconnect-events.jsonl",
+            "warnings-errors.log",
+            "status-samples.jsonl",
+        ] {
+            File::create(dir.join(file))?;
+        }
+        Ok(Self {
+            zip_path: root.join(format!("{stamp}-{safe_mode}.zip")),
+            dir,
+        })
+    }
+
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    async fn write_status(&self, file_name: &str, state: &SharedState) -> Result<()> {
+        let body = status_json(state).await;
+        tokio::fs::write(self.dir.join(file_name), body).await?;
+        Ok(())
+    }
+
+    fn start_status_sampler(&self, state: SharedState) -> tokio::task::JoinHandle<()> {
+        let dir = self.dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let Ok(status) =
+                    serde_json::from_str::<serde_json::Value>(&status_json(&state).await)
+                else {
+                    continue;
+                };
+                let sample = serde_json::json!({
+                    "timestamp_ms": system_time_ms(Some(SystemTime::now())),
+                    "status": status,
+                });
+                let line = match serde_json::to_string(&sample) {
+                    Ok(line) => line,
+                    Err(_) => continue,
+                };
+                let path = dir.join("status-samples.jsonl");
+                if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await
+                {
+                    let _ = file.write_all(format!("{line}\n").as_bytes()).await;
+                    let _ = file.flush().await;
+                }
+            }
+        })
+    }
+
+    async fn finish(&self, state: &SharedState, elapsed: Option<Duration>) -> Result<PathBuf> {
+        self.write_status("status-end.json", state).await?;
+        let summary = evidence_summary_markdown(state, elapsed).await;
+        tokio::fs::write(self.dir.join("summary.md"), summary).await?;
+        zip_dir(&self.dir, &self.zip_path)?;
+        println!("evidence bundle: {}", self.zip_path.display());
+        Ok(self.zip_path.clone())
+    }
+}
+
+async fn run_test_with_evidence<F>(
+    mode: &str,
+    config_path: &Path,
+    cfg: &BridgeConfig,
+    future: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let evidence = EvidenceRun::start(mode, config_path, cfg, std::env::args())?;
+    fs::write(evidence.dir().join("status-start.json"), "{}")?;
+    let result = future.await;
+    if let Err(err) = &result {
+        append_evidence_line("warnings-errors.log", format!("ERROR {err}"));
+    }
+    let state = shared_default_state();
+    fs::write(
+        evidence.dir().join("status-end.json"),
+        status_json(&state).await,
+    )?;
+    evidence.finish(&state, None).await?;
+    result
+}
+
+async fn evidence_summary_markdown(state: &SharedState, elapsed: Option<Duration>) -> String {
+    let guard = state.read().await;
+    let mut result = "PASS";
+    let mut warnings = Vec::new();
+    if guard.amp.connection_state == ConnectionState::Degraded
+        || guard.tuner.connection_state == ConnectionState::Degraded
+        || guard.flex_injection.connection_state == ConnectionState::Degraded
+    {
+        result = "WARN";
+    }
+    if guard.flex_injection.tuner_disappeared_count > 0 {
+        result = "WARN";
+        warnings.push("SmartSDR/Flex tuner presence disappeared during the run.");
+    }
+    if guard.clients.pgxl_session_started_count == 0
+        && guard.clients.tgxl_session_started_count == 0
+    {
+        warnings.push("No direct PGXL/TGXL client connected during the run.");
+    }
+    let mut body = String::new();
+    body.push_str("# Evidence Summary\n\n");
+    body.push_str(&format!("Overall result: **{result}**\n\n"));
+    if let Some(elapsed) = elapsed {
+        body.push_str(&format!("Uptime: {} seconds\n\n", elapsed.as_secs()));
+    }
+    body.push_str(&format!(
+        "- Amp polls: success={} failure={} reconnects={}\n",
+        guard.amp.runtime.poll_success_count,
+        guard.amp.runtime.poll_failure_count,
+        guard.amp.runtime.reconnect_count
+    ));
+    body.push_str(&format!(
+        "- Tuner polls: success={} failure={} reconnects={}\n",
+        guard.tuner.runtime.poll_success_count,
+        guard.tuner.runtime.poll_failure_count,
+        guard.tuner.runtime.reconnect_count
+    ));
+    body.push_str(&format!(
+        "- KPA500 final state: {} operate={} swr={:.2} fault={}\n",
+        guard.amp.connection_state.as_str(),
+        guard.amp.operate,
+        guard.amp.swr,
+        guard.amp.fault.as_deref().unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- KAT500 final state: {} antenna={:?} bypass={} swr={:.2} fault={}\n",
+        guard.tuner.connection_state.as_str(),
+        guard.tuner.selected_antenna,
+        guard.tuner.bypass,
+        guard.tuner.swr,
+        guard.tuner.fault.as_deref().unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Flex state: {} degraded_reason={}\n",
+        guard.flex_injection.connection_state.as_str(),
+        guard
+            .flex_injection
+            .degraded_reason
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Amplifier handle: {:?}\n- Tuner handle: {:?}\n- Meter handles: {:?}\n- Interlock handle: {:?}\n",
+        guard.flex_injection.amplifier_handle,
+        guard.flex_injection.tuner_handle,
+        guard.flex_injection.meter_handles,
+        guard.flex_injection.interlock_handle
+    ));
+    body.push_str(&format!(
+        "- SmartSDR tuner appeared={} disappeared={} last_reason={}\n",
+        guard.flex_injection.tuner_appeared_count,
+        guard.flex_injection.tuner_disappeared_count,
+        guard
+            .flex_injection
+            .last_tuner_disappearance_reason
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- PGXL/TGXL sessions started: {}/{}\n",
+        guard.clients.pgxl_session_started_count, guard.clients.tgxl_session_started_count
+    ));
+    if !warnings.is_empty() {
+        body.push_str("\n## Warnings\n\n");
+        for warning in warnings {
+            body.push_str(&format!("- {warning}\n"));
+        }
+    }
+    body.push_str("\n## Recommended Next Action\n\n");
+    if guard.flex_injection.tuner_disappeared_count > 0 {
+        body.push_str("Inspect `disconnect-events.jsonl`, `flex-rx.log`, and `flex-tx.log` around the tuner disappearance.\n");
+    } else {
+        body.push_str("If the target issue was not reproduced, run another evidence test while SmartSDR is connected.\n");
+    }
+    body
+}
+
+fn zip_dir(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(dst)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    add_dir_to_zip(&mut zip, options, src, src)?;
+    zip.finish()?;
+    Ok(())
+}
+
+fn add_dir_to_zip<W: std::io::Write + Seek>(
+    zip: &mut zip::ZipWriter<W>,
+    options: zip::write::FileOptions,
+    root: &Path,
+    dir: &Path,
+) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            add_dir_to_zip(zip, options, root, &path)?;
+        } else if entry.file_type()?.is_file() {
+            let name = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            zip.start_file(name, options)?;
+            std::io::Write::write_all(zip, &fs::read(path)?)?;
+        }
+    }
+    Ok(())
+}
+
+fn command_line<I, S>(command: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: ToString,
+{
+    command
+        .into_iter()
+        .map(|item| item.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn require_rf_risk_confirmation(allow_rf_risk: bool, confirmation: Option<&str>) -> Result<()> {
+    if allow_rf_risk && confirmation != Some("I understand") {
+        anyhow::bail!("--confirm-rf-risk \"I understand\" is required with --allow-rf-risk");
+    }
+    Ok(())
 }
 
 async fn apply_mock_config(cfg: &BridgeConfig, state: &SharedState) {
@@ -885,6 +1248,34 @@ fn timestamp_compact() -> String {
         .unwrap_or_default()
         .as_secs()
         .to_string()
+}
+
+fn timestamp_ymdhms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    let second = rem % 60;
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (y, m, d)
 }
 
 fn stale_duration_ms(value: Option<SystemTime>) -> Option<u128> {
@@ -1766,5 +2157,58 @@ fn print_kat_command_summary(
             "  {disposition}: {} wire={} safety={:?} verified={}",
             command.label, command.wire, command.safety, command.verified
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn stability_test_alias_is_wired() {
+        let command = Cli::command();
+        let names = command
+            .get_subcommands()
+            .map(|cmd| cmd.get_name().to_string())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"stability-test".to_string()));
+        assert!(names.contains(&"evidence-test".to_string()));
+    }
+
+    #[test]
+    fn rf_risk_confirmation_string_is_required() {
+        assert!(require_rf_risk_confirmation(false, None).is_ok());
+        assert!(require_rf_risk_confirmation(true, None).is_err());
+        assert!(require_rf_risk_confirmation(true, Some("wrong")).is_err());
+        assert!(require_rf_risk_confirmation(true, Some("I understand")).is_ok());
+    }
+
+    #[test]
+    fn summary_markdown_reports_warning_when_no_clients_connected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let state = shared_default_state();
+        let summary = rt.block_on(evidence_summary_markdown(
+            &state,
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(summary.contains("Overall result"));
+        assert!(summary.contains("No direct PGXL/TGXL client connected"));
+    }
+
+    #[test]
+    fn zip_dir_creates_bundle() {
+        let root = PathBuf::from("target-msvc/test-evidence");
+        let src = root.join(format!("src-{}", timestamp_compact()));
+        let dst = root.join(format!("bundle-{}.zip", timestamp_compact()));
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("summary.md"), "# Summary\n").unwrap();
+        zip_dir(&src, &dst).unwrap();
+        assert!(dst.exists());
+    }
+
+    #[test]
+    fn timestamp_formatter_produces_expected_epoch_date() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
     }
 }

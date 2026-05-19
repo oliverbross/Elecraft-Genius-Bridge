@@ -45,7 +45,7 @@ cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-
 For the GUI/SmartSDR reconnect investigation, use:
 
 ```powershell
-.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+.\target-msvc\debug\egb.exe evidence-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
 Save:

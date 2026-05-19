@@ -45,7 +45,7 @@ cargo run -p egb -- soak-test --config config.hardware-readonly.yaml --duration-
 For a 10-minute SmartSDR reconnect capture:
 
 ```powershell
-.\target-msvc\debug\egb.exe stability-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
+.\target-msvc\debug\egb.exe evidence-test --config .\config.flex-injection-readonly.yaml --duration-minutes 10
 ```
 
 Both commands start the normal bridge runtime. Keep `dry_run: true` until read-only soak results are stable.
