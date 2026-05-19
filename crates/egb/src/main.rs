@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
 use bridge_core::{
-    append_evidence_line, set_evidence_dir, AmpOperatingState, ConnectionState, SharedState,
+    append_evidence_json, append_evidence_line, set_evidence_dir, AmpOperatingState,
+    ConnectionState, SharedState,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use egb_config::{is_lan_or_loopback_or_cgnat, BridgeConfig};
@@ -23,8 +24,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_serial::{SerialPortBuilderExt, SerialPortType, SerialStream};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -100,6 +101,20 @@ enum Commands {
         allow_control: bool,
         #[arg(long)]
         allow_rf_risk: bool,
+    },
+    TestPgxlDirect {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 9008)]
+        port: u16,
+    },
+    PgxlTriggerLab {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value = "pgxl_paired")]
+        profile: String,
+        #[arg(long)]
+        duration_minutes: f64,
     },
     SerialProbeBatch {
         #[arg(long)]
@@ -254,6 +269,20 @@ async fn main() -> Result<()> {
                 test_kat(&cfg, allow_control, allow_rf_risk).await
             })
             .await
+        }
+        Commands::TestPgxlDirect { host, port } => {
+            init_logging("debug");
+            test_pgxl_direct(&host, port).await
+        }
+        Commands::PgxlTriggerLab {
+            config,
+            profile,
+            duration_minutes,
+        } => {
+            let mut cfg = BridgeConfig::load(&config)?;
+            cfg.flex_injection.amplifier_status_profile = profile;
+            init_logging(&cfg.logging.level);
+            run_pgxl_trigger_lab(cfg, config, duration_minutes).await
         }
         Commands::SerialProbe {
             port,
@@ -462,6 +491,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             serial: cfg.flex_injection.serial.clone(),
             handle_label: cfg.flex_injection.handle.clone(),
             ant_map: cfg.flex_injection.ant_map.clone(),
+            amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
             full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
             create_meters: cfg.flex_injection.create_meters,
             create_interlock: cfg.flex_injection.create_interlock,
@@ -473,10 +503,44 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             tuner_refresh_interval: Duration::from_millis(
                 cfg.flex_injection.tuner_refresh_interval_ms,
             ),
+            amplifier_reannounce_interval: Duration::from_millis(
+                cfg.flex_injection.amplifier_reannounce_interval_ms,
+            ),
         };
         let state = state.clone();
         tokio::spawn(async move {
             flex_injection::run(settings, state).await;
+        });
+    }
+
+    if cfg.pgxl.enabled && cfg.flex_injection.enabled {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let mut guard = state.write().await;
+            if guard.flex_injection.amplifier_handle.is_some()
+                && guard.clients.pgxl_session_started_count == 0
+            {
+                guard.clients.pgxl_manual_connect_no_socket_attempt_count = guard
+                    .clients
+                    .pgxl_manual_connect_no_socket_attempt_count
+                    .saturating_add(1);
+                let warning = "pgxl_manual_connect_no_socket_attempt: amplifier is present but no TCP 9008 PGXL session has started".to_string();
+                guard.clients.pgxl_last_no_socket_attempt_warning = Some(warning.clone());
+                drop(guard);
+                append_evidence_line("warnings-errors.log", warning.clone());
+                append_evidence_json(
+                    "disconnect-events.jsonl",
+                    &serde_json::json!({
+                        "event": "pgxl_manual_connect_no_socket_attempt",
+                        "reason": warning,
+                    }),
+                );
+                warn!(
+                    event_id = "pgxl_manual_connect_no_socket_attempt",
+                    "Flex amplifier is present but no PGXL TCP session started"
+                );
+            }
         });
     }
 
@@ -608,6 +672,97 @@ async fn run_evidence_test(
     Ok(())
 }
 
+async fn run_pgxl_trigger_lab(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start("pgxl-trigger-lab", &config_path, &cfg, std::env::args())?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let duration = Duration::from_secs_f64(duration_minutes * 60.0);
+    let started = Instant::now();
+    tokio::time::sleep(duration).await;
+    sampler.abort();
+    let guard = state.read().await;
+    let analysis = format!(
+        "# PGXL Trigger Lab\n\nProfile: `{}`\n\nPGXL sessions started: {}\nPGXL active clients: {}\nNo-socket warnings: {}\nLast no-socket warning: {}\nAmplifier handle: {:?}\nAmplifier reannounce count: {}\nDirect connect expected: {:?}\n",
+        cfg.flex_injection.amplifier_status_profile,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard.clients.pgxl_manual_connect_no_socket_attempt_count,
+        guard
+            .clients
+            .pgxl_last_no_socket_attempt_warning
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.amplifier_handle,
+        guard.flex_injection.amplifier_reannounce_count,
+        guard.flex_injection.amplifier_direct_connect_expected,
+    );
+    drop(guard);
+    tokio::fs::write(evidence.dir().join("pgxl-trigger-analysis.md"), analysis).await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "PGXL trigger lab complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
+async fn test_pgxl_direct(host: &str, port: u16) -> Result<()> {
+    let log_path = PathBuf::from("logs")
+        .join("tests")
+        .join(format!("{}-pgxl-direct-selftest.log", timestamp_compact()));
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let addr = format!("{host}:{port}");
+    let mut log = format!("PGXL direct self-test target={addr}\n");
+    let stream = TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("failed to connect to PGXL direct endpoint at {addr}"))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let greeting = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+        .await
+        .context("timed out waiting for PGXL greeting")??
+        .context("PGXL closed before greeting")?;
+    log.push_str(&format!("RX {greeting}\n"));
+    if !greeting.starts_with('V') {
+        anyhow::bail!("PGXL greeting did not start with V: {greeting}");
+    }
+    for (seq, command) in [
+        (1_u32, "info"),
+        (2, "status"),
+        (3, "standby"),
+        (4, "operate"),
+    ] {
+        let line = format!("C{seq}|{command}\n");
+        log.push_str(&format!("TX {}", line.trim_end()));
+        log.push('\n');
+        writer.write_all(line.as_bytes()).await?;
+        let response = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .with_context(|| format!("timed out waiting for response to {command}"))??
+            .with_context(|| format!("PGXL closed before response to {command}"))?;
+        log.push_str(&format!("RX {response}\n"));
+        if !response.starts_with(&format!("R{seq}|")) {
+            anyhow::bail!("unexpected PGXL response for {command}: {response}");
+        }
+    }
+    tokio::fs::write(&log_path, &log).await?;
+    append_evidence_line("pgxl-direct-selftest.log", log.clone());
+    println!("PGXL direct self-test passed: {addr}");
+    println!("log: {}", log_path.display());
+    Ok(())
+}
+
 async fn write_stability_report(
     state: &SharedState,
     elapsed: Duration,
@@ -702,6 +857,10 @@ impl EvidenceRun {
             "flex-tx.log",
             "pgxl-protocol.log",
             "tgxl-protocol.log",
+            "amplifier-status-lines.log",
+            "amplifier-reannounce.log",
+            "pgxl-direct-selftest.log",
+            "pgxl-trigger-analysis.md",
             "kpa500-serial.log",
             "kat500-serial.log",
             "client-sessions.jsonl",
@@ -883,6 +1042,20 @@ async fn evidence_summary_markdown(state: &SharedState, elapsed: Option<Duration
     body.push_str(&format!(
         "- PGXL/TGXL sessions started: {}/{}\n",
         guard.clients.pgxl_session_started_count, guard.clients.tgxl_session_started_count
+    ));
+    body.push_str(&format!(
+        "- PGXL no-socket warnings: {} ({})\n",
+        guard.clients.pgxl_manual_connect_no_socket_attempt_count,
+        guard
+            .clients
+            .pgxl_last_no_socket_attempt_warning
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Amplifier reannounce/direct-expected: {}/{:?}\n",
+        guard.flex_injection.amplifier_reannounce_count,
+        guard.flex_injection.amplifier_direct_connect_expected
     ));
     body.push_str(&format!(
         "- Last PGXL/TGXL disconnect: {}/{}\n",
@@ -1272,11 +1445,15 @@ async fn status_json(state: &SharedState) -> String {
             "tgxl_sessions": guard.clients.tgxl_sessions,
             "pgxl_last_disconnect_reason": guard.clients.pgxl_last_disconnect_reason,
             "tgxl_last_disconnect_reason": guard.clients.tgxl_last_disconnect_reason,
+            "pgxl_manual_connect_no_socket_attempt_count": guard.clients.pgxl_manual_connect_no_socket_attempt_count,
+            "pgxl_last_no_socket_attempt_warning": guard.clients.pgxl_last_no_socket_attempt_warning,
         },
         "flex_injection": guard.flex_injection,
         "flex_diagnostics": {
             "ping_count": guard.flex_injection.ping_count,
+            "ping_ack_count": guard.flex_injection.ping_ack_count,
             "ping_failures": guard.flex_injection.ping_failure_count,
+            "last_ping_latency_ms": guard.flex_injection.last_ping_latency_ms,
             "pending_count": guard.flex_injection.pending_count,
             "expired_pending_count": guard.flex_injection.expired_pending_count,
             "degraded_reason": guard.flex_injection.degraded_reason,
@@ -1287,8 +1464,10 @@ async fn status_json(state: &SharedState) -> String {
             "registration_refresh_count": guard.flex_injection.tuner_registration_refresh_count,
             "tuner_presence_expired_count": guard.flex_injection.tuner_presence_expired_count,
             "tuner_reannounce_count": guard.flex_injection.tuner_reannounce_count,
+            "amplifier_reannounce_count": guard.flex_injection.amplifier_reannounce_count,
+            "amplifier_direct_connect_expected": guard.flex_injection.amplifier_direct_connect_expected,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
-            "amplifier_presence_age_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
+            "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
         },
         "protocol": guard.protocol,
     })

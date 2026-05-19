@@ -766,6 +766,28 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "PGXL expected direct",
+                    status
+                        .flex_diagnostics
+                        .amplifier_direct_connect_expected
+                        .map(|value| bool_text(Some(value)))
+                        .unwrap_or("unknown"),
+                );
+                field(
+                    ui,
+                    "PGXL no socket",
+                    format!(
+                        "{} {}",
+                        status.clients.pgxl_manual_connect_no_socket_attempt_count,
+                        status
+                            .clients
+                            .pgxl_last_no_socket_attempt_warning
+                            .as_deref()
+                            .unwrap_or("")
+                    ),
+                );
+                field(
+                    ui,
                     "Meters",
                     status
                         .flex_injection
@@ -1010,9 +1032,30 @@ impl GuiApp {
             text_field(ui, "Amplifier model", &mut self.config.flex_injection.amplifier_model);
             text_field(ui, "Serial", &mut self.config.flex_injection.serial);
             text_field(ui, "Antenna map", &mut self.config.flex_injection.ant_map);
+            egui::ComboBox::from_label("PGXL status profile")
+                .selected_text(self.config.flex_injection.amplifier_status_profile.as_str())
+                .show_ui(ui, |ui| {
+                    for profile in [
+                        "minimal",
+                        "pgxl_paired",
+                        "pgxl_verbose",
+                        "aethersdr_force_direct",
+                    ] {
+                        ui.selectable_value(
+                            &mut self.config.flex_injection.amplifier_status_profile,
+                            profile.to_string(),
+                            profile,
+                        );
+                    }
+                });
             checkbox(ui, "Full PGXL registration", &mut self.config.flex_injection.full_pgxl_registration);
             checkbox(ui, "Create AMP meters", &mut self.config.flex_injection.create_meters);
             checkbox(ui, "Create AMP interlock", &mut self.config.flex_injection.create_interlock);
+            u64_field(
+                ui,
+                "Amplifier reannounce interval ms",
+                &mut self.config.flex_injection.amplifier_reannounce_interval_ms,
+            );
             u64_field(
                 ui,
                 "Tuner refresh interval ms",
@@ -1057,6 +1100,32 @@ impl GuiApp {
                             "test-kat".into(),
                             "--config".into(),
                             self.config_path.display().to_string(),
+                        ],
+                    );
+                }
+                if ui.button("Run PGXL Direct Self-Test").clicked() {
+                    self.run_egb_command(
+                        "pgxl-direct-selftest",
+                        vec![
+                            "test-pgxl-direct".into(),
+                            "--host".into(),
+                            self.config.server.bind_ip.clone(),
+                            "--port".into(),
+                            self.config.pgxl.port.to_string(),
+                        ],
+                    );
+                }
+                if ui.button("Run PGXL Trigger Lab").clicked() {
+                    self.run_egb_command(
+                        "pgxl-trigger-lab",
+                        vec![
+                            "pgxl-trigger-lab".into(),
+                            "--config".into(),
+                            self.config_path.display().to_string(),
+                            "--profile".into(),
+                            self.config.flex_injection.amplifier_status_profile.clone(),
+                            "--duration-minutes".into(),
+                            "5".into(),
                         ],
                     );
                 }
@@ -1625,6 +1694,10 @@ struct ClientStatus {
     pgxl_last_disconnect_reason: Option<String>,
     #[serde(default)]
     tgxl_last_disconnect_reason: Option<String>,
+    #[serde(default)]
+    pgxl_manual_connect_no_socket_attempt_count: u64,
+    #[serde(default)]
+    pgxl_last_no_socket_attempt_warning: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1693,6 +1766,8 @@ struct FlexDiagnostics {
     smartsdr_tuner_last_disappearance_reason: Option<String>,
     #[serde(default)]
     flex_tuner_presence_age_ms: Option<u128>,
+    #[serde(default)]
+    amplifier_direct_connect_expected: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -121,9 +121,12 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
+  amplifier_status_profile: pgxl_paired
+  amplifier_reannounce_interval_ms: 5000
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
+  tuner_refresh_interval_ms: 5000
 ```
 
 Phase 19 `flex_injection` is a LAN/local-only registration client. It connects to the Flex radio TCP API on port `4992` and sends the documented PGXL-style amplifier registration sequence so the radio can advertise a `PowerGeniusXL`-compatible amplifier to AetherSDR/SmartSDR.
@@ -133,6 +136,10 @@ Phase 19 `flex_injection` is a LAN/local-only registration client. It connects t
 The configured `handle` is an EGB log/config label. The real Flex amplifier object handle is assigned by the radio and observed by AetherSDR through normal radio status.
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
+
+`amplifier_status_profile` controls PGXL trigger experiments. `minimal` and `pgxl_paired` stay conservative. `pgxl_verbose` and `aethersdr_force_direct` add unverified status-like fields to the amplifier create command and should be used only during isolated trigger lab runs.
+
+`amplifier_reannounce_interval_ms` controls the rate-limited amplifier refresh query and evidence logging. It does not create duplicate amplifier objects.
 
 This mode does not implement live radio-side meter value streaming, proxying, TLS, or WAN exposure. Operate remains RF-risk gated by `kpa500.allow_rf_risk`.
 

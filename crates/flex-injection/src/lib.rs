@@ -19,6 +19,7 @@ pub struct FlexInjectionSettings {
     pub serial: String,
     pub handle_label: String,
     pub ant_map: String,
+    pub amplifier_status_profile: String,
     pub full_pgxl_registration: bool,
     pub create_meters: bool,
     pub create_interlock: bool,
@@ -28,6 +29,7 @@ pub struct FlexInjectionSettings {
     pub ping_interval: Duration,
     pub tuner_presence_refresh: bool,
     pub tuner_refresh_interval: Duration,
+    pub amplifier_reannounce_interval: Duration,
 }
 
 impl FlexInjectionSettings {
@@ -38,6 +40,7 @@ impl FlexInjectionSettings {
             &self.amplifier_model,
             &self.serial,
             &self.ant_map,
+            &self.amplifier_status_profile,
         )
     }
 }
@@ -107,8 +110,9 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let registration = registration_commands(settings);
     let mut registration_sent = false;
     let mut next_seq = 1_u32;
-    let mut ping_timer = Box::pin(sleep(settings.ping_interval));
+    let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
+    let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
 
     loop {
         tokio::select! {
@@ -179,6 +183,38 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     log_amp_snapshot(&state).await;
                 }
                 ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
+            }
+            () = &mut amplifier_reannounce_timer => {
+                if registration_sent {
+                    send_tracked_command(
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                        PendingCommand::new(
+                            "amplifier_reannounce_refresh",
+                            "sub amplifier all",
+                            PendingKind::AmplifierReannounce,
+                        ),
+                    )
+                    .await?;
+                    let line = synthetic_amplifier_status_line(settings, session.amplifier_handle.as_deref());
+                    append_evidence_line("amplifier-reannounce.log", line.clone());
+                    append_evidence_line("amplifier-status-lines.log", line);
+                    {
+                        let mut guard = state.write().await;
+                        guard.flex_injection.amplifier_reannounce_count =
+                            guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
+                        guard.flex_injection.amplifier_direct_connect_expected =
+                            Some(!settings.amplifier_ip.is_loopback());
+                    }
+                    info!(
+                        event_id = "amplifier_presence_refreshed",
+                        profile = %settings.amplifier_status_profile,
+                        "Flex amplifier presence refresh query sent"
+                    );
+                }
+                amplifier_reannounce_timer.as_mut().reset(tokio::time::Instant::now() + settings.amplifier_reannounce_interval);
             }
             () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
                 if registration_sent {
@@ -373,12 +409,17 @@ impl FlexSession {
             }
             PendingKind::KeepaliveEnable
             | PendingKind::Subscription
+            | PendingKind::AmplifierReannounce
             | PendingKind::TunerPresenceRefresh => {}
             PendingKind::Ping => {
                 let mut guard = state.write().await;
                 if code == "0" {
                     guard.flex_injection.degraded_reason = None;
                     guard.flex_injection.connection_state = ConnectionState::Connected;
+                    guard.flex_injection.ping_ack_count =
+                        guard.flex_injection.ping_ack_count.saturating_add(1);
+                    guard.flex_injection.last_ping_latency_ms =
+                        Some(duration_millis_u64(pending.created_at.elapsed()));
                 } else {
                     guard.flex_injection.ping_failure_count =
                         guard.flex_injection.ping_failure_count.saturating_add(1);
@@ -421,6 +462,7 @@ impl FlexSession {
 async fn set_amplifier_handle(state: &SharedState, handle: &str) {
     let mut guard = state.write().await;
     guard.flex_injection.amplifier_handle = Some(handle.to_string());
+    guard.flex_injection.amplifier_last_seen_at = Some(SystemTime::now());
 }
 
 async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
@@ -579,6 +621,7 @@ enum PendingKind {
     InterlockCreate,
     KeepaliveEnable,
     Subscription,
+    AmplifierReannounce,
     TunerPresenceRefresh,
     Ping,
 }
@@ -701,13 +744,51 @@ pub fn amplifier_create_command(
     model: &str,
     serial: &str,
     ant_map: &str,
+    profile: &str,
 ) -> String {
-    format!(
+    let mut command = format!(
         "amplifier create ip={amplifier_ip} port={amplifier_port} model={} serial_num={} ant={}",
         sanitize_token(model),
         sanitize_token(serial),
         sanitize_token(ant_map)
-    )
+    );
+    match profile {
+        "pgxl_verbose" => {
+            command.push_str(" state=STANDBY connected=1 configured=1 enabled=1");
+        }
+        "aethersdr_force_direct" => {
+            command.push_str(" state=STANDBY connected=1 configured=1 enabled=1 direct=1 lan=1");
+        }
+        _ => {}
+    }
+    command
+}
+
+fn synthetic_amplifier_status_line(
+    settings: &FlexInjectionSettings,
+    handle: Option<&str>,
+) -> String {
+    let handle = handle.unwrap_or("unknown");
+    let mut line = format!(
+        "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state=STANDBY",
+        sanitize_token(&settings.amplifier_model),
+        settings.amplifier_ip,
+        settings.amplifier_port,
+        sanitize_token(&settings.serial),
+        sanitize_token(&settings.ant_map)
+    );
+    match settings.amplifier_status_profile.as_str() {
+        "pgxl_verbose" => line.push_str(" connected=1 configured=1 enabled=1"),
+        "aethersdr_force_direct" => {
+            line.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1")
+        }
+        _ => {}
+    }
+    line
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 pub fn registration_command_lines(settings: &FlexInjectionSettings) -> Vec<String> {
@@ -830,6 +911,7 @@ mod tests {
             "PowerGeniusXL",
             "EGB-KPA500",
             "ANT1:PORTA,ANT2:NONE",
+            "minimal",
         );
         assert_eq!(
             cmd,
@@ -845,6 +927,7 @@ mod tests {
             "Power Genius|XL",
             "EGB KPA500",
             "ANT1:PORTA, ANT2:NONE",
+            "minimal",
         );
         assert!(cmd.contains("model=PowerGeniusXL"));
         assert!(cmd.contains("serial_num=EGBKPA500"));
@@ -928,6 +1011,7 @@ mod tests {
             serial: "EGB-KPA500".to_string(),
             handle_label: "amp_1".to_string(),
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "pgxl_paired".to_string(),
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -937,6 +1021,7 @@ mod tests {
             ping_interval: Duration::from_millis(30000),
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
         };
         let commands = registration_command_lines(&settings);
         assert_eq!(

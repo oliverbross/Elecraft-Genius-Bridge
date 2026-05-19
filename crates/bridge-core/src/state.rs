@@ -319,9 +319,15 @@ pub struct FlexInjectionState {
     pub tuner_registration_refresh_count: u64,
     pub tuner_presence_expired_count: u64,
     pub tuner_reannounce_count: u64,
+    pub amplifier_reannounce_count: u64,
+    pub amplifier_direct_connect_expected: Option<bool>,
+    pub ping_ack_count: u64,
+    pub last_ping_latency_ms: Option<u64>,
     pub last_tuner_disappearance_reason: Option<String>,
     #[serde(skip)]
     pub tuner_last_seen_at: Option<SystemTime>,
+    #[serde(skip)]
+    pub amplifier_last_seen_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +366,8 @@ pub struct ClientState {
     pub tgxl_sessions: Vec<ProtocolClientSession>,
     pub pgxl_last_disconnect_reason: Option<String>,
     pub tgxl_last_disconnect_reason: Option<String>,
+    pub pgxl_manual_connect_no_socket_attempt_count: u64,
+    pub pgxl_last_no_socket_attempt_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

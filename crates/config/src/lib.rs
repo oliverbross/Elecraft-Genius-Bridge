@@ -331,6 +331,8 @@ pub struct FlexInjectionConfig {
     pub full_pgxl_registration: bool,
     pub create_meters: bool,
     pub create_interlock: bool,
+    pub amplifier_status_profile: String,
+    pub amplifier_reannounce_interval_ms: u64,
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
     pub ping_interval_ms: u64,
@@ -352,6 +354,12 @@ impl FlexInjectionConfig {
         validate_nonempty_token("flex_injection.serial", &self.serial)?;
         validate_nonempty_token("flex_injection.handle", &self.handle)?;
         validate_nonempty_token("flex_injection.ant_map", &self.ant_map)?;
+        self.validate_status_profile()?;
+        if self.amplifier_reannounce_interval_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "flex_injection.amplifier_reannounce_interval_ms must be > 0".to_string(),
+            ));
+        }
         if self.reconnect_initial_ms == 0 {
             return Err(ConfigError::Invalid(
                 "flex_injection.reconnect_initial_ms must be > 0".to_string(),
@@ -374,6 +382,15 @@ impl FlexInjectionConfig {
         }
         Ok(())
     }
+
+    fn validate_status_profile(&self) -> Result<(), ConfigError> {
+        match self.amplifier_status_profile.as_str() {
+            "minimal" | "pgxl_paired" | "pgxl_verbose" | "aethersdr_force_direct" => Ok(()),
+            other => Err(ConfigError::Invalid(format!(
+                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, aethersdr_force_direct; got {other}"
+            ))),
+        }
+    }
 }
 
 impl Default for FlexInjectionConfig {
@@ -391,6 +408,8 @@ impl Default for FlexInjectionConfig {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            amplifier_status_profile: "pgxl_paired".to_string(),
+            amplifier_reannounce_interval_ms: 5000,
             reconnect_initial_ms: 1000,
             reconnect_max_ms: 30000,
             ping_interval_ms: 30000,

@@ -74,6 +74,8 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
+  amplifier_status_profile: pgxl_paired
+  amplifier_reannounce_interval_ms: 5000
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
