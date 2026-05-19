@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bridge_core::{
-    append_evidence_line, push_capability, AmpOperatingState, ConnectionState, SharedState,
+    append_evidence_json, append_evidence_line, push_capability, AmpOperatingState,
+    ConnectionState, SharedState,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -480,6 +481,32 @@ impl Kpa500Driver {
             allow_rf_risk = self.settings.allow_rf_risk,
             "mapping PGXL/Flex amplifier control to KPA500"
         );
+        if self.settings.dry_run && command.safety != CommandSafety::ReadOnly {
+            let mut guard = self.state.write().await;
+            guard.controls.last_mapped_elecraft_action = Some(format!("KPA500 {}", command.wire));
+            guard.controls.last_safety_decision =
+                Some("blocked_by_dry_run: kpa500.dry_run=true".to_string());
+            guard.controls.blocked_by_dry_run_count =
+                guard.controls.blocked_by_dry_run_count.saturating_add(1);
+            drop(guard);
+            append_evidence_json(
+                "control-events.jsonl",
+                &serde_json::json!({
+                    "device": "KPA500",
+                    "command": command.label,
+                    "wire": command.wire,
+                    "safety": format!("{:?}", command.safety),
+                    "decision": "blocked_by_dry_run",
+                }),
+            );
+            append_evidence_line(
+                "pgxl-control-commands.log",
+                format!(
+                    "KPA500 {} {} blocked_by_dry_run",
+                    command.label, command.wire
+                ),
+            );
+        }
         let result = self
             .send_ackless_verified(port, transcript, command, operate)
             .await?;

@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use bridge_core::{append_evidence_line, push_capability, ConnectionState, SharedState};
+use bridge_core::{
+    append_evidence_json, append_evidence_line, push_capability, ConnectionState, SharedState,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::fs::{create_dir_all, File};
@@ -171,6 +173,7 @@ pub struct Kat500Settings {
     pub polling_interval: Duration,
     pub mock: bool,
     pub dry_run: bool,
+    pub allow_rf_risk: bool,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
 }
@@ -264,6 +267,17 @@ impl Kat500Driver {
                     }
                     self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
+                        if let Err(err) = self
+                            .process_desired_control(&mut port, &mut transcript)
+                            .await
+                        {
+                            warn!(
+                                event_id = "command_blocked_by_safety",
+                                device = "KAT500",
+                                error = %err,
+                                "KAT500 desired control request was not applied"
+                            );
+                        }
                         if let Err(err) = self.poll_status_on_port(&mut port, &mut transcript).await
                         {
                             warn!(event_id = "serial_disconnected", device = "KAT500", error = %err, "KAT500 poll failed; reconnecting");
@@ -412,6 +426,134 @@ impl Kat500Driver {
         Ok(())
     }
 
+    async fn process_desired_control(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) -> Result<()> {
+        let (autotune, antenna, bypass, manual) = {
+            let mut guard = self.state.write().await;
+            (
+                std::mem::take(&mut guard.desired.tuner_autotune_requested),
+                guard.desired.tuner_selected_antenna.take(),
+                guard.desired.tuner_bypass.take(),
+                guard.desired.tuner_manual_tune.take(),
+            )
+        };
+
+        if autotune {
+            self.apply_desired_command(
+                port,
+                transcript,
+                CMD_AUTOTUNE,
+                "TGXL autotune -> KAT500 T;",
+            )
+            .await?;
+        }
+        if let Some(antenna) = antenna {
+            let command = antenna_command(antenna);
+            self.apply_desired_command(
+                port,
+                transcript,
+                command,
+                &format!("TGXL activate ant={antenna} -> KAT500 {}", command.wire),
+            )
+            .await?;
+        }
+        if let Some(bypass) = bypass {
+            let command = if bypass {
+                CMD_BYPASS_ON
+            } else {
+                CMD_BYPASS_OFF
+            };
+            self.apply_desired_command(
+                port,
+                transcript,
+                command,
+                &format!("TGXL bypass={bypass} -> KAT500 {}", command.wire),
+            )
+            .await?;
+        }
+        if let Some(manual) = manual {
+            let mut guard = self.state.write().await;
+            guard.controls.last_mapped_elecraft_action = Some(format!(
+                "KAT500 manual tune relay={} move={} unverified",
+                manual.relay, manual.movement
+            ));
+            guard.controls.last_safety_decision =
+                Some("blocked_unknown_destructive_manual_tune_mapping".to_string());
+            drop(guard);
+            append_evidence_json(
+                "control-events.jsonl",
+                &serde_json::json!({
+                    "device": "KAT500",
+                    "command": "manual_tune_relay_move",
+                    "relay": manual.relay,
+                    "movement": manual.movement,
+                    "decision": "blocked_unknown_destructive_manual_tune_mapping",
+                }),
+            );
+            append_evidence_line(
+                "tgxl-control-commands.log",
+                format!(
+                    "KAT500 manual tune relay={} move={} blocked_unknown_destructive_manual_tune_mapping",
+                    manual.relay, manual.movement
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    async fn apply_desired_command(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+        command: ElecraftCommand,
+        action: &str,
+    ) -> Result<()> {
+        let decision = if self.settings.dry_run && command.safety != CommandSafety::ReadOnly {
+            "blocked_by_dry_run"
+        } else if command.safety == CommandSafety::RfRisk && !self.settings.allow_rf_risk {
+            "blocked_by_rf_risk"
+        } else {
+            "accepted"
+        };
+        {
+            let mut guard = self.state.write().await;
+            guard.controls.last_mapped_elecraft_action = Some(action.to_string());
+            guard.controls.last_safety_decision = Some(decision.to_string());
+            match decision {
+                "blocked_by_dry_run" => {
+                    guard.controls.blocked_by_dry_run_count =
+                        guard.controls.blocked_by_dry_run_count.saturating_add(1);
+                }
+                "blocked_by_rf_risk" => {
+                    guard.controls.blocked_by_rf_risk_count =
+                        guard.controls.blocked_by_rf_risk_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        append_evidence_json(
+            "control-events.jsonl",
+            &serde_json::json!({
+                "device": "KAT500",
+                "command": command.label,
+                "wire": command.wire,
+                "safety": format!("{:?}", command.safety),
+                "mapped_action": action,
+                "decision": decision,
+            }),
+        );
+        append_evidence_line(
+            "tgxl-control-commands.log",
+            format!("KAT500 {} {} {decision}", command.label, command.wire),
+        );
+        self.ensure_can_send(command)?;
+        send_command(port, command, Duration::from_secs(5), transcript).await?;
+        Ok(())
+    }
+
     pub async fn set_antenna(&self, antenna: u8) -> Result<()> {
         let command = antenna_command(antenna);
         self.ensure_can_send(command)?;
@@ -492,6 +634,19 @@ impl Kat500Driver {
                 "KAT500 dry-run blocked {} ({:?})",
                 command.label,
                 command.safety
+            );
+        }
+        if command.safety == CommandSafety::RfRisk && !self.settings.allow_rf_risk {
+            warn!(
+                event_id = "blocked_rf_risk_control",
+                device = "KAT500",
+                command = command.label,
+                wire = command.wire,
+                "blocked RF-risk KAT500 command because allow_rf_risk is false"
+            );
+            anyhow::bail!(
+                "KAT500 RF-risk command {} requires allow_rf_risk",
+                command.label
             );
         }
         Ok(())

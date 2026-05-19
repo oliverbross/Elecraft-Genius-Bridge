@@ -198,7 +198,12 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         ),
                     )
                     .await?;
-                    let line = synthetic_amplifier_status_line(settings, session.amplifier_handle.as_deref());
+                    let line = synthetic_amplifier_status_line(
+                        settings,
+                        &state,
+                        session.amplifier_handle.as_deref(),
+                    )
+                    .await;
                     append_evidence_line("amplifier-reannounce.log", line.clone());
                     append_evidence_line("amplifier-status-lines.log", line);
                     {
@@ -562,6 +567,31 @@ async fn handle_amplifier_status(
     };
 
     if operate && !settings.allow_rf_risk {
+        {
+            let mut guard = state.write().await;
+            guard.controls.aethersdr_button_command_seen = true;
+            guard.controls.control_requested_count =
+                guard.controls.control_requested_count.saturating_add(1);
+            guard.controls.last_flex_amp_set_command = Some(status.raw.clone());
+            guard.controls.last_mapped_elecraft_action = Some("KPA500 ^OS1;".to_string());
+            guard.controls.last_safety_decision =
+                Some("blocked_by_rf_risk: allow_rf_risk=false".to_string());
+            guard.controls.blocked_by_rf_risk_count =
+                guard.controls.blocked_by_rf_risk_count.saturating_add(1);
+        }
+        append_evidence_json(
+            "control-events.jsonl",
+            &serde_json::json!({
+                "protocol": "Flex",
+                "raw": status.raw,
+                "mapped_action": "KPA500 ^OS1;",
+                "safety_decision": "blocked_by_rf_risk",
+            }),
+        );
+        append_evidence_line(
+            "flex-control-commands.log",
+            format!("RX {} -> KPA500 ^OS1; blocked_by_rf_risk", status.raw),
+        );
         warn!(
             event_id = "blocked_rf_risk_control",
             amplifier_handle = %status.handle,
@@ -581,10 +611,42 @@ async fn handle_amplifier_status(
 
     {
         let mut guard = state.write().await;
+        guard.controls.aethersdr_button_command_seen = true;
+        guard.controls.control_requested_count =
+            guard.controls.control_requested_count.saturating_add(1);
+        guard.controls.last_flex_amp_set_command = Some(status.raw.clone());
+        guard.controls.last_mapped_elecraft_action = Some(if operate {
+            "KPA500 ^OS1;".to_string()
+        } else {
+            "KPA500 ^OS0;".to_string()
+        });
+        guard.controls.last_safety_decision = Some("accepted_desired_state".to_string());
         if guard.desired.amp_operate != Some(operate) {
             guard.desired.amp_operate = Some(operate);
         }
     }
+    append_evidence_json(
+        "control-events.jsonl",
+        &serde_json::json!({
+            "protocol": "Flex",
+            "raw": status.raw,
+            "requested_operate": operate,
+            "mapped_action": if operate { "KPA500 ^OS1;" } else { "KPA500 ^OS0;" },
+            "safety_decision": "accepted_desired_state",
+        }),
+    );
+    append_evidence_line(
+        "flex-control-commands.log",
+        format!(
+            "RX {} -> {} accepted_desired_state",
+            status.raw,
+            if operate {
+                "KPA500 ^OS1;"
+            } else {
+                "KPA500 ^OS0;"
+            }
+        ),
+    );
     info!(
         event_id = "pgxl_control_mapping",
         amplifier_handle = %status.handle,
@@ -649,11 +711,7 @@ impl AmplifierStatus {
                 _ => None,
             };
         }
-        let state = self.value("state")?.to_ascii_uppercase();
-        Some(matches!(
-            state.as_str(),
-            "IDLE" | "OPERATE" | "TRANSMIT" | "TRANSMIT_A" | "TRANSMIT_B"
-        ))
+        None
     }
 
     fn tuner_disappearance_reason(&self) -> Option<&'static str> {
@@ -764,18 +822,33 @@ pub fn amplifier_create_command(
     command
 }
 
-fn synthetic_amplifier_status_line(
+async fn synthetic_amplifier_status_line(
     settings: &FlexInjectionSettings,
+    state: &SharedState,
     handle: Option<&str>,
 ) -> String {
     let handle = handle.unwrap_or("unknown");
+    let amp = {
+        let guard = state.read().await;
+        guard.amp.clone()
+    };
+    let state_value = if amp.is_connected() {
+        amp.state.pgxl_state()
+    } else {
+        "FAULT"
+    };
+    let fault = amp.fault.as_deref().unwrap_or("");
     let mut line = format!(
-        "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state=STANDBY",
+        "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state={} temp={:.1} id={:.1} fault={}",
         sanitize_token(&settings.amplifier_model),
         settings.amplifier_ip,
         settings.amplifier_port,
         sanitize_token(&settings.serial),
-        sanitize_token(&settings.ant_map)
+        sanitize_token(&settings.ant_map),
+        state_value,
+        amp.temperature_c,
+        amp.pa_current_amps,
+        sanitize_token(fault)
     );
     match settings.amplifier_status_profile.as_str() {
         "pgxl_verbose" => line.push_str(" connected=1 configured=1 enabled=1"),
@@ -958,7 +1031,7 @@ mod tests {
         let standby =
             parse_amplifier_status("S1A2B|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
                 .unwrap();
-        assert_eq!(standby.requested_operate(), Some(false));
+        assert_eq!(standby.requested_operate(), None);
     }
 
     #[test]

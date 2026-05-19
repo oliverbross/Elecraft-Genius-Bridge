@@ -1204,6 +1204,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bridge-core",
+ "serde_json",
  "tokio",
  "tokio-serial",
  "tracing",
@@ -1215,6 +1216,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bridge-core",
+ "serde_json",
  "tokio",
  "tokio-serial",
  "tracing",

@@ -6,6 +6,6 @@ pub use evidence::{append_evidence_json, append_evidence_line, evidence_dir, set
 pub use protocol::{parse_client_command, response_line, ClientCommand, ProtocolError};
 pub use state::{
     push_capability, AmpOperatingState, AmpState, Band, BridgeState, ClientState, ConnectionState,
-    DesiredState, FlexInjectionState, FlexMeterHandle, ManualTuneRequest, ProtocolClientSession,
-    ProtocolCounterSet, ProtocolCounters, SharedState, TunerState,
+    ControlDiagnostics, DesiredState, FlexInjectionState, FlexMeterHandle, ManualTuneRequest,
+    ProtocolClientSession, ProtocolCounterSet, ProtocolCounters, SharedState, TunerState,
 };

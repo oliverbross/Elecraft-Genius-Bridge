@@ -63,6 +63,12 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    ControlLab {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        duration_minutes: f64,
+    },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -192,14 +198,26 @@ async fn main() -> Result<()> {
         Commands::StabilityTest {
             config,
             duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test("stability-test", cfg, config, duration_minutes).await
         }
-        | Commands::EvidenceTest {
+        Commands::EvidenceTest {
             config,
             duration_minutes,
         } => {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
-            run_evidence_test(cfg, config, duration_minutes).await
+            run_evidence_test("evidence-test", cfg, config, duration_minutes).await
+        }
+        Commands::ControlLab {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test("control-lab", cfg, config, duration_minutes).await
         }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
@@ -388,6 +406,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
                 mock: cfg.kat500.mock,
                 dry_run: cfg.kat500.dry_run,
+                allow_rf_risk: cfg.kat500.allow_rf_risk,
                 transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
                     .logging
@@ -446,6 +465,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 .map(PathBuf::from),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             aethersdr_compat: cfg.tgxl.aethersdr_compat || cfg.tgxl.smartsdr_compat,
+            control_profile: cfg.tgxl.control_profile.clone(),
             strict_emulation: cfg.tgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.tgxl.startup_delay_ms),
             force_presence_test: cfg.tgxl.force_presence_test,
@@ -620,6 +640,7 @@ async fn run_soak_test(cfg: BridgeConfig, config_path: PathBuf, duration_hours: 
 }
 
 async fn run_evidence_test(
+    mode: &str,
     cfg: BridgeConfig,
     config_path: PathBuf,
     duration_minutes: f64,
@@ -627,7 +648,7 @@ async fn run_evidence_test(
     if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
-    let evidence = EvidenceRun::start("evidence-test", &config_path, &cfg, std::env::args())?;
+    let evidence = EvidenceRun::start(mode, &config_path, &cfg, std::env::args())?;
     let state = start_bridge(&cfg).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
@@ -867,6 +888,11 @@ impl EvidenceRun {
             "disconnect-events.jsonl",
             "warnings-errors.log",
             "status-samples.jsonl",
+            "controls-analysis.md",
+            "control-events.jsonl",
+            "tgxl-control-commands.log",
+            "pgxl-control-commands.log",
+            "flex-control-commands.log",
         ] {
             File::create(dir.join(file))?;
         }
@@ -925,6 +951,8 @@ impl EvidenceRun {
         tokio::fs::write(self.dir.join("summary.md"), summary).await?;
         let analysis = protocol_analysis_markdown(state).await;
         tokio::fs::write(self.dir.join("pgxl-vs-tgxl-analysis.md"), analysis).await?;
+        let controls = controls_analysis_markdown(state).await;
+        tokio::fs::write(self.dir.join("controls-analysis.md"), controls).await?;
         zip_dir(&self.dir, &self.zip_path)?;
         println!("evidence bundle: {}", self.zip_path.display());
         Ok(self.zip_path.clone())
@@ -1184,6 +1212,78 @@ async fn protocol_analysis_markdown(state: &SharedState) -> String {
         likely_pgxl,
         likely_tgxl,
     )
+}
+
+async fn controls_analysis_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let mut body = String::from("# Controls Analysis\n\n");
+    body.push_str(&format!(
+        "- AetherSDR button command seen: {}\n",
+        guard.controls.aethersdr_button_command_seen
+    ));
+    body.push_str(&format!(
+        "- Control requests observed: {}\n",
+        guard.controls.control_requested_count
+    ));
+    body.push_str(&format!(
+        "- Last TGXL control command: {}\n",
+        guard
+            .controls
+            .last_tgxl_control_command
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Last PGXL control command: {}\n",
+        guard
+            .controls
+            .last_pgxl_control_command
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Last Flex amp set/status command: {}\n",
+        guard
+            .controls
+            .last_flex_amp_set_command
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Last mapped Elecraft action: {}\n",
+        guard
+            .controls
+            .last_mapped_elecraft_action
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Last safety decision: {}\n",
+        guard
+            .controls
+            .last_safety_decision
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Blocked by dry_run: {}\n- Blocked by RF-risk gate: {}\n",
+        guard.controls.blocked_by_dry_run_count, guard.controls.blocked_by_rf_risk_count
+    ));
+    body.push_str("\n## Interpretation\n\n");
+    if guard.controls.control_requested_count == 0 {
+        body.push_str("No control command reached EGB during this run. The likely issue is AetherSDR UI enablement/state fields rather than Elecraft serial control.\n");
+    } else if guard.controls.blocked_by_dry_run_count > 0
+        || guard.controls.blocked_by_rf_risk_count > 0
+    {
+        body.push_str(
+            "A control command reached EGB and was intentionally blocked by a safety gate.\n",
+        );
+    } else {
+        body.push_str(
+            "At least one control command reached EGB and was mapped to desired Elecraft state.\n",
+        );
+    }
+    body
 }
 
 fn zip_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -1449,6 +1549,7 @@ async fn status_json(state: &SharedState) -> String {
             "pgxl_last_no_socket_attempt_warning": guard.clients.pgxl_last_no_socket_attempt_warning,
         },
         "flex_injection": guard.flex_injection,
+        "controls": guard.controls,
         "flex_diagnostics": {
             "ping_count": guard.flex_injection.ping_count,
             "ping_ack_count": guard.flex_injection.ping_ack_count,
@@ -2177,6 +2278,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
             mock: cfg.kat500.mock,
             dry_run: cfg.kat500.dry_run,
+            allow_rf_risk: cfg.kat500.allow_rf_risk || allow_rf_risk,
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
                 .logging

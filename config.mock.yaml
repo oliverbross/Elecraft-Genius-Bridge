@@ -13,6 +13,7 @@ tgxl:
   enabled: true
   port: 9010
   aethersdr_compat: false
+  control_profile: readonly
   strict_emulation: true
   startup_delay_ms: 1500
   force_presence_test: true

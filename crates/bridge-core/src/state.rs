@@ -99,6 +99,7 @@ pub struct BridgeState {
     pub clients: ClientState,
     pub desired: DesiredState,
     pub protocol: ProtocolCounters,
+    pub controls: ControlDiagnostics,
 }
 
 impl Default for BridgeState {
@@ -112,6 +113,7 @@ impl Default for BridgeState {
             clients: ClientState::default(),
             desired: DesiredState::default(),
             protocol: ProtocolCounters::default(),
+            controls: ControlDiagnostics::default(),
         }
     }
 }
@@ -439,6 +441,19 @@ pub struct ManualTuneRequest {
 pub struct ProtocolCounters {
     pub pgxl: ProtocolCounterSet,
     pub tgxl: ProtocolCounterSet,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ControlDiagnostics {
+    pub aethersdr_button_command_seen: bool,
+    pub last_tgxl_control_command: Option<String>,
+    pub last_pgxl_control_command: Option<String>,
+    pub last_flex_amp_set_command: Option<String>,
+    pub last_mapped_elecraft_action: Option<String>,
+    pub last_safety_decision: Option<String>,
+    pub blocked_by_dry_run_count: u64,
+    pub blocked_by_rf_risk_count: u64,
+    pub control_requested_count: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

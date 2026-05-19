@@ -25,6 +25,7 @@ tgxl:
   enabled: true
   port: 9010
   aethersdr_compat: false
+  control_profile: readonly
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false
@@ -35,6 +36,8 @@ Set `aethersdr_compat: true` while diagnosing AetherSDR direct PGXL/TGXL behavio
 Set `strict_emulation: true` in mock mode to simulate a more realistic device startup sequence. The emulator sends the required `V` greeting immediately, but shared mock state reports transitional readiness until `startup_delay_ms` expires.
 
 Set `tgxl.force_presence_test: true` only for AetherSDR TUN applet activation testing. It makes the direct TGXL emulator publish the richest safe direct state currently understood, without changing KAT500 serial behaviour.
+
+Set `tgxl.control_profile` to `tgxl_control_ready` only for AetherSDR/SmartSDR control-button experiments. It reports a control-ready TGXL direct state while the serial driver still enforces `dry_run` and RF-risk gates. Valid values are `readonly`, `tgxl_control_ready`, and `tgxl_verbose_control`.
 
 ## Elecraft Devices
 

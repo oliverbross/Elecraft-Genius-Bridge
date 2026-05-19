@@ -788,6 +788,47 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "Button command seen",
+                    bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                );
+                field(
+                    ui,
+                    "Last TGXL control",
+                    status
+                        .controls
+                        .last_tgxl_control_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Last PGXL control",
+                    status
+                        .controls
+                        .last_pgxl_control_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Last Flex amp set",
+                    status
+                        .controls
+                        .last_flex_amp_set_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Safety blocks",
+                    format!(
+                        "dry_run {} / RF {}",
+                        status.controls.blocked_by_dry_run_count,
+                        status.controls.blocked_by_rf_risk_count
+                    ),
+                );
+                field(
+                    ui,
                     "Meters",
                     status
                         .flex_injection
@@ -1263,6 +1304,74 @@ impl GuiApp {
             });
             ui.separator();
             ui.group(|ui| {
+                ui.heading("Control Path");
+                field(
+                    ui,
+                    "AetherSDR button command seen",
+                    bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                );
+                field(
+                    ui,
+                    "Requests",
+                    status.controls.control_requested_count.to_string(),
+                );
+                field(
+                    ui,
+                    "Last TGXL control command",
+                    status
+                        .controls
+                        .last_tgxl_control_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Last PGXL control command",
+                    status
+                        .controls
+                        .last_pgxl_control_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Last Flex amp set command",
+                    status
+                        .controls
+                        .last_flex_amp_set_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Mapped Elecraft action",
+                    status
+                        .controls
+                        .last_mapped_elecraft_action
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Safety decision",
+                    status
+                        .controls
+                        .last_safety_decision
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Blocked dry_run/RF",
+                    format!(
+                        "{}/{}",
+                        status.controls.blocked_by_dry_run_count,
+                        status.controls.blocked_by_rf_risk_count
+                    ),
+                );
+            });
+            ui.separator();
+            ui.group(|ui| {
                 ui.heading("Clients And Runtime");
                 field(
                     ui,
@@ -1614,6 +1723,8 @@ struct StatusSnapshot {
     clients: ClientStatus,
     flex_injection: FlexStatus,
     #[serde(default)]
+    controls: ControlStatus,
+    #[serde(default)]
     flex_diagnostics: FlexDiagnostics,
 }
 
@@ -1768,6 +1879,28 @@ struct FlexDiagnostics {
     flex_tuner_presence_age_ms: Option<u128>,
     #[serde(default)]
     amplifier_direct_connect_expected: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct ControlStatus {
+    #[serde(default)]
+    aethersdr_button_command_seen: bool,
+    #[serde(default)]
+    last_tgxl_control_command: Option<String>,
+    #[serde(default)]
+    last_pgxl_control_command: Option<String>,
+    #[serde(default)]
+    last_flex_amp_set_command: Option<String>,
+    #[serde(default)]
+    last_mapped_elecraft_action: Option<String>,
+    #[serde(default)]
+    last_safety_decision: Option<String>,
+    #[serde(default)]
+    blocked_by_dry_run_count: u64,
+    #[serde(default)]
+    blocked_by_rf_risk_count: u64,
+    #[serde(default)]
+    control_requested_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -64,6 +64,7 @@ impl BridgeConfig {
         validate_port("pgxl.port", self.pgxl.port)?;
         validate_port("tgxl.port", self.tgxl.port)?;
         self.pgxl.validate()?;
+        self.tgxl.validate()?;
         if self.metrics.enabled {
             self.metrics.bind_ip.parse::<IpAddr>().map_err(|_| {
                 ConfigError::Invalid(format!(
@@ -182,10 +183,22 @@ pub struct TgxlConfig {
     pub port: u16,
     pub aethersdr_compat: bool,
     pub smartsdr_compat: bool,
+    pub control_profile: String,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
     pub force_presence_test: bool,
     pub experimental_presence_refresh: bool,
+}
+
+impl TgxlConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        match self.control_profile.as_str() {
+            "readonly" | "tgxl_control_ready" | "tgxl_verbose_control" => Ok(()),
+            other => Err(ConfigError::Invalid(format!(
+                "tgxl.control_profile must be one of readonly, tgxl_control_ready, tgxl_verbose_control; got {other}"
+            ))),
+        }
+    }
 }
 
 impl Default for TgxlConfig {
@@ -195,6 +208,7 @@ impl Default for TgxlConfig {
             port: 9010,
             aethersdr_compat: false,
             smartsdr_compat: false,
+            control_profile: "readonly".to_string(),
             strict_emulation: false,
             startup_delay_ms: 0,
             force_presence_test: false,

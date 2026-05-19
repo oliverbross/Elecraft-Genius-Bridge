@@ -20,6 +20,7 @@ pub struct EmulatorOptions {
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
     pub aethersdr_compat: bool,
+    pub control_profile: String,
     pub strict_emulation: bool,
     pub startup_delay: Duration,
     pub force_presence_test: bool,
@@ -56,7 +57,7 @@ pub async fn replay_line(
     state: &SharedState,
 ) -> Result<Vec<String>, bridge_core::ProtocolError> {
     let cmd = parse_client_command(line)?;
-    let outcome = handle_command(cmd.seq, &cmd.command, state, false).await;
+    let outcome = handle_command(cmd.seq, &cmd.command, state, false, "readonly").await;
     let mut lines = vec![outcome.response];
     lines.extend(outcome.pushes);
     Ok(lines)
@@ -169,9 +170,14 @@ async fn handle_client(
                     stats.observe_command(&cmd.command);
                     update_tgxl_session_command(&state, session_id, &cmd.command).await;
                     let command_started = Instant::now();
-                    let outcome =
-                        handle_command(cmd.seq, &cmd.command, &state, options.aethersdr_compat)
-                            .await;
+                    let outcome = handle_command(
+                        cmd.seq,
+                        &cmd.command,
+                        &state,
+                        options.aethersdr_compat,
+                        &options.control_profile,
+                    )
+                    .await;
                     if outcome.unknown {
                         stats.unknown_commands += 1;
                         update_tgxl_session_unknown(&state, session_id).await;
@@ -325,23 +331,48 @@ async fn handle_command(
     command: &str,
     state: &SharedState,
     aethersdr_compat: bool,
+    control_profile: &str,
 ) -> CommandOutcome {
     match command {
         "info" => CommandOutcome::ok(response_line(seq, 0, info_body(aethersdr_compat))),
         "status" => CommandOutcome::ok(response_line(
             seq,
             0,
-            status_body(state, aethersdr_compat).await,
+            status_body(state, aethersdr_compat, control_profile).await,
         )),
         "autotune" => {
             {
                 let mut guard = state.write().await;
+                guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.control_requested_count =
+                    guard.controls.control_requested_count.saturating_add(1);
+                guard.controls.last_tgxl_control_command = Some(command.to_string());
+                guard.controls.last_mapped_elecraft_action = Some("KAT500 T;".to_string());
+                guard.controls.last_safety_decision =
+                    Some("desired_autotune_requested".to_string());
                 guard.desired.tuner_autotune_requested = true;
             }
-            let pushes = vec![state_push(state, aethersdr_compat).await];
+            append_evidence_json(
+                "control-events.jsonl",
+                &serde_json::json!({
+                    "protocol": "TGXL",
+                    "raw": command,
+                    "mapped_action": "KAT500 T;",
+                    "safety_decision": "desired_autotune_requested",
+                }),
+            );
+            append_evidence_line(
+                "tgxl-control-commands.log",
+                format!("RX {command} -> KAT500 T; desired_autotune_requested"),
+            );
+            let pushes = vec![state_push(state, aethersdr_compat, control_profile).await];
             sleep(Duration::from_millis(800)).await;
             CommandOutcome::with_pushes(
-                response_line(seq, 0, status_body(state, aethersdr_compat).await),
+                response_line(
+                    seq,
+                    0,
+                    status_body(state, aethersdr_compat, control_profile).await,
+                ),
                 pushes,
             )
         }
@@ -353,14 +384,37 @@ async fn handle_command(
                 .filter(|n| (1..=3).contains(n));
             if let Some(ant) = ant {
                 let mut guard = state.write().await;
+                guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.control_requested_count =
+                    guard.controls.control_requested_count.saturating_add(1);
+                guard.controls.last_tgxl_control_command = Some(command.to_string());
+                guard.controls.last_mapped_elecraft_action = Some(format!("KAT500 AN{ant};"));
+                guard.controls.last_safety_decision = Some("desired_antenna_requested".to_string());
                 guard.desired.tuner_selected_antenna = Some(ant);
+                append_evidence_json(
+                    "control-events.jsonl",
+                    &serde_json::json!({
+                        "protocol": "TGXL",
+                        "raw": command,
+                        "mapped_action": format!("KAT500 AN{ant};"),
+                        "safety_decision": "desired_antenna_requested",
+                    }),
+                );
+                append_evidence_line(
+                    "tgxl-control-commands.log",
+                    format!("RX {command} -> KAT500 AN{ant}; desired_antenna_requested"),
+                );
                 CommandOutcome {
                     response: response_line(
                         seq,
                         0,
-                        status_body_from_tuner(&guard.tuner, aethersdr_compat),
+                        status_body_from_tuner(&guard.tuner, aethersdr_compat, control_profile),
                     ),
-                    pushes: vec![state_push_from_tuner(&guard.tuner, aethersdr_compat)],
+                    pushes: vec![state_push_from_tuner(
+                        &guard.tuner,
+                        aethersdr_compat,
+                        control_profile,
+                    )],
                     unknown: false,
                     unsupported: false,
                 }
@@ -377,8 +431,12 @@ async fn handle_command(
             let result = apply_relay_command(command, state).await;
             match result {
                 Ok(()) => CommandOutcome::with_pushes(
-                    response_line(seq, 0, status_body(state, aethersdr_compat).await),
-                    vec![state_push(state, aethersdr_compat).await],
+                    response_line(
+                        seq,
+                        0,
+                        status_body(state, aethersdr_compat, control_profile).await,
+                    ),
+                    vec![state_push(state, aethersdr_compat, control_profile).await],
                 ),
                 Err(error) => CommandOutcome {
                     response: response_line(seq, 2, format!("error={error}")),
@@ -456,23 +514,55 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
     }
 
     let mut guard = state.write().await;
+    guard.controls.aethersdr_button_command_seen = true;
+    guard.controls.control_requested_count =
+        guard.controls.control_requested_count.saturating_add(1);
+    guard.controls.last_tgxl_control_command = Some(command.to_string());
+    guard.controls.last_mapped_elecraft_action = Some(format!(
+        "KAT500 manual relay={} move={} (unverified)",
+        relay, movement
+    ));
+    guard.controls.last_safety_decision = Some("desired_manual_tune_requested".to_string());
     guard.desired.tuner_manual_tune = Some(ManualTuneRequest { relay, movement });
+    append_evidence_json(
+        "control-events.jsonl",
+        &serde_json::json!({
+            "protocol": "TGXL",
+            "raw": command,
+            "mapped_action": format!("KAT500 manual relay={relay} move={movement}"),
+            "safety_decision": "desired_manual_tune_requested",
+        }),
+    );
+    append_evidence_line(
+        "tgxl-control-commands.log",
+        format!("RX {command} -> KAT500 manual relay={relay} move={movement} desired_manual_tune_requested"),
+    );
     Ok(())
 }
 
-async fn status_body(state: &SharedState, aethersdr_compat: bool) -> String {
+async fn status_body(state: &SharedState, aethersdr_compat: bool, control_profile: &str) -> String {
     let guard = state.read().await;
-    status_body_from_tuner(&guard.tuner, aethersdr_compat)
+    status_body_from_tuner(&guard.tuner, aethersdr_compat, control_profile)
 }
 
-fn status_body_from_tuner(tuner: &bridge_core::TunerState, aethersdr_compat: bool) -> String {
+fn status_body_from_tuner(
+    tuner: &bridge_core::TunerState,
+    aethersdr_compat: bool,
+    control_profile: &str,
+) -> String {
     let fwd = watts_to_dbm(tuner.forward_power_watts);
     let swr = protocol_swr_value(tuner.swr);
     let degraded = matches!(
         tuner.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
     );
-    let operate = if aethersdr_compat {
+    let control_ready = matches!(
+        control_profile,
+        "tgxl_control_ready" | "tgxl_verbose_control"
+    );
+    let operate = if control_ready {
+        true
+    } else if aethersdr_compat {
         false
     } else {
         tuner.operate
@@ -501,15 +591,19 @@ fn status_body_from_tuner(tuner: &bridge_core::TunerState, aethersdr_compat: boo
     }
 }
 
-async fn state_push(state: &SharedState, aethersdr_compat: bool) -> String {
+async fn state_push(state: &SharedState, aethersdr_compat: bool, control_profile: &str) -> String {
     let guard = state.read().await;
-    state_push_from_tuner(&guard.tuner, aethersdr_compat)
+    state_push_from_tuner(&guard.tuner, aethersdr_compat, control_profile)
 }
 
-fn state_push_from_tuner(tuner: &bridge_core::TunerState, aethersdr_compat: bool) -> String {
+fn state_push_from_tuner(
+    tuner: &bridge_core::TunerState,
+    aethersdr_compat: bool,
+    control_profile: &str,
+) -> String {
     format!(
         "S0|state {}\n",
-        status_body_from_tuner(tuner, aethersdr_compat)
+        status_body_from_tuner(tuner, aethersdr_compat, control_profile)
     )
 }
 
@@ -866,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn status_contains_aethersdr_fields() {
         let state = shared_mock_state();
-        let body = status_body(&state, false).await;
+        let body = status_body(&state, false, "readonly").await;
         assert!(body.contains("operate=0"));
         assert!(body.contains("relayC1="));
         assert!(body.contains("one_by_three=1"));
@@ -891,7 +985,7 @@ mod tests {
     #[tokio::test]
     async fn golden_tgxl_mock_status_response_is_stable() {
         let state = shared_mock_state();
-        let body = status_body(&state, false).await;
+        let body = status_body(&state, false, "readonly").await;
         assert_eq!(
             response_line(2, 0, body),
             "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000 connection_state=connected fault=\n"
@@ -901,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn mock_status_reports_return_loss_not_swr_ratio() {
         let state = shared_mock_state();
-        let body = status_body(&state, false).await;
+        let body = status_body(&state, false, "readonly").await;
         assert!(body.contains("swr=-30.0000"));
         assert!(!body.contains("swr=32."));
     }
@@ -917,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn aethersdr_compat_status_removes_unverified_fields() {
         let state = shared_mock_state();
-        let body = status_body(&state, true).await;
+        let body = status_body(&state, true, "readonly").await;
         assert_eq!(
             response_line(2, 0, body),
             "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000\n"

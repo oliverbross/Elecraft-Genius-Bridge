@@ -316,7 +316,28 @@ async fn handle_command(
         // as desired-state requests for manual harness testing.
         "operate" => {
             let mut guard = state.write().await;
+            guard.controls.aethersdr_button_command_seen = true;
+            guard.controls.control_requested_count =
+                guard.controls.control_requested_count.saturating_add(1);
+            guard.controls.last_pgxl_control_command = Some(command.to_string());
+            guard.controls.last_mapped_elecraft_action = Some("KPA500 ^OS1;".to_string());
+            guard.controls.last_safety_decision = Some("desired_operate_requested".to_string());
             guard.desired.amp_operate = Some(true);
+            drop(guard);
+            append_evidence_json(
+                "control-events.jsonl",
+                &serde_json::json!({
+                    "protocol": "PGXL",
+                    "raw": command,
+                    "mapped_action": "KPA500 ^OS1;",
+                    "safety_decision": "desired_operate_requested",
+                }),
+            );
+            append_evidence_line(
+                "pgxl-control-commands.log",
+                format!("RX {command} -> KPA500 ^OS1; desired_operate_requested"),
+            );
+            let guard = state.read().await;
             CommandOutcome::ok(response_line(
                 seq,
                 0,
@@ -325,7 +346,28 @@ async fn handle_command(
         }
         "standby" => {
             let mut guard = state.write().await;
+            guard.controls.aethersdr_button_command_seen = true;
+            guard.controls.control_requested_count =
+                guard.controls.control_requested_count.saturating_add(1);
+            guard.controls.last_pgxl_control_command = Some(command.to_string());
+            guard.controls.last_mapped_elecraft_action = Some("KPA500 ^OS0;".to_string());
+            guard.controls.last_safety_decision = Some("desired_standby_requested".to_string());
             guard.desired.amp_operate = Some(false);
+            drop(guard);
+            append_evidence_json(
+                "control-events.jsonl",
+                &serde_json::json!({
+                    "protocol": "PGXL",
+                    "raw": command,
+                    "mapped_action": "KPA500 ^OS0;",
+                    "safety_decision": "desired_standby_requested",
+                }),
+            );
+            append_evidence_line(
+                "pgxl-control-commands.log",
+                format!("RX {command} -> KPA500 ^OS0; desired_standby_requested"),
+            );
+            let guard = state.read().await;
             CommandOutcome::ok(response_line(
                 seq,
                 0,
