@@ -15,6 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_CONFIG: &str = "config.flex-injection-readonly.yaml";
 const LOG_LIMIT: usize = 500;
 const GUI_SETTINGS_PATH: &str = "egb-gui-settings.yaml";
+const GUI_GIT_COMMIT: &str = env!("GIT_HASH");
+const GUI_BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP");
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
@@ -131,6 +133,9 @@ impl GuiApp {
                         });
                         self.push_log(format!("evidence bundle: {}", path.display()));
                     }
+                    if label == "version-check" {
+                        self.push_log(output.clone());
+                    }
                     if label.starts_with("stability-test") || label.starts_with("evidence-test") {
                         if output.contains("warning:") {
                             self.push_log(
@@ -233,7 +238,10 @@ impl GuiApp {
             return;
         }
         stop_stale_bridge_processes();
-        match self.bridge.start(&self.config_path, self.tx.clone()) {
+        match self
+            .bridge
+            .start(&self.config_path, self.config.metrics.port, self.tx.clone())
+        {
             Ok(()) => {
                 self.start_progress_open = true;
                 self.push_log("bridge process started");
@@ -251,6 +259,12 @@ impl GuiApp {
 
     fn restart_bridge(&mut self) {
         let _ = self.bridge.stop();
+        self.start_bridge();
+    }
+
+    fn clean_restart_bridge(&mut self) {
+        let _ = self.bridge.stop();
+        stop_stale_bridge_processes();
         self.start_bridge();
     }
 
@@ -542,6 +556,9 @@ impl GuiApp {
             {
                 self.restart_bridge();
             }
+            if ui.button("Clean restart bridge").clicked() {
+                self.clean_restart_bridge();
+            }
             if ui.button("Export Support Bundle").clicked() {
                 match self.export_diagnostics_bundle() {
                     Ok(path) => {
@@ -558,6 +575,18 @@ impl GuiApp {
                 egui::Color32::YELLOW,
                 format!("/status unavailable: {error}"),
             );
+        }
+        if let Some(status) = &self.status {
+            if !runtime_build_matches(status) {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!(
+                        "Runtime mismatch: GUI {} / bridge {}. Use Clean restart bridge.",
+                        GUI_GIT_COMMIT,
+                        status.bridge.git_commit.as_deref().unwrap_or("unknown")
+                    ),
+                );
+            }
         }
         self.ui_config_state_banner(ui);
         if let Some(status) = &self.status {
@@ -932,6 +961,14 @@ impl GuiApp {
                 ));
             } else {
                 ui.label("KAT500 control policy unavailable until /status is available.");
+            }
+            if let Some(status) = &self.status {
+                if !runtime_build_matches(status) {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "Runtime mismatch - controls disabled until a clean restart launches the matching egb.exe.",
+                    );
+                }
             }
         });
     }
@@ -2091,6 +2128,36 @@ impl GuiApp {
                     "Commit",
                     status.bridge.git_commit.as_deref().unwrap_or("unknown"),
                 );
+                field(ui, "GUI commit", GUI_GIT_COMMIT);
+                field(
+                    ui,
+                    "Bridge build",
+                    status
+                        .bridge
+                        .build_timestamp
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                );
+                field(ui, "GUI build", GUI_BUILD_TIMESTAMP);
+                field(
+                    ui,
+                    "Executable",
+                    status
+                        .bridge
+                        .executable_path
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                );
+                field(
+                    ui,
+                    "Working dir",
+                    status.bridge.working_dir.as_deref().unwrap_or("unknown"),
+                );
+                field(
+                    ui,
+                    "Runtime match",
+                    bool_text(Some(runtime_build_matches(status))),
+                );
                 field(
                     ui,
                     "PID",
@@ -2548,12 +2615,17 @@ impl BridgeProcess {
         }
     }
 
-    fn start(&mut self, config_path: &Path, tx: Sender<AsyncMessage>) -> Result<()> {
+    fn start(
+        &mut self,
+        config_path: &Path,
+        metrics_port: u16,
+        tx: Sender<AsyncMessage>,
+    ) -> Result<()> {
         let egb = find_egb_binary()?;
         let config_path = config_path
             .canonicalize()
             .with_context(|| format!("config path does not exist: {}", config_path.display()))?;
-        let mut child = Command::new(egb)
+        let mut child = Command::new(&egb)
             .arg("run")
             .arg("--config")
             .arg(&config_path)
@@ -2567,8 +2639,10 @@ impl BridgeProcess {
         if let Some(stderr) = child.stderr.take() {
             spawn_log_reader(stderr, tx);
         }
+        let pid = child.id();
         self.child = Some(child);
         self.state = ProcessState::Starting;
+        verify_status_pid(metrics_port, pid)?;
         Ok(())
     }
 
@@ -2655,7 +2729,13 @@ struct StatusSnapshot {
 struct BridgeStatus {
     version: Option<String>,
     git_commit: Option<String>,
+    #[serde(default)]
+    build_timestamp: Option<String>,
     process_id: Option<u32>,
+    #[serde(default)]
+    executable_path: Option<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
     uptime_ms: Option<u128>,
     config_path: Option<String>,
     #[serde(default)]
@@ -3002,7 +3082,9 @@ fn support_summary_text(status: &StatusSnapshot) -> String {
         Controls: kat_tune={} kpa_standby={} kpa_operate={}\n\
         PGXL lifecycle: {} - {}\n\
         Config path: {}\n\
-        Config hash match: {:?}\n",
+        Config hash match: {:?}\n\
+        Bridge executable: {}\n\
+        Bridge working dir: {}\n",
         status
             .bridge
             .process_id
@@ -3030,6 +3112,12 @@ fn support_summary_text(status: &StatusSnapshot) -> String {
         status.pgxl_lifecycle.reason,
         status.bridge.config_path.as_deref().unwrap_or("unknown"),
         status.bridge.config_hash_match,
+        status
+            .bridge
+            .executable_path
+            .as_deref()
+            .unwrap_or("unknown"),
+        status.bridge.working_dir.as_deref().unwrap_or("unknown"),
     )
 }
 
@@ -3120,6 +3208,7 @@ fn export_diagnostics_bundle(
         )?;
     }
     zip_text(&mut zip, options, "windows-info.txt", windows_info())?;
+    zip_text(&mut zip, options, "process-list.txt", process_list_text())?;
     zip_text(
         &mut zip,
         options,
@@ -3210,6 +3299,24 @@ fn windows_info() -> String {
     }
 }
 
+fn process_list_text() -> String {
+    #[cfg(windows)]
+    {
+        run_command_text(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Get-Process egb,egb-gui -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,Path,StartTime | Format-List",
+            ],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        run_command_text("ps", &["-ef"])
+    }
+}
+
 fn run_command_text(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
@@ -3247,6 +3354,32 @@ fn fetch_status(host: &str, port: u16) -> Result<StatusSnapshot> {
         .split_once("\r\n\r\n")
         .context("status endpoint returned malformed HTTP")?;
     serde_json::from_str(body).context("failed to parse status JSON")
+}
+
+fn verify_status_pid(port: u16, expected_pid: u32) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match fetch_status("127.0.0.1", port) {
+            Ok(status) if status.bridge.process_id == Some(expected_pid) => return Ok(()),
+            Ok(status) => {
+                last_error = Some(format!(
+                    "port {port} belongs to PID {:?}, expected {expected_pid}",
+                    status.bridge.process_id
+                ));
+            }
+            Err(err) => last_error = Some(err.to_string()),
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    anyhow::bail!(
+        "launched bridge PID {expected_pid}, but /status verification failed: {}",
+        last_error.unwrap_or_else(|| "no status response".to_string())
+    )
+}
+
+fn runtime_build_matches(status: &StatusSnapshot) -> bool {
+    status.bridge.git_commit.as_deref() == Some(GUI_GIT_COMMIT)
 }
 
 fn run_egb_capture(args: &[String]) -> Result<String> {
@@ -3296,16 +3429,10 @@ fn find_egb_binary() -> Result<PathBuf> {
     if adjacent.exists() {
         return Ok(adjacent);
     }
-    for candidate in [
-        PathBuf::from("target-msvc/debug/egb.exe"),
-        PathBuf::from("target/debug/egb.exe"),
-        PathBuf::from("target/release/egb.exe"),
-    ] {
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Ok(PathBuf::from("egb.exe"))
+    anyhow::bail!(
+        "could not find sibling egb.exe next to GUI at {}; build/copy egb.exe into the same folder",
+        adjacent.display()
+    )
 }
 
 #[allow(dead_code)]

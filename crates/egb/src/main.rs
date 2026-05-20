@@ -3412,7 +3412,10 @@ async fn status_json(state: &SharedState) -> String {
         "bridge": {
             "version": env!("CARGO_PKG_VERSION"),
             "git_commit": option_env!("GIT_HASH").unwrap_or("unknown"),
+            "build_timestamp": option_env!("BUILD_TIMESTAMP").unwrap_or("unknown"),
             "process_id": std::process::id(),
+            "executable_path": std::env::current_exe().ok().map(|path| path.display().to_string()),
+            "working_dir": std::env::current_dir().ok().map(|path| path.display().to_string()),
             "uptime_ms": SystemTime::now().duration_since(started).unwrap_or_default().as_millis(),
             "config_path": guard.config_identity.config_path,
             "config_loaded_at": guard.config_identity.config_loaded_at_ms,
