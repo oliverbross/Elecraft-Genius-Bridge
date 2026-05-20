@@ -75,6 +75,12 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    AethersdrOperationalTest {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 60.0)]
+        duration_seconds: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -264,6 +270,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("aethersdr-smoke-test", cfg, config, duration_minutes).await
+        }
+        Commands::AethersdrOperationalTest {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_aethersdr_operational_test(cfg, config, duration_seconds).await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -612,6 +626,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
             pgxl_force_operate_advertisement: cfg.flex_injection.pgxl_force_operate_advertisement,
             flex_force_operate_via_radio: cfg.flex_injection.flex_force_operate_via_radio,
+            pgxl_connect_assist: cfg.flex_injection.pgxl_connect_assist,
             amplifier_startup_state_policy: cfg
                 .flex_injection
                 .amplifier_startup_state_policy
@@ -975,6 +990,43 @@ async fn run_amplifier_operate_lab(
     Ok(())
 }
 
+async fn run_aethersdr_operational_test(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.pgxl_connect_assist = true;
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    cfg.validate()?;
+    let evidence = EvidenceRun::start(
+        "aethersdr-operational-test",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    tokio::fs::write(
+        evidence.dir().join("aethersdr-operational-test.md"),
+        aethersdr_operational_test_markdown(&state).await,
+    )
+    .await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "AetherSDR operational test complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn run_pgxl_direct_trigger_matrix(
     mut cfg: BridgeConfig,
     config_path: PathBuf,
@@ -1228,6 +1280,9 @@ impl EvidenceRun {
             "amplifier-operate-lab.md",
             "flex-amplifier-operate-sequence.log",
             "amplifier-state-rewrite-analysis.md",
+            "pgxl-connect-assist.md",
+            "real-vs-ui-amp-state.md",
+            "aethersdr-operational-test.md",
             "pgxl-trigger-matrix.md",
             "radio-stripped-amplifier-fields.md",
             "aethersdr-amp-parser-notes.md",
@@ -1357,6 +1412,21 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("amplifier-operate-lab.md"),
             amplifier_operate_lab_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("pgxl-connect-assist.md"),
+            pgxl_connect_assist_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("real-vs-ui-amp-state.md"),
+            real_vs_ui_amp_state_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("aethersdr-operational-test.md"),
+            aethersdr_operational_test_markdown(state).await,
         )
         .await?;
         tokio::fs::write(
@@ -1970,6 +2040,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
         pgxl_force_operate_advertisement: cfg.flex_injection.pgxl_force_operate_advertisement,
         flex_force_operate_via_radio: cfg.flex_injection.flex_force_operate_via_radio,
+        pgxl_connect_assist: cfg.flex_injection.pgxl_connect_assist,
         amplifier_startup_state_policy: cfg.flex_injection.amplifier_startup_state_policy.clone(),
         wait_first_kpa_poll_timeout: Duration::from_millis(
             cfg.flex_injection.wait_first_kpa_poll_timeout_ms,
@@ -2144,6 +2215,108 @@ async fn amplifier_state_rewrite_analysis_markdown(state: &SharedState) -> Strin
             .as_deref()
             .unwrap_or("none"),
         guard.clients.pgxl_session_started_count,
+    )
+}
+
+async fn pgxl_connect_assist_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# PGXL Connect Assist\n\n\
+        Connect-assist sends one Flex-side `amplifier set <handle> operate=1` after the injected amplifier handle is observed. It does not send `^OS1;` to the KPA500.\n\n\
+        - Enabled: {}\n\
+        - Sent count: {}\n\
+        - Last result: `{}`\n\
+        - Triggered PGXL TCP: {}\n\
+        - PGXL sessions started: {}\n\
+        - PGXL clients active: {}\n\
+        - Real KPA state: `{}`\n\
+        - Last PGXL advertised state: `{}`\n",
+        guard.flex_injection.pgxl_connect_assist_enabled,
+        guard.flex_injection.pgxl_connect_assist_sent_count,
+        guard
+            .flex_injection
+            .pgxl_connect_assist_last_result
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.pgxl_connect_assist_triggered_tcp,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard.amp.state.pgxl_state(),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+    )
+}
+
+async fn real_vs_ui_amp_state_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Real vs UI Amplifier State\n\n\
+        - Real KPA RF state: `{}` from serial polling\n\
+        - Flex UI desired/connect-assist state: `{}`\n\
+        - Flex observed/rebroadcast state: `{}`\n\
+        - PGXL direct advertised state: `{}`\n\
+        - RF-risk gate enabled: not represented here; KPA500 `^OS1;` remains blocked unless the normal KPA safety settings allow it.\n\n\
+        Interpretation: Flex-side connect-assist may briefly mark the virtual amplifier active for AetherSDR pairing, but PGXL direct telemetry remains authoritative to the real KPA500 state.\n",
+        guard.amp.state.pgxl_state(),
+        guard
+            .flex_injection
+            .flex_desired_amp_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+    )
+}
+
+async fn aethersdr_operational_test_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# AetherSDR Operational Test\n\n\
+        - PGXL connected: {}\n\
+        - TGXL connected: {}\n\
+        - Real KPA state: `{}`\n\
+        - UI connect-assist used: {}\n\
+        - Connect-assist last result: `{}`\n\
+        - Controls seen: {}\n\
+        - Last blocked reason: `{}`\n\
+        - Last TGXL control: `{}`\n\
+        - Last PGXL/Flex control: `{}`\n",
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        guard.amp.state.pgxl_state(),
+        guard.flex_injection.pgxl_connect_assist_sent_count > 0,
+        guard
+            .flex_injection
+            .pgxl_connect_assist_last_result
+            .as_deref()
+            .unwrap_or("none"),
+        guard.controls.control_requested_count > 0,
+        guard
+            .controls
+            .last_safety_decision
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .controls
+            .last_tgxl_control_command
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .controls
+            .last_flex_amp_set_command
+            .as_deref()
+            .unwrap_or("none"),
     )
 }
 
@@ -3797,6 +3970,7 @@ mod tests {
         assert!(names.contains(&"stability-test".to_string()));
         assert!(names.contains(&"evidence-test".to_string()));
         assert!(names.contains(&"aethersdr-smoke-test".to_string()));
+        assert!(names.contains(&"aethersdr-operational-test".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
         assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));

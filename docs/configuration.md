@@ -128,6 +128,7 @@ flex_injection:
   amplifier_status_profile: pgxl_paired
   pgxl_force_operate_advertisement: false
   flex_force_operate_via_radio: false
+  pgxl_connect_assist: false
   amplifier_reannounce_interval_ms: 5000
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
@@ -150,6 +151,8 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 `pgxl_force_operate_advertisement` is a lab-only switch. It advertises `state=OPERATE` to AetherSDR without sending any KPA500 command. Use it only to determine whether AetherSDR refuses to open TCP 9008 while the injected amplifier is in `STANDBY`.
 
 `flex_force_operate_via_radio` is also lab-only. It sends `amplifier set <handle> operate=1` to the Flex API after the injected amplifier handle is observed. It does not send `^OS1;` to the KPA500 and is used only to test whether the Flex radio owns and rewrites amplifier operate state.
+
+`pgxl_connect_assist` is the AetherSDR PGXL direct-connect workaround. It sends one Flex-side `amplifier set <handle> operate=1` after the virtual amplifier handle is discovered, which can trigger AetherSDR to open TCP 9008. It does not send `^OS1;` to the KPA500; PGXL direct status remains based on real KPA500 polling.
 
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 

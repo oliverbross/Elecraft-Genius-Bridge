@@ -913,6 +913,23 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "PGXL connect-assist",
+                    format!(
+                        "enabled={} sent={} result={} tcp={}",
+                        bool_text(Some(status.flex_injection.pgxl_connect_assist_enabled)),
+                        status.flex_injection.pgxl_connect_assist_sent_count,
+                        status
+                            .flex_injection
+                            .pgxl_connect_assist_last_result
+                            .as_deref()
+                            .unwrap_or("-"),
+                        bool_text(Some(
+                            status.flex_injection.pgxl_connect_assist_triggered_tcp
+                        ))
+                    ),
+                );
+                field(
+                    ui,
                     "PGXL no socket",
                     format!(
                         "{} {}",
@@ -1241,6 +1258,7 @@ impl GuiApp {
                         "pgxl_verbose",
                         "old_good_pgxl",
                         "aethersdr_force_direct",
+                        "aethersdr_pgxl_direct_lab",
                         "strict_real_pgxl",
                     ] {
                         ui.selectable_value(
@@ -1254,6 +1272,13 @@ impl GuiApp {
             checkbox(ui, "Create AMP meters", &mut self.config.flex_injection.create_meters);
             checkbox(ui, "Create AMP interlock", &mut self.config.flex_injection.create_interlock);
             checkbox(ui, "Trace amplifier advertisements", &mut self.config.flex_injection.trace_amplifier_advertisements);
+            checkbox(ui, "Enable PGXL connect-assist for AetherSDR", &mut self.config.flex_injection.pgxl_connect_assist);
+            if self.config.flex_injection.pgxl_connect_assist {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Connect-assist may mark the Flex-side virtual amplifier active to trigger PGXL connection. It does not switch the real KPA500 to operate.",
+                );
+            }
             egui::ComboBox::from_label("Amplifier startup policy")
                 .selected_text(self.config.flex_injection.amplifier_startup_state_policy.as_str())
                 .show_ui(ui, |ui| {
@@ -2079,6 +2104,14 @@ struct FlexStatus {
     flex_operate_lab_command_count: u64,
     #[serde(default)]
     flex_operate_lab_accept_count: u64,
+    #[serde(default)]
+    pgxl_connect_assist_enabled: bool,
+    #[serde(default)]
+    pgxl_connect_assist_sent_count: u64,
+    #[serde(default)]
+    pgxl_connect_assist_last_result: Option<String>,
+    #[serde(default)]
+    pgxl_connect_assist_triggered_tcp: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

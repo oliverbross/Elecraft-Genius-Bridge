@@ -358,6 +358,7 @@ pub struct FlexInjectionConfig {
     pub trace_amplifier_advertisements: bool,
     pub pgxl_force_operate_advertisement: bool,
     pub flex_force_operate_via_radio: bool,
+    pub pgxl_connect_assist: bool,
     pub amplifier_startup_state_policy: String,
     pub wait_first_kpa_poll_timeout_ms: u64,
     pub amplifier_reannounce_interval_ms: u64,
@@ -471,6 +472,7 @@ impl Default for FlexInjectionConfig {
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
             flex_force_operate_via_radio: false,
+            pgxl_connect_assist: false,
             amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
             wait_first_kpa_poll_timeout_ms: 10000,
             amplifier_reannounce_interval_ms: 5000,
@@ -612,11 +614,13 @@ pgxl:
     fn flex_operate_lab_flag_is_valid_but_disabled_by_default() {
         let mut cfg = BridgeConfig::default();
         assert!(!cfg.flex_injection.flex_force_operate_via_radio);
+        assert!(!cfg.flex_injection.pgxl_connect_assist);
         cfg.flex_injection.enabled = true;
         cfg.flex_injection.radio_ip = "192.168.1.100".to_string();
         cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
         cfg.flex_injection.flex_force_operate_via_radio = true;
         cfg.flex_injection.pgxl_force_operate_advertisement = true;
+        cfg.flex_injection.pgxl_connect_assist = true;
         cfg.validate().unwrap();
     }
 
