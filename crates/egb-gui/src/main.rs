@@ -662,6 +662,65 @@ impl GuiApp {
                 field(ui, "Flex state", &status.flex_injection.connection_state);
                 field(
                     ui,
+                    "Real KPA state",
+                    status.amp.state.as_deref().unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Advertised Flex",
+                    status
+                        .flex_injection
+                        .last_advertised_flex_amp_state
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Advertised PGXL",
+                    status
+                        .flex_injection
+                        .last_advertised_pgxl_state
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "TGXL operate",
+                    status
+                        .flex_injection
+                        .last_advertised_tgxl_operate
+                        .map(|value| bool_text(Some(value)))
+                        .unwrap_or("unknown"),
+                );
+                field(
+                    ui,
+                    "State mismatch",
+                    status
+                        .flex_injection
+                        .state_advertisement_mismatch
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Amp profile",
+                    status
+                        .flex_injection
+                        .active_amplifier_status_profile
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "TGXL profile",
+                    status
+                        .flex_injection
+                        .active_tgxl_control_profile
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
                     "Degraded reason",
                     status
                         .flex_injection
@@ -1031,6 +1090,17 @@ impl GuiApp {
             checkbox(ui, "PGXL direct connected diagnostic", &mut self.config.pgxl.force_direct_connected_test);
             checkbox(ui, "TGXL AetherSDR compatibility", &mut self.config.tgxl.aethersdr_compat);
             checkbox(ui, "TGXL SmartSDR compatibility", &mut self.config.tgxl.smartsdr_compat);
+            egui::ComboBox::from_label("TGXL control profile")
+                .selected_text(self.config.tgxl.control_profile.as_str())
+                .show_ui(ui, |ui| {
+                    for profile in ["readonly", "control_ready", "verbose_control"] {
+                        ui.selectable_value(
+                            &mut self.config.tgxl.control_profile,
+                            profile.to_string(),
+                            profile,
+                        );
+                    }
+                });
             checkbox(ui, "TGXL direct presence test", &mut self.config.tgxl.force_presence_test);
             checkbox(ui, "TGXL experimental presence refresh", &mut self.config.tgxl.experimental_presence_refresh);
             checkbox(ui, "Metrics enabled", &mut self.config.metrics.enabled);
@@ -1080,7 +1150,9 @@ impl GuiApp {
                         "minimal",
                         "pgxl_paired",
                         "pgxl_verbose",
+                        "old_good_pgxl",
                         "aethersdr_force_direct",
+                        "strict_real_pgxl",
                     ] {
                         ui.selectable_value(
                             &mut self.config.flex_injection.amplifier_status_profile,
@@ -1830,6 +1902,10 @@ struct ClientSession {
 struct FlexStatus {
     enabled: bool,
     connection_state: String,
+    #[serde(default)]
+    active_amplifier_status_profile: Option<String>,
+    #[serde(default)]
+    active_tgxl_control_profile: Option<String>,
     client_handle: Option<String>,
     amplifier_handle: Option<String>,
     meter_handles: Vec<MeterHandle>,
@@ -1855,6 +1931,16 @@ struct FlexStatus {
     tuner_disappeared_count: u64,
     #[serde(default)]
     last_tuner_disappearance_reason: Option<String>,
+    #[serde(default)]
+    last_advertised_flex_amp_state: Option<String>,
+    #[serde(default)]
+    last_advertised_pgxl_state: Option<String>,
+    #[serde(default)]
+    last_advertised_tgxl_operate: Option<bool>,
+    #[serde(default)]
+    state_advertisement_mismatch: Option<String>,
+    #[serde(default)]
+    state_advertisement_mismatch_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

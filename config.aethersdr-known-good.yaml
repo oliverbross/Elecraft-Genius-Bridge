@@ -1,22 +1,26 @@
 server:
-  # Use 127.0.0.1 for local tests, or replace with a private LAN IP only.
+  # Replace with the Windows private LAN IP when AetherSDR runs on another machine.
   bind_ip: 127.0.0.1
 
 pgxl:
   enabled: true
   port: 9008
-  aethersdr_compat: false
+  aethersdr_compat: true
+  compat_profile: aethersdr
   strict_emulation: false
   startup_delay_ms: 0
+  force_direct_connected_test: false
 
 tgxl:
   enabled: true
   port: 9010
-  aethersdr_compat: false
+  aethersdr_compat: true
+  smartsdr_compat: true
   control_profile: control_ready
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false
+  experimental_presence_refresh: true
 
 kpa500:
   enabled: true
@@ -24,7 +28,7 @@ kpa500:
   baud: 38400
   polling_interval_ms: 1000
   mock: false
-  dry_run: false
+  dry_run: true
   allow_rf_risk: false
 
 kat500:
@@ -33,7 +37,6 @@ kat500:
   baud: 38400
   polling_interval_ms: 1000
   mock: false
-  # Keep tuner controls blocked until a separate KAT500 control phase.
   dry_run: true
   allow_rf_risk: false
 
@@ -54,6 +57,27 @@ metrics:
 
 control:
   verify_delay_ms: 200
+
+flex_injection:
+  enabled: true
+  radio_ip: 127.0.0.1
+  radio_port: 4992
+  amplifier_ip: 127.0.0.1
+  force_advertised_pgxl_ip:
+  amplifier_port: 9008
+  amplifier_model: PowerGeniusXL
+  serial: EGB-KPA500
+  handle: amp_1
+  ant_map: ANT1:PORTA,ANT2:PORTB
+  full_pgxl_registration: true
+  create_meters: true
+  create_interlock: true
+  amplifier_status_profile: aethersdr_force_direct
+  amplifier_reannounce_interval_ms: 5000
+  reconnect_initial_ms: 1000
+  reconnect_max_ms: 30000
+  ping_interval_ms: 30000
+  tuner_refresh_interval_ms: 5000
 
 mock:
   pgxl_fault: false

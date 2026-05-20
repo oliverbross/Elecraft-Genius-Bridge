@@ -15,7 +15,7 @@ tgxl:
   port: 9010
   aethersdr_compat: true
   smartsdr_compat: true
-  control_profile: tgxl_control_ready
+  control_profile: control_ready
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false

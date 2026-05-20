@@ -27,7 +27,8 @@ m_pgxlConn.connectToPgxl(m_radioModel.ampIp());
 | `minimal` | `ip`, `port`, `model`, `serial_num`, `ant` | documented create fields |
 | `pgxl_paired` | same create fields; paired synthetic evidence line logged | default experiment |
 | `pgxl_verbose` | adds `state`, `connected`, `configured`, `enabled` | experimental |
-| `aethersdr_force_direct` | adds `direct`, `lan` to verbose fields | experimental |
+| `old_good_pgxl` | same direct-connect readiness fields as verbose, without strict-real filtering | AetherSDR regression checks |
+| `aethersdr_force_direct` | adds `direct`, `lan` to verbose fields | recommended AetherSDR PGXL direct-connect test profile |
 
 Only `minimal`/`pgxl_paired` should be considered conservative. The other profiles may be rejected by the radio and are meant for isolated trigger testing.
 

@@ -541,8 +541,22 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
 }
 
 async fn status_body(state: &SharedState, aethersdr_compat: bool, control_profile: &str) -> String {
-    let guard = state.read().await;
-    status_body_from_tuner(&guard.tuner, aethersdr_compat, control_profile)
+    let (body, advertised_operate) = {
+        let guard = state.read().await;
+        (
+            status_body_from_tuner(&guard.tuner, aethersdr_compat, control_profile),
+            advertised_operate_from_tuner(&guard.tuner, aethersdr_compat, control_profile),
+        )
+    };
+    let should_update = {
+        let guard = state.read().await;
+        guard.flex_injection.last_advertised_tgxl_operate != Some(advertised_operate)
+    };
+    if should_update {
+        let mut guard = state.write().await;
+        guard.flex_injection.last_advertised_tgxl_operate = Some(advertised_operate);
+    }
+    body
 }
 
 fn status_body_from_tuner(
@@ -556,17 +570,7 @@ fn status_body_from_tuner(
         tuner.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
     );
-    let control_ready = matches!(
-        control_profile,
-        "tgxl_control_ready" | "tgxl_verbose_control"
-    );
-    let operate = if control_ready {
-        true
-    } else if aethersdr_compat {
-        false
-    } else {
-        tuner.operate
-    };
+    let operate = advertised_operate_from_tuner(tuner, aethersdr_compat, control_profile);
     let native = format!(
         "operate={} bypass={} tuning={} relayC1={} relayL={} relayC2={} antA={} one_by_three=1 fwd={fwd:.4} swr={swr:.4}",
         bool_int(operate),
@@ -588,6 +592,24 @@ fn status_body_from_tuner(
                 .as_deref()
                 .unwrap_or(if degraded { "device_degraded" } else { "" }),
         )
+    }
+}
+
+fn advertised_operate_from_tuner(
+    tuner: &bridge_core::TunerState,
+    aethersdr_compat: bool,
+    control_profile: &str,
+) -> bool {
+    let control_ready = matches!(
+        control_profile,
+        "control_ready" | "verbose_control" | "tgxl_control_ready" | "tgxl_verbose_control"
+    );
+    if control_ready {
+        true
+    } else if aethersdr_compat {
+        false
+    } else {
+        tuner.operate
     }
 }
 
@@ -1016,6 +1038,17 @@ mod tests {
             response_line(2, 0, body),
             "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000\n"
         );
+    }
+
+    #[tokio::test]
+    async fn control_ready_profile_advertises_operate_for_ui_enablement() {
+        let state = shared_mock_state();
+        let body = status_body(&state, true, "control_ready").await;
+        assert!(body.contains("operate=1"));
+        let body = status_body(&state, true, "verbose_control").await;
+        assert!(body.contains("operate=1"));
+        let body = status_body(&state, true, "tgxl_control_ready").await;
+        assert!(body.contains("operate=1"));
     }
 
     #[test]

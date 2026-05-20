@@ -426,8 +426,23 @@ fn info_body(aethersdr_compat: bool) -> String {
 }
 
 async fn status_body(state: &SharedState, aethersdr_compat: bool) -> String {
-    let guard = state.read().await;
-    status_body_from_amp(&guard.amp, aethersdr_compat)
+    let (body, advertised_state) = {
+        let guard = state.read().await;
+        (
+            status_body_from_amp(&guard.amp, aethersdr_compat),
+            advertised_state_from_amp(&guard.amp).to_string(),
+        )
+    };
+    let should_update = {
+        let guard = state.read().await;
+        guard.flex_injection.last_advertised_pgxl_state.as_deref()
+            != Some(advertised_state.as_str())
+    };
+    if should_update {
+        let mut guard = state.write().await;
+        guard.flex_injection.last_advertised_pgxl_state = Some(advertised_state);
+    }
+    body
 }
 
 fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> String {
@@ -435,11 +450,7 @@ fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> 
         amp.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
     );
-    let state = if degraded {
-        "FAULT"
-    } else {
-        amp.state.pgxl_state()
-    };
+    let state = advertised_state_from_amp(amp);
     let peakfwd = watts_to_dbm(amp.forward_power_watts);
     let swr = protocol_swr_value(amp.swr);
     let fault = amp
@@ -460,6 +471,17 @@ fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> 
             "{native} fault={fault} connection_state={}",
             amp.connection_state.as_str()
         )
+    }
+}
+
+fn advertised_state_from_amp(amp: &bridge_core::AmpState) -> &'static str {
+    if matches!(
+        amp.connection_state,
+        ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
+    ) {
+        "FAULT"
+    } else {
+        amp.state.pgxl_state()
     }
 }
 
@@ -860,6 +882,23 @@ mod tests {
         let body = status_body(&state, false).await;
         assert!(body.contains("swr=-30.0000"));
         assert!(!body.contains("swr=32."));
+    }
+
+    #[tokio::test]
+    async fn pgxl_status_follows_live_amp_state() {
+        let state = shared_mock_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+        }
+        let body = status_body(&state, true).await;
+        assert!(body.contains("state=OPERATE"));
+        let guard = state.read().await;
+        assert_eq!(
+            guard.flex_injection.last_advertised_pgxl_state.as_deref(),
+            Some("OPERATE")
+        );
     }
 
     #[test]

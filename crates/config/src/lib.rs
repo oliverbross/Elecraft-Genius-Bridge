@@ -193,9 +193,13 @@ pub struct TgxlConfig {
 impl TgxlConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         match self.control_profile.as_str() {
-            "readonly" | "tgxl_control_ready" | "tgxl_verbose_control" => Ok(()),
+            "readonly"
+            | "control_ready"
+            | "verbose_control"
+            | "tgxl_control_ready"
+            | "tgxl_verbose_control" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "tgxl.control_profile must be one of readonly, tgxl_control_ready, tgxl_verbose_control; got {other}"
+                "tgxl.control_profile must be one of readonly, control_ready, verbose_control; got {other}"
             ))),
         }
     }
@@ -412,10 +416,11 @@ impl FlexInjectionConfig {
             "minimal"
             | "pgxl_paired"
             | "pgxl_verbose"
+            | "old_good_pgxl"
             | "aethersdr_force_direct"
             | "strict_real_pgxl" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, aethersdr_force_direct, strict_real_pgxl; got {other}"
+                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_force_direct, strict_real_pgxl; got {other}"
             ))),
         }
     }
@@ -563,7 +568,27 @@ pgxl:
         cfg.flex_injection.amplifier_status_profile = "strict_real_pgxl".to_string();
         cfg.validate().unwrap();
 
+        cfg.flex_injection.amplifier_status_profile = "old_good_pgxl".to_string();
+        cfg.validate().unwrap();
+
         cfg.flex_injection.amplifier_status_profile = "invented".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validates_current_and_legacy_tgxl_control_profiles() {
+        let mut cfg = BridgeConfig::default();
+        for profile in [
+            "readonly",
+            "control_ready",
+            "verbose_control",
+            "tgxl_control_ready",
+            "tgxl_verbose_control",
+        ] {
+            cfg.tgxl.control_profile = profile.to_string();
+            cfg.validate().unwrap();
+        }
+        cfg.tgxl.control_profile = "invented".to_string();
         assert!(cfg.validate().is_err());
     }
 

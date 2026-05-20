@@ -499,8 +499,12 @@ async fn record_amplifier_pairing_status(
     line: String,
     candidate_fields: Vec<String>,
 ) {
+    let advertised_state = extract_key_value(&line, "state").map(str::to_string);
     let mut guard = state.write().await;
     guard.flex_injection.last_amplifier_status_line = Some(line);
+    if let Some(advertised_state) = advertised_state {
+        guard.flex_injection.last_advertised_flex_amp_state = Some(advertised_state);
+    }
     guard.flex_injection.amplifier_pairing_candidate_fields = candidate_fields;
     guard
         .flex_injection
@@ -860,11 +864,11 @@ pub fn amplifier_create_command(
         sanitize_token(ant_map)
     );
     match profile {
-        "pgxl_verbose" => {
-            command.push_str(" state=STANDBY connected=1 configured=1 enabled=1");
+        "pgxl_verbose" | "old_good_pgxl" => {
+            command.push_str(" connected=1 configured=1 enabled=1");
         }
         "aethersdr_force_direct" => {
-            command.push_str(" state=STANDBY connected=1 configured=1 enabled=1 direct=1 lan=1");
+            command.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1");
         }
         "strict_real_pgxl" => {}
         _ => {}
@@ -922,7 +926,7 @@ async fn synthetic_amplifier_status_line(
         )
     };
     match settings.amplifier_status_profile.as_str() {
-        "pgxl_verbose" => {
+        "pgxl_verbose" | "old_good_pgxl" => {
             candidate_fields.extend([
                 "connected".to_string(),
                 "configured".to_string(),
@@ -1038,6 +1042,12 @@ fn sanitize_token(value: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_whitespace() && *ch != '|')
         .collect()
+}
+
+fn extract_key_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
 }
 
 pub fn parse_response(line: &str) -> Option<(u32, String, String)> {
@@ -1202,6 +1212,65 @@ mod tests {
                 "state".to_string(),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn amplifier_status_uses_live_operate_state() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.connection_state = bridge_core::ConnectionState::Connected;
+            guard.amp.connected = true;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+        }
+        let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
+        assert!(line.contains("state=OPERATE"));
+        {
+            let mut guard = state.write().await;
+            guard.amp.operate = false;
+            guard.amp.state = bridge_core::AmpOperatingState::Standby;
+        }
+        let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
+        assert!(line.contains("state=STANDBY"));
+    }
+
+    #[test]
+    fn direct_profiles_do_not_hardcode_standby_on_create() {
+        for profile in ["pgxl_verbose", "old_good_pgxl", "aethersdr_force_direct"] {
+            let cmd = amplifier_create_command(
+                "192.168.1.50".parse().unwrap(),
+                9008,
+                "PowerGeniusXL",
+                "EGB-KPA500",
+                "ANT1:PORTA,ANT2:PORTB",
+                profile,
+            );
+            assert!(
+                !cmd.contains("state=STANDBY"),
+                "{profile} must not hard-code STANDBY in amplifier create"
+            );
+        }
     }
 
     #[test]

@@ -69,6 +69,12 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    AethersdrSmokeTest {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long)]
+        duration_minutes: f64,
+    },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -226,6 +232,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("control-lab", cfg, config, duration_minutes).await
+        }
+        Commands::AethersdrSmokeTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test("aethersdr-smoke-test", cfg, config, duration_minutes).await
         }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
@@ -389,6 +403,12 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
         shared_default_state()
     };
     apply_mock_config(cfg, &state).await;
+    {
+        let mut guard = state.write().await;
+        guard.flex_injection.active_amplifier_status_profile =
+            Some(cfg.flex_injection.amplifier_status_profile.clone());
+        guard.flex_injection.active_tgxl_control_profile = Some(cfg.tgxl.control_profile.clone());
+    }
 
     if cfg.kpa500.enabled {
         let driver = Kpa500Driver::new(
@@ -594,6 +614,13 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 tuner_after.max(Duration::from_secs(3)),
             )
             .await;
+        });
+    }
+
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state_advertisement_watchdog(state).await;
         });
     }
 
@@ -935,6 +962,10 @@ impl EvidenceRun {
             "tgxl-control-commands.log",
             "pgxl-control-commands.log",
             "flex-control-commands.log",
+            "advertised-state-history.jsonl",
+            "state-mismatch-events.jsonl",
+            "profile-summary.md",
+            "last-known-good-comparison.md",
         ] {
             File::create(dir.join(file))?;
         }
@@ -983,6 +1014,26 @@ impl EvidenceRun {
                     let _ = file.write_all(format!("{line}\n").as_bytes()).await;
                     let _ = file.flush().await;
                 }
+                let advertised = serde_json::json!({
+                    "timestamp_ms": system_time_ms(Some(SystemTime::now())),
+                    "real_kpa500_state": status.pointer("/amp/state").cloned().unwrap_or(serde_json::Value::Null),
+                    "advertised_flex_amp_state": status.pointer("/flex_injection/last_advertised_flex_amp_state").cloned().unwrap_or(serde_json::Value::Null),
+                    "advertised_pgxl_state": status.pointer("/flex_injection/last_advertised_pgxl_state").cloned().unwrap_or(serde_json::Value::Null),
+                    "advertised_tgxl_operate": status.pointer("/flex_injection/last_advertised_tgxl_operate").cloned().unwrap_or(serde_json::Value::Null),
+                    "state_mismatch": status.pointer("/flex_injection/state_advertisement_mismatch").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                if let Ok(line) = serde_json::to_string(&advertised) {
+                    let path = dir.join("advertised-state-history.jsonl");
+                    if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .await
+                    {
+                        let _ = file.write_all(format!("{line}\n").as_bytes()).await;
+                        let _ = file.flush().await;
+                    }
+                }
             }
         })
     }
@@ -995,6 +1046,10 @@ impl EvidenceRun {
         tokio::fs::write(self.dir.join("pgxl-vs-tgxl-analysis.md"), analysis).await?;
         let controls = controls_analysis_markdown(state).await;
         tokio::fs::write(self.dir.join("controls-analysis.md"), controls).await?;
+        let profile_summary = profile_summary_markdown(state).await;
+        tokio::fs::write(self.dir.join("profile-summary.md"), profile_summary).await?;
+        let comparison = last_known_good_comparison_markdown(state).await;
+        tokio::fs::write(self.dir.join("last-known-good-comparison.md"), comparison).await?;
         zip_dir(&self.dir, &self.zip_path)?;
         println!("evidence bundle: {}", self.zip_path.display());
         Ok(self.zip_path.clone())
@@ -1343,6 +1398,90 @@ async fn controls_analysis_markdown(state: &SharedState) -> String {
     body
 }
 
+async fn profile_summary_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Active Profiles\n\n\
+        - Amplifier status profile: `{}`\n\
+        - TGXL control profile: `{}`\n\
+        - Real KPA500 state: `{}`\n\
+        - Advertised Flex amp state: `{}`\n\
+        - Advertised PGXL state: `{}`\n\
+        - Advertised TGXL operate: `{}`\n\
+        - State mismatch: `{}`\n",
+        guard
+            .flex_injection
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .active_tgxl_control_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard.amp.state.pgxl_state(),
+        guard
+            .flex_injection
+            .last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_tgxl_operate
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard
+            .flex_injection
+            .state_advertisement_mismatch
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn last_known_good_comparison_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let profile = guard
+        .flex_injection
+        .active_amplifier_status_profile
+        .as_deref()
+        .unwrap_or("unknown");
+    let recommendation = match profile {
+        "strict_real_pgxl" => {
+            "Use `aethersdr_force_direct` or `old_good_pgxl` for AetherSDR regression checks; `strict_real_pgxl` is retained for protocol experiments only."
+        }
+        "aethersdr_force_direct" | "old_good_pgxl" => {
+            "This run used the recommended AetherSDR regression profile."
+        }
+        _ => {
+            "If PGXL does not open TCP 9008, repeat with `config.aethersdr-known-good.yaml` before changing code."
+        }
+    };
+    format!(
+        "# Last Known Good Comparison\n\n\
+        The known-good AetherSDR path uses Flex injection plus a direct-connect amplifier profile and TGXL `control_ready` status.\n\n\
+        - Current amplifier profile: `{profile}`\n\
+        - Current TGXL profile: `{}`\n\
+        - PGXL sessions started: {}\n\
+        - TGXL sessions started: {}\n\
+        - Flex amp state follows live KPA500: {}\n\
+        - Recommendation: {}\n",
+        guard
+            .flex_injection
+            .active_tgxl_control_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.flex_injection.state_advertisement_mismatch.is_none(),
+        recommendation,
+    )
+}
+
 fn zip_dir(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -1483,6 +1622,94 @@ async fn stale_state_watchdog(
             );
         }
     }
+}
+
+async fn state_advertisement_watchdog(state: SharedState) {
+    let mut pending: Option<(String, Instant)> = None;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mismatch = {
+            let guard = state.read().await;
+            state_advertisement_mismatch_reason(&guard)
+        };
+        match (mismatch, pending.as_mut()) {
+            (Some(reason), Some((pending_reason, since))) if *pending_reason == reason => {
+                if since.elapsed() >= Duration::from_secs(2) {
+                    let mut guard = state.write().await;
+                    if guard.flex_injection.state_advertisement_mismatch.as_deref()
+                        == Some(reason.as_str())
+                    {
+                        continue;
+                    }
+                    guard.flex_injection.state_advertisement_mismatch = Some(reason.clone());
+                    guard.flex_injection.state_advertisement_mismatch_count = guard
+                        .flex_injection
+                        .state_advertisement_mismatch_count
+                        .saturating_add(1);
+                    append_evidence_line("warnings-errors.log", reason.clone());
+                    append_evidence_json(
+                        "state-mismatch-events.jsonl",
+                        &serde_json::json!({
+                            "event": "state_advertisement_mismatch",
+                            "reason": reason,
+                            "timestamp_ms": system_time_ms(Some(SystemTime::now())),
+                        }),
+                    );
+                    warn!(
+                        event_id = "state_advertisement_mismatch",
+                        "Advertised protocol state does not match live serial/shared state"
+                    );
+                }
+            }
+            (Some(reason), _) => {
+                pending = Some((reason, Instant::now()));
+            }
+            (None, _) => {
+                pending = None;
+                let mut guard = state.write().await;
+                if guard.flex_injection.state_advertisement_mismatch.is_some() {
+                    guard.flex_injection.state_advertisement_mismatch = None;
+                }
+            }
+        }
+    }
+}
+
+fn state_advertisement_mismatch_reason(guard: &bridge_core::state::BridgeState) -> Option<String> {
+    let real_amp = if guard.amp.is_connected() {
+        guard.amp.state.pgxl_state()
+    } else {
+        "FAULT"
+    };
+    if let Some(advertised) = guard
+        .flex_injection
+        .last_advertised_flex_amp_state
+        .as_deref()
+    {
+        if advertised != real_amp {
+            return Some(format!(
+                "Flex amp advertised state mismatch: real_serial_state={real_amp} advertised_flex_state={advertised} profile={}",
+                guard
+                    .flex_injection
+                    .active_amplifier_status_profile
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ));
+        }
+    }
+    if let Some(advertised) = guard.flex_injection.last_advertised_pgxl_state.as_deref() {
+        if advertised != real_amp {
+            return Some(format!(
+                "PGXL advertised state mismatch: real_serial_state={real_amp} advertised_pgxl_state={advertised} profile={}",
+                guard
+                    .flex_injection
+                    .active_amplifier_status_profile
+                    .as_deref()
+                    .unwrap_or("unknown")
+            ));
+        }
+    }
+    None
 }
 
 fn is_stale(last_poll: Option<SystemTime>, now: SystemTime, stale_after: Duration) -> bool {
@@ -2666,6 +2893,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"stability-test".to_string()));
         assert!(names.contains(&"evidence-test".to_string()));
+        assert!(names.contains(&"aethersdr-smoke-test".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
     }
 
@@ -2703,5 +2931,23 @@ mod tests {
     #[test]
     fn timestamp_formatter_produces_expected_epoch_date() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn detects_amp_advertisement_mismatch() {
+        let mut state = bridge_core::state::BridgeState::default();
+        state.amp.connection_state = ConnectionState::Connected;
+        state.amp.connected = true;
+        state.amp.operate = true;
+        state.amp.state = AmpOperatingState::Operate;
+        state.flex_injection.active_amplifier_status_profile =
+            Some("aethersdr_force_direct".to_string());
+        state.flex_injection.last_advertised_flex_amp_state = Some("STANDBY".to_string());
+        let reason = state_advertisement_mismatch_reason(&state).unwrap();
+        assert!(reason.contains("real_serial_state=OPERATE"));
+        assert!(reason.contains("advertised_flex_state=STANDBY"));
+
+        state.flex_injection.last_advertised_flex_amp_state = Some("OPERATE".to_string());
+        assert!(state_advertisement_mismatch_reason(&state).is_none());
     }
 }

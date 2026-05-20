@@ -37,7 +37,7 @@ Set `strict_emulation: true` in mock mode to simulate a more realistic device st
 
 Set `tgxl.force_presence_test: true` only for AetherSDR TUN applet activation testing. It makes the direct TGXL emulator publish the richest safe direct state currently understood, without changing KAT500 serial behaviour.
 
-Set `tgxl.control_profile` to `tgxl_control_ready` only for AetherSDR/SmartSDR control-button experiments. It reports a control-ready TGXL direct state while the serial driver still enforces `dry_run` and RF-risk gates. Valid values are `readonly`, `tgxl_control_ready`, and `tgxl_verbose_control`.
+Set `tgxl.control_profile` to `control_ready` only for AetherSDR/SmartSDR control-button experiments. It reports a control-ready TGXL direct state while the serial driver still enforces `dry_run` and RF-risk gates. Valid values are `readonly`, `control_ready`, and `verbose_control`. The older names `tgxl_control_ready` and `tgxl_verbose_control` are accepted only for backward compatibility.
 
 ## Elecraft Devices
 
@@ -143,7 +143,7 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
 
-`amplifier_status_profile` controls PGXL trigger experiments. `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative. `strict_real_pgxl` keeps amplifier status candidates to the documented PGXL fields: `model`, `ip`, `port`, `serial_num`, `ant`, and `state`. `pgxl_verbose` and `aethersdr_force_direct` add unverified status-like fields to the amplifier create command and should be used only during isolated pairing lab runs.
+`amplifier_status_profile` controls PGXL trigger experiments. `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative. `strict_real_pgxl` keeps amplifier status candidates to the documented PGXL fields: `model`, `ip`, `port`, `serial_num`, `ant`, and live `state`. `pgxl_verbose`, `old_good_pgxl`, and `aethersdr_force_direct` add status-like direct-connect fields and are the preferred profiles for AetherSDR regression checks. No profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
 
 `amplifier_reannounce_interval_ms` controls the rate-limited amplifier refresh query and evidence logging. It does not create duplicate amplifier objects.
 

@@ -58,7 +58,7 @@ amplifier <handle> model=PowerGeniusXL ip=<ip> port=9008 serial_num=<serial> ant
 
 `pgxl_paired` uses the documented `amplifier create` command and records live KPA500-derived status candidates.
 
-`pgxl_verbose` and `aethersdr_force_direct` remain experimental. They add fields such as `connected`, `configured`, `enabled`, `direct`, and `lan`. These are not confirmed real-PGXL fields and should not be treated as production behavior.
+`pgxl_verbose`, `old_good_pgxl`, and `aethersdr_force_direct` remain AetherSDR-oriented profiles. They add fields such as `connected`, `configured`, `enabled`, `direct`, and `lan`. These are not confirmed real-PGXL fields and should not be treated as production behavior. All profiles now advertise live KPA500 state; none should force `state=STANDBY` outside mock state.
 
 ## Current Suspects
 
