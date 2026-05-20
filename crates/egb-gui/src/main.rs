@@ -287,6 +287,7 @@ impl eframe::App for GuiApp {
                 ui.separator();
                 nav_button(ui, &mut self.tab, Tab::Dashboard, "Dashboard");
                 nav_button(ui, &mut self.tab, Tab::Config, "Configuration");
+                nav_button(ui, &mut self.tab, Tab::Operational, "Operational");
                 nav_button(ui, &mut self.tab, Tab::Controls, "Controls");
                 nav_button(ui, &mut self.tab, Tab::Diagnostics, "Diagnostics");
                 nav_button(ui, &mut self.tab, Tab::Logs, "Logs");
@@ -301,6 +302,7 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Dashboard => self.ui_dashboard(ui),
             Tab::Config => self.ui_config(ui),
+            Tab::Operational => self.ui_operational(ui),
             Tab::Controls => self.ui_controls(ui),
             Tab::Diagnostics => self.ui_diagnostics(ui),
             Tab::Logs => self.ui_logs(ui),
@@ -1110,6 +1112,83 @@ impl GuiApp {
         });
     }
 
+    fn ui_operational(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Operational Mode");
+        ui.colored_label(
+            egui::Color32::YELLOW,
+            "Operational mode can send real serial control commands. Keep RF-risk controls off until the station is ready.",
+        );
+        ui.group(|ui| {
+            ui.checkbox(
+                &mut self.config.operational.enable_real_controls,
+                "Enable Real Hardware Controls",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kat_tune,
+                "Allow KAT500 Tune (T;)",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kat_bypass,
+                "Allow KAT500 Bypass/Standby (BYPB;/BYPN;)",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kat_antenna,
+                "Allow KAT500 Antenna 1/2/3 (AN1;/AN2;/AN3;)",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kpa_standby,
+                "Allow KPA500 Standby (^OS0;)",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kpa_operate,
+                "Allow KPA500 Operate (^OS1;)",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_clear_fault,
+                "Allow Clear Fault (^FLC;)",
+            );
+            ui.checkbox(
+                &mut self.config.operational.persist_rf_risk,
+                "Persist RF-risk controls across restart",
+            );
+            text_field(
+                ui,
+                "Typed confirmation",
+                &mut self.config.operational.confirm_real_hardware_control,
+            );
+            if self.config.operational.enable_kpa_operate
+                || self.config.operational.enable_kat_tune
+                || self.config.operational.enable_clear_fault
+            {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "RF-risk controls require confirmation text: I understand",
+                );
+            }
+        });
+        ui.separator();
+        ui.heading("Command Map");
+        ui.monospace("KAT500 Tune: T;");
+        ui.monospace("KAT500 Bypass: BYPB; / BYPN;");
+        ui.monospace("KAT500 Antenna: AN1; / AN2; / AN3;");
+        ui.monospace("KPA500 Standby: ^OS0;");
+        ui.monospace("KPA500 Operate: ^OS1;");
+        ui.monospace("KPA500 Clear Fault: ^FLC;");
+        ui.separator();
+        if ui.button("Start Full Operational Test").clicked() {
+            self.run_egb_command(
+                "full-operational-test",
+                vec![
+                    "full-operational-test".into(),
+                    "--config".into(),
+                    self.config_path.display().to_string(),
+                    "--duration-seconds".into(),
+                    "180".into(),
+                ],
+            );
+        }
+    }
+
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
         ui.heading("Logs");
         ui.horizontal(|ui| {
@@ -1726,6 +1805,7 @@ impl GuiApp {
 enum Tab {
     Dashboard,
     Config,
+    Operational,
     Controls,
     Diagnostics,
     Logs,

@@ -176,6 +176,7 @@ pub struct Kpa500Settings {
     pub polling_interval: Duration,
     pub mock: bool,
     pub dry_run: bool,
+    pub allow_control: bool,
     pub allow_rf_risk: bool,
     pub control_verify_delay: Duration,
     pub transcript_dir: Option<PathBuf>,
@@ -507,6 +508,7 @@ impl Kpa500Driver {
             safety = ?command.safety,
             dry_run = self.settings.dry_run,
             allow_rf_risk = self.settings.allow_rf_risk,
+            allow_control = self.settings.allow_control,
             "mapping PGXL/Flex amplifier control to KPA500"
         );
         if self.settings.dry_run && command.safety != CommandSafety::ReadOnly {
@@ -652,6 +654,19 @@ impl Kpa500Driver {
                 "KPA500 dry-run blocked {} ({:?})",
                 command.label,
                 command.safety
+            );
+        }
+        if command.safety == CommandSafety::StateChangeSafe && !self.settings.allow_control {
+            warn!(
+                event_id = "command_blocked_by_safety",
+                device = "KPA500",
+                command = command.label,
+                wire = command.wire,
+                "blocked safe KPA500 control because allow_control is false"
+            );
+            anyhow::bail!(
+                "KPA500 safe command {} requires allow_control",
+                command.label
             );
         }
         if command.safety == CommandSafety::RfRisk && !self.settings.allow_rf_risk {

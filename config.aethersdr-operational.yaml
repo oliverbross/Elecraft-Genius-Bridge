@@ -1,11 +1,10 @@
 server:
-  # Safe default for MVP. Use 0.0.0.0 only after you understand the security notes.
   bind_ip: 127.0.0.1
 
 pgxl:
   enabled: true
   port: 9008
-  aethersdr_compat: false
+  aethersdr_compat: true
   compat_profile: aethersdr
   strict_emulation: false
   startup_delay_ms: 0
@@ -14,20 +13,20 @@ pgxl:
 tgxl:
   enabled: true
   port: 9010
-  aethersdr_compat: false
-  smartsdr_compat: false
-  control_profile: readonly
+  aethersdr_compat: true
+  smartsdr_compat: true
+  control_profile: control_ready
   strict_emulation: false
   startup_delay_ms: 0
   force_presence_test: false
-  experimental_presence_refresh: false
+  experimental_presence_refresh: true
 
 kpa500:
   enabled: true
   com_port: COM21
   baud: 38400
   polling_interval_ms: 1000
-  mock: true
+  mock: false
   dry_run: true
   allow_control: false
   allow_rf_risk: false
@@ -37,26 +36,23 @@ kat500:
   com_port: COM8
   baud: 38400
   polling_interval_ms: 1000
-  mock: true
+  mock: false
   dry_run: true
   allow_control: false
   allow_rf_risk: false
 
 security:
-  # Reserved for a later authenticated API/control plane.
   token:
 
 logging:
-  level: info
-  protocol_trace: false
-  # When set, EGB writes one raw PGXL/TGXL transcript file per client session.
-  protocol_transcript_dir:
-  # When set, EGB writes one raw serial transcript file per device session.
-  serial_transcript_dir:
+  level: debug
+  protocol_trace: true
+  protocol_transcript_dir: logs/protocol
+  serial_transcript_dir: logs/serial
   transcript_rotate_bytes: 1048576
 
 metrics:
-  enabled: false
+  enabled: true
   bind_ip: 127.0.0.1
   port: 9160
 
@@ -64,19 +60,18 @@ control:
   verify_delay_ms: 200
 
 operational:
-  enable_real_controls: false
-  enable_kat_tune: false
+  enable_real_controls: true
+  enable_kat_tune: true
   enable_kat_bypass: false
   enable_kat_antenna: false
-  enable_kpa_standby: false
+  enable_kpa_standby: true
   enable_kpa_operate: false
   enable_clear_fault: false
   persist_rf_risk: false
-  confirm_real_hardware_control: ""
+  confirm_real_hardware_control: "I understand"
 
 flex_injection:
-  # Phase 17 passive Flex API registration. Disabled by default.
-  enabled: false
+  enabled: true
   radio_ip: 127.0.0.1
   radio_port: 4992
   amplifier_ip: 127.0.0.1
@@ -89,14 +84,11 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
-  amplifier_status_profile: pgxl_paired
-  trace_amplifier_advertisements: false
-  # Lab-only: advertises OPERATE to AetherSDR without sending any KPA500 command.
+  amplifier_status_profile: aethersdr_force_direct
+  trace_amplifier_advertisements: true
   pgxl_force_operate_advertisement: false
-  # Lab-only: sends Flex API amplifier set <handle> operate=1 without touching KPA500.
   flex_force_operate_via_radio: false
-  # AetherSDR connect assist: Flex-side operate trigger only, never KPA500 ^OS1;.
-  pgxl_connect_assist: false
+  pgxl_connect_assist: true
   amplifier_startup_state_policy: wait_for_first_kpa_poll
   wait_first_kpa_poll_timeout_ms: 10000
   amplifier_reannounce_interval_ms: 5000

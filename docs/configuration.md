@@ -49,6 +49,7 @@ kpa500:
   polling_interval_ms: 1000
   mock: true
   dry_run: true
+  allow_control: false
   allow_rf_risk: false
 
 kat500:
@@ -58,6 +59,7 @@ kat500:
   polling_interval_ms: 1000
   mock: true
   dry_run: true
+  allow_control: false
   allow_rf_risk: false
 ```
 
@@ -66,6 +68,25 @@ Set `mock: false` only when real hardware is connected and command mappings have
 Set `dry_run: true` for first hardware tests. Dry-run opens the configured COM port and permits read-only status queries, but blocks control-changing commands such as operate, tune, antenna change, bypass, relay move, and clear fault.
 
 Set `kpa500.allow_rf_risk: true` only for local controlled KPA500 operate testing after dummy-load / no-RF checks. It is required before EGB will translate a Flex/PGXL operate request to `^OS1;`. Standby still uses `^OS0;` and remains state-change-safe, but it is blocked when `dry_run: true`.
+
+## Operational Mode
+
+Normal profiles stay read-only or dry-run by default. For real AetherSDR operation, use `config.aethersdr-operational.yaml` and enable only the controls you intend to test:
+
+```yaml
+operational:
+  enable_real_controls: true
+  enable_kat_tune: true
+  enable_kat_bypass: false
+  enable_kat_antenna: false
+  enable_kpa_standby: true
+  enable_kpa_operate: false
+  enable_clear_fault: false
+  persist_rf_risk: false
+  confirm_real_hardware_control: "I understand"
+```
+
+When the confirmation string is present, operational mode can override device `dry_run` for the explicitly enabled control paths. `enable_kat_tune` allows the AetherSDR TGXL `autotune` command to send KAT500 `T;`. `enable_kpa_standby` allows KPA500 `^OS0;`. `enable_kpa_operate` allows `^OS1;` and should remain off until RF-risk testing is deliberate and local.
 
 ## Logging
 

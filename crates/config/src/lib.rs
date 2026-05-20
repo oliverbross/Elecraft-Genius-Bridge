@@ -34,6 +34,7 @@ pub struct BridgeConfig {
     pub logging: LoggingConfig,
     pub metrics: MetricsConfig,
     pub control: ControlConfig,
+    pub operational: OperationalConfig,
     pub flex_injection: FlexInjectionConfig,
     pub mock: MockConfig,
 }
@@ -82,6 +83,7 @@ impl BridgeConfig {
                 "control.verify_delay_ms must be > 0".to_string(),
             ));
         }
+        self.operational.validate()?;
         if self.logging.transcript_rotate_bytes == 0 {
             return Err(ConfigError::Invalid(
                 "logging.transcript_rotate_bytes must be > 0".to_string(),
@@ -121,6 +123,7 @@ impl Default for BridgeConfig {
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             control: ControlConfig::default(),
+            operational: OperationalConfig::default(),
             flex_injection: FlexInjectionConfig::default(),
             mock: MockConfig::default(),
         }
@@ -335,6 +338,43 @@ impl Default for ControlConfig {
         Self {
             verify_delay_ms: 200,
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OperationalConfig {
+    pub enable_real_controls: bool,
+    pub enable_kat_tune: bool,
+    pub enable_kat_bypass: bool,
+    pub enable_kat_antenna: bool,
+    pub enable_kpa_standby: bool,
+    pub enable_kpa_operate: bool,
+    pub enable_clear_fault: bool,
+    pub persist_rf_risk: bool,
+    pub confirm_real_hardware_control: String,
+}
+
+impl OperationalConfig {
+    pub fn controls_confirmed(&self) -> bool {
+        self.confirm_real_hardware_control == "I understand"
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.enable_real_controls && !self.controls_confirmed() {
+            return Err(ConfigError::Invalid(
+                "operational.confirm_real_hardware_control must be \"I understand\" when enable_real_controls=true".to_string(),
+            ));
+        }
+        if (self.enable_kpa_operate || self.enable_kat_tune || self.enable_clear_fault)
+            && !self.enable_real_controls
+        {
+            return Err(ConfigError::Invalid(
+                "operational RF-risk/advanced controls require enable_real_controls=true"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -638,6 +678,20 @@ pgxl:
             cfg.validate().unwrap();
         }
         cfg.tgxl.control_profile = "invented".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validates_operational_confirmation_gate() {
+        let mut cfg = BridgeConfig::default();
+        cfg.operational.enable_real_controls = true;
+        cfg.operational.enable_kat_tune = true;
+        assert!(cfg.validate().is_err());
+
+        cfg.operational.confirm_real_hardware_control = "I understand".to_string();
+        cfg.validate().unwrap();
+
+        cfg.operational.enable_real_controls = false;
         assert!(cfg.validate().is_err());
     }
 

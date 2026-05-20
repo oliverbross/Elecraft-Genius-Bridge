@@ -173,6 +173,7 @@ pub struct Kat500Settings {
     pub polling_interval: Duration,
     pub mock: bool,
     pub dry_run: bool,
+    pub allow_control: bool,
     pub allow_rf_risk: bool,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
@@ -646,6 +647,19 @@ impl Kat500Driver {
                 "KAT500 dry-run blocked {} ({:?})",
                 command.label,
                 command.safety
+            );
+        }
+        if command.safety == CommandSafety::StateChangeSafe && !self.settings.allow_control {
+            warn!(
+                event_id = "command_blocked_by_safety",
+                device = "KAT500",
+                command = command.label,
+                wire = command.wire,
+                "blocked safe KAT500 control because allow_control is false"
+            );
+            anyhow::bail!(
+                "KAT500 safe command {} requires allow_control",
+                command.label
             );
         }
         if command.safety == CommandSafety::RfRisk && !self.settings.allow_rf_risk {

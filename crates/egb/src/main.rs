@@ -81,6 +81,12 @@ enum Commands {
         #[arg(long, default_value_t = 60.0)]
         duration_seconds: f64,
     },
+    FullOperationalTest {
+        #[arg(long, default_value = "config.aethersdr-operational.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 180.0)]
+        duration_seconds: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -279,6 +285,14 @@ async fn main() -> Result<()> {
             init_logging(&cfg.logging.level);
             run_aethersdr_operational_test(cfg, config, duration_seconds).await
         }
+        Commands::FullOperationalTest {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_full_operational_test(cfg, config, duration_seconds).await
+        }
         Commands::ComparePgxlProfiles {
             config,
             duration_seconds,
@@ -473,6 +487,12 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
         shared_default_state()
     };
     apply_mock_config(cfg, &state).await;
+    let kpa_dry_run = effective_kpa_dry_run(cfg);
+    let kat_dry_run = effective_kat_dry_run(cfg);
+    let kpa_allow_control = effective_kpa_allow_control(cfg);
+    let kat_allow_control = effective_kat_allow_control(cfg);
+    let kpa_allow_rf_risk = effective_kpa_allow_rf_risk(cfg);
+    let kat_allow_rf_risk = effective_kat_allow_rf_risk(cfg);
     {
         let mut guard = state.write().await;
         guard.flex_injection.active_amplifier_status_profile =
@@ -489,8 +509,9 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 baud: cfg.kpa500.baud,
                 polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
                 mock: cfg.kpa500.mock,
-                dry_run: cfg.kpa500.dry_run,
-                allow_rf_risk: cfg.kpa500.allow_rf_risk,
+                dry_run: kpa_dry_run,
+                allow_control: kpa_allow_control,
+                allow_rf_risk: kpa_allow_rf_risk,
                 control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
                 transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
@@ -511,8 +532,9 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 baud: cfg.kat500.baud,
                 polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
                 mock: cfg.kat500.mock,
-                dry_run: cfg.kat500.dry_run,
-                allow_rf_risk: cfg.kat500.allow_rf_risk,
+                dry_run: kat_dry_run,
+                allow_control: kat_allow_control,
+                allow_rf_risk: kat_allow_rf_risk,
                 transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
                     .logging
@@ -637,7 +659,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
             create_meters: cfg.flex_injection.create_meters,
             create_interlock: cfg.flex_injection.create_interlock,
-            allow_rf_risk: cfg.kpa500.allow_rf_risk,
+            allow_rf_risk: kpa_allow_rf_risk,
             reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
             reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
             ping_interval: Duration::from_millis(cfg.flex_injection.ping_interval_ms),
@@ -734,6 +756,53 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
     }
 
     Ok(state)
+}
+
+fn operational_controls_confirmed(cfg: &BridgeConfig) -> bool {
+    cfg.operational.enable_real_controls && cfg.operational.controls_confirmed()
+}
+
+fn effective_kpa_dry_run(cfg: &BridgeConfig) -> bool {
+    if operational_controls_confirmed(cfg)
+        && (cfg.operational.enable_kpa_standby || cfg.operational.enable_kpa_operate)
+    {
+        false
+    } else {
+        cfg.kpa500.dry_run
+    }
+}
+
+fn effective_kat_dry_run(cfg: &BridgeConfig) -> bool {
+    if operational_controls_confirmed(cfg)
+        && (cfg.operational.enable_kat_tune
+            || cfg.operational.enable_kat_bypass
+            || cfg.operational.enable_kat_antenna)
+    {
+        false
+    } else {
+        cfg.kat500.dry_run
+    }
+}
+
+fn effective_kpa_allow_control(cfg: &BridgeConfig) -> bool {
+    cfg.kpa500.allow_control
+        || (operational_controls_confirmed(cfg) && cfg.operational.enable_kpa_standby)
+}
+
+fn effective_kat_allow_control(cfg: &BridgeConfig) -> bool {
+    cfg.kat500.allow_control
+        || (operational_controls_confirmed(cfg)
+            && (cfg.operational.enable_kat_bypass || cfg.operational.enable_kat_antenna))
+}
+
+fn effective_kpa_allow_rf_risk(cfg: &BridgeConfig) -> bool {
+    cfg.kpa500.allow_rf_risk
+        || (operational_controls_confirmed(cfg) && cfg.operational.enable_kpa_operate)
+}
+
+fn effective_kat_allow_rf_risk(cfg: &BridgeConfig) -> bool {
+    cfg.kat500.allow_rf_risk
+        || (operational_controls_confirmed(cfg) && cfg.operational.enable_kat_tune)
 }
 
 async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
@@ -1027,6 +1096,53 @@ async fn run_aethersdr_operational_test(
     Ok(())
 }
 
+async fn run_full_operational_test(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.pgxl_connect_assist = true;
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    cfg.validate()?;
+    let evidence = EvidenceRun::start(
+        "full-operational-test",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    tokio::fs::write(
+        evidence.dir().join("operational-readiness.md"),
+        operational_readiness_markdown(&cfg, &state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("smartsdr-interlock-analysis.md"),
+        smartsdr_interlock_analysis_markdown(&cfg, &state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("smartsdr-visibility-analysis.md"),
+        smartsdr_visibility_analysis_markdown(&state).await,
+    )
+    .await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "full operational test complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn run_pgxl_direct_trigger_matrix(
     mut cfg: BridgeConfig,
     config_path: PathBuf,
@@ -1283,6 +1399,9 @@ impl EvidenceRun {
             "pgxl-connect-assist.md",
             "real-vs-ui-amp-state.md",
             "aethersdr-operational-test.md",
+            "operational-readiness.md",
+            "smartsdr-interlock-analysis.md",
+            "smartsdr-visibility-analysis.md",
             "pgxl-trigger-matrix.md",
             "radio-stripped-amplifier-fields.md",
             "aethersdr-amp-parser-notes.md",
@@ -1427,6 +1546,11 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("aethersdr-operational-test.md"),
             aethersdr_operational_test_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("operational-readiness.md"),
+            operational_readiness_from_state_markdown(state).await,
         )
         .await?;
         tokio::fs::write(
@@ -2048,7 +2172,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
         create_meters: cfg.flex_injection.create_meters,
         create_interlock: cfg.flex_injection.create_interlock,
-        allow_rf_risk: cfg.kpa500.allow_rf_risk,
+        allow_rf_risk: effective_kpa_allow_rf_risk(cfg),
         reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
         reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
         ping_interval: Duration::from_millis(cfg.flex_injection.ping_interval_ms),
@@ -2317,6 +2441,128 @@ async fn aethersdr_operational_test_markdown(state: &SharedState) -> String {
             .last_flex_amp_set_command
             .as_deref()
             .unwrap_or("none"),
+    )
+}
+
+async fn operational_readiness_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Operational Readiness\n\n\
+        - Real controls enabled: {}\n\
+        - Confirmation accepted: {}\n\
+        - KAT tune enabled: {}\n\
+        - KAT bypass enabled: {}\n\
+        - KAT antenna enabled: {}\n\
+        - KPA standby enabled: {}\n\
+        - KPA operate enabled: {}\n\
+        - Effective KPA dry_run: {}\n\
+        - Effective KPA allow_control: {}\n\
+        - Effective KPA allow_rf_risk: {}\n\
+        - Effective KAT dry_run: {}\n\
+        - Effective KAT allow_control: {}\n\
+        - Effective KAT allow_rf_risk: {}\n\
+        - PGXL connected: {}\n\
+        - TGXL connected: {}\n\
+        - Final KPA state: `{}`\n\
+        - Final KAT antenna: {:?}, SWR {:.2}\n\
+        - Last control safety decision: `{}`\n",
+        cfg.operational.enable_real_controls,
+        cfg.operational.controls_confirmed(),
+        cfg.operational.enable_kat_tune,
+        cfg.operational.enable_kat_bypass,
+        cfg.operational.enable_kat_antenna,
+        cfg.operational.enable_kpa_standby,
+        cfg.operational.enable_kpa_operate,
+        effective_kpa_dry_run(cfg),
+        effective_kpa_allow_control(cfg),
+        effective_kpa_allow_rf_risk(cfg),
+        effective_kat_dry_run(cfg),
+        effective_kat_allow_control(cfg),
+        effective_kat_allow_rf_risk(cfg),
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        guard.amp.state.pgxl_state(),
+        guard.tuner.selected_antenna,
+        guard.tuner.swr,
+        guard
+            .controls
+            .last_safety_decision
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn operational_readiness_from_state_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Operational Readiness\n\n\
+        - PGXL connected: {}\n\
+        - TGXL connected: {}\n\
+        - KPA state: `{}`\n\
+        - KPA polls: success={} failure={}\n\
+        - KAT polls: success={} failure={}\n\
+        - Controls seen: {}\n\
+        - Last safety decision: `{}`\n",
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        guard.amp.state.pgxl_state(),
+        guard.amp.runtime.poll_success_count,
+        guard.amp.runtime.poll_failure_count,
+        guard.tuner.runtime.poll_success_count,
+        guard.tuner.runtime.poll_failure_count,
+        guard.controls.control_requested_count,
+        guard
+            .controls
+            .last_safety_decision
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn smartsdr_interlock_analysis_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# SmartSDR Interlock Analysis\n\n\
+        - AMP interlock creation enabled: {}\n\
+        - Interlock handle: {:?}\n\
+        - Antenna map: `{}`\n\
+        - Valid antenna mapping used by EGB interlock: `ANT1,ANT2`\n\
+        - Last Flex response: `{}`\n\
+        - Last Flex command: `{}`\n\n\
+        Current blocker: SmartSDR interlock behaviour requires a live SmartSDR/Flex transcript. EGB now captures `flex-rx.log`, `flex-tx.log`, and control events in `full-operational-test` evidence so the rejected tune/interlock line can be tied to an exact Flex response.\n",
+        cfg.flex_injection.create_interlock,
+        guard.flex_injection.interlock_handle,
+        cfg.flex_injection.ant_map,
+        guard
+            .flex_injection
+            .last_response
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_command
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn smartsdr_visibility_analysis_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# SmartSDR Visibility Analysis\n\n\
+        - PGXL amplifier handle: {:?}\n\
+        - TGXL/tuner handle: {:?}\n\
+        - Flex tuner appeared count: {}\n\
+        - Flex tuner disappeared count: {}\n\
+        - TGXL direct sessions: {}\n\
+        - PGXL direct sessions: {}\n\n\
+        AetherSDR direct TGXL is supported through TCP 9010. SmartSDR TGXL visibility depends on the Flex-side tuner/accessory status path; if `tuner_handle` remains absent while TGXL direct sessions work, SmartSDR TGXL injection remains the active blocker.\n",
+        guard.flex_injection.amplifier_handle,
+        guard.flex_injection.tuner_handle,
+        guard.flex_injection.tuner_appeared_count,
+        guard.flex_injection.tuner_disappeared_count,
+        guard.clients.tgxl_session_started_count,
+        guard.clients.pgxl_session_started_count,
     )
 }
 
@@ -3486,6 +3732,7 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
             mock: cfg.kpa500.mock,
             dry_run: cfg.kpa500.dry_run,
+            allow_control: cfg.kpa500.allow_control || allow_control,
             allow_rf_risk: cfg.kpa500.allow_rf_risk || allow_rf_risk,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
@@ -3581,6 +3828,7 @@ async fn test_kpa_operate(cfg: &BridgeConfig, allow_rf_risk: bool) -> Result<()>
             polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
             mock: cfg.kpa500.mock,
             dry_run: cfg.kpa500.dry_run,
+            allow_control: true,
             allow_rf_risk: cfg.kpa500.allow_rf_risk || allow_rf_risk,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
@@ -3638,6 +3886,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
             mock: cfg.kat500.mock,
             dry_run: cfg.kat500.dry_run,
+            allow_control: cfg.kat500.allow_control || allow_control,
             allow_rf_risk: cfg.kat500.allow_rf_risk || allow_rf_risk,
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
@@ -3971,6 +4220,7 @@ mod tests {
         assert!(names.contains(&"evidence-test".to_string()));
         assert!(names.contains(&"aethersdr-smoke-test".to_string()));
         assert!(names.contains(&"aethersdr-operational-test".to_string()));
+        assert!(names.contains(&"full-operational-test".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
         assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));
