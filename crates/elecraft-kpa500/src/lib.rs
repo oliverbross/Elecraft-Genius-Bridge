@@ -242,7 +242,25 @@ impl Kpa500Driver {
             {
                 Ok(mut port) => {
                     backoff = Duration::from_secs(1);
-                    info!(port = %self.settings.com_port, baud = self.settings.baud, "KPA500 serial connected");
+                    info!(
+                        event_id = "serial_connected",
+                        device = "KPA500",
+                        port = %self.settings.com_port,
+                        baud = self.settings.baud,
+                        dry_run = self.settings.dry_run,
+                        first_command = CMD_FIRMWARE.wire,
+                        "KPA500 serial connected"
+                    );
+                    append_evidence_line(
+                        "first-poll-sequence.log",
+                        format!(
+                            "KPA500 open success port={} baud={} dry_run={} first_command={}",
+                            self.settings.com_port,
+                            self.settings.baud,
+                            self.settings.dry_run,
+                            CMD_FIRMWARE.wire
+                        ),
+                    );
                     let mut transcript = SerialTranscript::open(
                         "KPA500",
                         &self.settings.com_port,
@@ -254,6 +272,7 @@ impl Kpa500Driver {
                         let mut guard = self.state.write().await;
                         guard.amp.connected = true;
                         guard.amp.connection_state = ConnectionState::Connecting;
+                        guard.amp.serial_port_open_error = None;
                     }
                     self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
@@ -283,14 +302,23 @@ impl Kpa500Driver {
                     }
                 }
                 Err(err) => {
+                    let error = format!(
+                        "failed to open KPA500 serial port {} at {} baud: {}; possible causes: wrong COM port, USB disconnect, or another process has the port locked",
+                        self.settings.com_port, self.settings.baud, err
+                    );
                     warn!(
                         port = %self.settings.com_port,
+                        baud = self.settings.baud,
+                        dry_run = self.settings.dry_run,
                         error = %err,
                         "KPA500 serial open failed; retrying"
                     );
+                    append_evidence_line("serial-port-open-errors.log", error.clone());
+                    append_evidence_line("first-poll-sequence.log", error.clone());
                     let mut guard = self.state.write().await;
                     guard.amp.connected = false;
                     guard.amp.connection_state = ConnectionState::Disconnected;
+                    guard.amp.serial_port_open_error = Some(error);
                     guard.amp.runtime.reconnect_count =
                         guard.amp.runtime.reconnect_count.saturating_add(1);
                 }
@@ -690,6 +718,13 @@ impl Kpa500Driver {
             {
                 Ok(read) => {
                     debug!(command = command.label, response = %read.response, unsolicited_count = read.unsolicited.len(), "KPA500 status response");
+                    append_evidence_line(
+                        "first-poll-sequence.log",
+                        format!(
+                            "KPA500 response command={} wire={} response={}",
+                            command.label, command.wire, read.response
+                        ),
+                    );
                     outcomes.push(CommandOutcome {
                         command: *command,
                         response: Some(read.response),
@@ -699,6 +734,13 @@ impl Kpa500Driver {
                 }
                 Err(err) => {
                     warn!(device = "KPA500", command = command.label, error = %err, "KPA500 read-only command failed; continuing");
+                    append_evidence_line(
+                        "first-poll-sequence.log",
+                        format!(
+                            "KPA500 command failed command={} wire={} error={}",
+                            command.label, command.wire, err
+                        ),
+                    );
                     outcomes.push(CommandOutcome {
                         command: *command,
                         response: None,
@@ -727,12 +769,47 @@ impl Kpa500Driver {
             }
             for outcome in &outcomes {
                 for unsolicited in &outcome.unsolicited {
+                    guard.amp.last_raw_response = Some(unsolicited.clone());
                     parse_kpa500_response(unsolicited, &mut guard.amp);
                 }
                 if let Some(response) = &outcome.response {
                     push_capability(&mut guard.amp.capabilities, outcome.command.label);
+                    guard.amp.last_raw_response = Some(response.clone());
+                    guard.amp.last_successful_command = Some(outcome.command.label.to_string());
                     parse_kpa500_response(response, &mut guard.amp);
                 }
+            }
+            let required = [
+                CMD_OPERATE_STATUS.label,
+                CMD_TEMPERATURE.label,
+                CMD_VOLTS_CURRENT.label,
+                CMD_FAULT.label,
+            ];
+            let missing = required
+                .iter()
+                .copied()
+                .filter(|label| {
+                    !outcomes.iter().any(|outcome| {
+                        outcome.command.label == *label && outcome.response.is_some()
+                    })
+                })
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                if !guard.amp.first_poll_completed {
+                    append_evidence_line(
+                        "first-poll-sequence.log",
+                        "KPA500 first poll completed: ^OS;, ^TM;, ^VI;, ^FL; returned responses",
+                    );
+                }
+                guard.amp.first_poll_completed = true;
+                guard.amp.first_poll_error = None;
+            } else {
+                guard.amp.first_poll_error = Some(format!(
+                    "missing first-poll responses for {} on {} at {} baud",
+                    missing.join(", "),
+                    self.settings.com_port,
+                    self.settings.baud
+                ));
             }
         }
         sleep(self.settings.polling_interval).await;

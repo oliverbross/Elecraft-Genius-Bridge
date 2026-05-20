@@ -476,6 +476,11 @@ fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> 
 }
 
 fn advertised_state_from_amp(amp: &bridge_core::AmpState) -> &'static str {
+    if !amp.first_poll_completed
+        && amp.startup_state_policy.as_deref() == Some("wait_for_first_kpa_poll")
+    {
+        return "UNKNOWN";
+    }
     if amp.fault.is_some() || amp.state == bridge_core::AmpOperatingState::Fault {
         "FAULT"
     } else {

@@ -147,6 +147,14 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 
+`flex_injection.amplifier_startup_state_policy` controls whether PGXL/Flex amplifier advertisement can happen before KPA500 telemetry is real:
+
+- `wait_for_first_kpa_poll`: recommended for real hardware. EGB waits for `^OS;`, `^TM;`, `^VI;`, and `^FL;` before sending the direct-connect amplifier create with live state.
+- `advertise_standby_immediately`: lab-only compatibility mode.
+- `advertise_configured_default`: reserved for future explicit default-state profiles.
+
+If first poll does not complete before `wait_first_kpa_poll_timeout_ms`, EGB emits `kpa500_not_polling` with the COM port/open error and proceeds in degraded mode.
+
 `amplifier_reannounce_interval_ms` controls the rate-limited amplifier refresh query and evidence logging. It does not create duplicate amplifier objects.
 
 This mode does not implement live radio-side meter value streaming, proxying, TLS, or WAN exposure. Operate remains RF-risk gated by `kpa500.allow_rf_risk`.

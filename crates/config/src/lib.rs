@@ -104,6 +104,7 @@ impl Default for BridgeConfig {
                 polling_interval_ms: 1000,
                 mock: true,
                 dry_run: true,
+                allow_control: false,
                 allow_rf_risk: false,
             },
             kat500: SerialDeviceConfig {
@@ -113,6 +114,7 @@ impl Default for BridgeConfig {
                 polling_interval_ms: 1000,
                 mock: true,
                 dry_run: true,
+                allow_control: false,
                 allow_rf_risk: false,
             },
             security: SecurityConfig::default(),
@@ -238,6 +240,7 @@ pub struct SerialDeviceConfig {
     pub polling_interval_ms: u64,
     pub mock: bool,
     pub dry_run: bool,
+    pub allow_control: bool,
     pub allow_rf_risk: bool,
 }
 
@@ -269,6 +272,7 @@ impl Default for SerialDeviceConfig {
             polling_interval_ms: 1000,
             mock: true,
             dry_run: true,
+            allow_control: false,
             allow_rf_risk: false,
         }
     }
@@ -352,6 +356,8 @@ pub struct FlexInjectionConfig {
     pub create_interlock: bool,
     pub amplifier_status_profile: String,
     pub trace_amplifier_advertisements: bool,
+    pub amplifier_startup_state_policy: String,
+    pub wait_first_kpa_poll_timeout_ms: u64,
     pub amplifier_reannounce_interval_ms: u64,
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
@@ -384,6 +390,21 @@ impl FlexInjectionConfig {
         validate_nonempty_token("flex_injection.handle", &self.handle)?;
         validate_nonempty_token("flex_injection.ant_map", &self.ant_map)?;
         self.validate_status_profile()?;
+        match self.amplifier_startup_state_policy.as_str() {
+            "wait_for_first_kpa_poll"
+            | "advertise_standby_immediately"
+            | "advertise_configured_default" => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "flex_injection.amplifier_startup_state_policy must be one of wait_for_first_kpa_poll, advertise_standby_immediately, advertise_configured_default; got {other}"
+                )))
+            }
+        }
+        if self.wait_first_kpa_poll_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "flex_injection.wait_first_kpa_poll_timeout_ms must be > 0".to_string(),
+            ));
+        }
         if self.amplifier_reannounce_interval_ms == 0 {
             return Err(ConfigError::Invalid(
                 "flex_injection.amplifier_reannounce_interval_ms must be > 0".to_string(),
@@ -445,6 +466,8 @@ impl Default for FlexInjectionConfig {
             create_interlock: true,
             amplifier_status_profile: "pgxl_paired".to_string(),
             trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout_ms: 10000,
             amplifier_reannounce_interval_ms: 5000,
             reconnect_initial_ms: 1000,
             reconnect_max_ms: 30000,

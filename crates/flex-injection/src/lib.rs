@@ -23,6 +23,8 @@ pub struct FlexInjectionSettings {
     pub ant_map: String,
     pub amplifier_status_profile: String,
     pub trace_amplifier_advertisements: bool,
+    pub amplifier_startup_state_policy: String,
+    pub wait_first_kpa_poll_timeout: Duration,
     pub full_pgxl_registration: bool,
     pub create_meters: bool,
     pub create_interlock: bool,
@@ -146,6 +148,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 trace_flex_rx(&line);
 
                 if session.has_handle && !registration_sent {
+                    wait_for_kpa_first_poll_if_needed(settings, &state).await;
                     let items = registration
                         .get_or_insert(registration_commands_with_state(settings, &state).await);
                     for item in items.iter() {
@@ -304,6 +307,68 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 tuner_refresh_timer.as_mut().reset(tokio::time::Instant::now() + settings.tuner_refresh_interval);
             }
         }
+    }
+}
+
+async fn wait_for_kpa_first_poll_if_needed(settings: &FlexInjectionSettings, state: &SharedState) {
+    if settings.amplifier_startup_state_policy != "wait_for_first_kpa_poll" {
+        return;
+    }
+    let started = Instant::now();
+    {
+        let mut guard = state.write().await;
+        guard.amp.advertisement_waiting_for_first_poll = true;
+    }
+    loop {
+        let (ready, error) = {
+            let guard = state.read().await;
+            (
+                guard.amp.first_poll_completed,
+                guard
+                    .amp
+                    .first_poll_error
+                    .clone()
+                    .or_else(|| guard.amp.serial_port_open_error.clone()),
+            )
+        };
+        if ready {
+            let mut guard = state.write().await;
+            guard.amp.advertisement_waiting_for_first_poll = false;
+            append_evidence_line(
+                "first-poll-sequence.log",
+                "KPA500 first poll completed before amplifier advertisement",
+            );
+            return;
+        }
+        if started.elapsed() >= settings.wait_first_kpa_poll_timeout {
+            let warning = format!(
+                "kpa500_not_polling: no successful KPA500 first poll after {} ms; last_error={}",
+                settings.wait_first_kpa_poll_timeout.as_millis(),
+                error.as_deref().unwrap_or("none")
+            );
+            {
+                let mut guard = state.write().await;
+                guard.amp.advertisement_waiting_for_first_poll = false;
+                guard.amp.first_poll_error = Some(warning.clone());
+                guard.flex_injection.degraded_reason = Some(warning.clone());
+            }
+            append_evidence_line("warnings-errors.log", warning.clone());
+            append_evidence_line("first-poll-sequence.log", warning.clone());
+            append_evidence_json(
+                "disconnect-events.jsonl",
+                &serde_json::json!({
+                    "event": "kpa500_not_polling",
+                    "timeout_ms": settings.wait_first_kpa_poll_timeout.as_millis(),
+                    "last_error": error,
+                }),
+            );
+            warn!(
+                event_id = "kpa500_not_polling",
+                "KPA500 did not complete first poll before amplifier advertisement"
+            );
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1039,6 +1104,11 @@ async fn synthetic_amplifier_status_line(
 }
 
 fn advertised_amp_state(amp: &bridge_core::AmpState) -> &'static str {
+    if !amp.first_poll_completed
+        && amp.startup_state_policy.as_deref() == Some("wait_for_first_kpa_poll")
+    {
+        return "UNKNOWN";
+    }
     if amp.fault.is_some() || amp.state == bridge_core::AmpOperatingState::Fault {
         "FAULT"
     } else {
@@ -1292,6 +1362,8 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "strict_real_pgxl".to_string(),
             trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1337,6 +1409,8 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1379,6 +1453,8 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1434,6 +1510,8 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1458,6 +1536,40 @@ mod tests {
         assert!(commands[0].command.contains("direct=1"));
     }
 
+    #[tokio::test]
+    async fn wait_policy_uses_unknown_before_first_poll() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.startup_state_policy = Some("wait_for_first_kpa_poll".to_string());
+        }
+        let commands = registration_commands_with_state(&settings, &state).await;
+        assert!(commands[0].command.contains("state=UNKNOWN"));
+    }
+
     #[test]
     fn full_pgxl_registration_sequence_matches_reference_order() {
         let settings = FlexInjectionSettings {
@@ -1470,6 +1582,8 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "pgxl_paired".to_string(),
             trace_amplifier_advertisements: false,
+            amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,

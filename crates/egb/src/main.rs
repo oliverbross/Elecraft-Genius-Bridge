@@ -81,6 +81,12 @@ enum Commands {
         #[arg(long, default_value_t = 60.0)]
         duration_seconds: f64,
     },
+    TestStartupSequence {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 30.0)]
+        duration_seconds: f64,
+    },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -255,6 +261,14 @@ async fn main() -> Result<()> {
             init_logging(&cfg.logging.level);
             compare_pgxl_profiles(cfg, config, duration_seconds).await
         }
+        Commands::TestStartupSequence {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            test_startup_sequence(cfg, config, duration_seconds).await
+        }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
             println!("config OK: {}", config.display());
@@ -422,6 +436,8 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
         guard.flex_injection.active_amplifier_status_profile =
             Some(cfg.flex_injection.amplifier_status_profile.clone());
         guard.flex_injection.active_tgxl_control_profile = Some(cfg.tgxl.control_profile.clone());
+        guard.amp.startup_state_policy =
+            Some(cfg.flex_injection.amplifier_startup_state_policy.clone());
     }
 
     if cfg.kpa500.enabled {
@@ -566,6 +582,13 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             ant_map: cfg.flex_injection.ant_map.clone(),
             amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
             trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
+            amplifier_startup_state_policy: cfg
+                .flex_injection
+                .amplifier_startup_state_policy
+                .clone(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(
+                cfg.flex_injection.wait_first_kpa_poll_timeout_ms,
+            ),
             full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
             create_meters: cfg.flex_injection.create_meters,
             create_interlock: cfg.flex_injection.create_interlock,
@@ -613,6 +636,32 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
                 warn!(
                     event_id = "pgxl_manual_connect_no_socket_attempt",
                     "Flex amplifier is present but no PGXL TCP session started"
+                );
+            }
+        });
+    }
+
+    if cfg.kpa500.enabled && !cfg.kpa500.mock {
+        let state = state.clone();
+        let port = cfg.kpa500.com_port.clone();
+        let baud = cfg.kpa500.baud;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let guard = state.read().await;
+            if !guard.amp.first_poll_completed {
+                let warning = format!(
+                    "kpa500_not_polling: no successful KPA500 poll within 5 seconds on {port} at {baud} baud; port_error={}; first_poll_error={}",
+                    guard.amp.serial_port_open_error.as_deref().unwrap_or("none"),
+                    guard.amp.first_poll_error.as_deref().unwrap_or("none")
+                );
+                drop(guard);
+                append_evidence_line("warnings-errors.log", warning.clone());
+                append_evidence_line("first-poll-sequence.log", warning.clone());
+                warn!(
+                    event_id = "kpa500_not_polling",
+                    port = %port,
+                    baud = baud,
+                    "KPA500 did not complete a successful poll within startup window"
                 );
             }
         });
@@ -851,6 +900,39 @@ async fn compare_pgxl_profiles(
     Ok(())
 }
 
+async fn test_startup_sequence(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start(
+        "test-startup-sequence",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    append_evidence_line(
+        "first-poll-sequence.log",
+        "Starting bridge with KPA first-poll gate before Flex amplifier advertisement",
+    );
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "startup sequence test complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn test_pgxl_direct(host: &str, port: u16) -> Result<()> {
     let log_path = PathBuf::from("logs")
         .join("tests")
@@ -1020,6 +1102,10 @@ impl EvidenceRun {
             "pgxl-regression-diff.md",
             "amplifier-advertisements.jsonl",
             "pgxl-connect-attempt-timeline.md",
+            "kpa-startup-diagnostics.md",
+            "first-poll-sequence.log",
+            "startup-advertisement-policy.md",
+            "serial-port-open-errors.log",
         ] {
             File::create(dir.join(file))?;
         }
@@ -1126,6 +1212,16 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("pgxl-connect-attempt-timeline.md"),
             pgxl_connect_attempt_timeline_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("kpa-startup-diagnostics.md"),
+            kpa_startup_diagnostics_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("startup-advertisement-policy.md"),
+            startup_advertisement_policy_markdown(state).await,
         )
         .await?;
         zip_dir(&self.dir, &self.zip_path)?;
@@ -1634,6 +1730,70 @@ async fn pgxl_connect_attempt_timeline_markdown(state: &SharedState) -> String {
     )
 }
 
+async fn kpa_startup_diagnostics_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# KPA500 Startup Diagnostics\n\n\
+        - Connection state: `{}`\n\
+        - Connected: {}\n\
+        - First poll completed: {}\n\
+        - First poll error: `{}`\n\
+        - Serial port open error: `{}`\n\
+        - Last successful command: `{}`\n\
+        - Last raw response: `{}`\n\
+        - Poll successes: {}\n\
+        - Poll failures: {}\n\
+        - Reconnects: {}\n\n\
+        Probable causes when disconnected: wrong COM port, KPA500 USB cable disconnected, KPA500 powered off, or another process such as Elecraft KPA500 Remote has the COM port locked.\n",
+        guard.amp.connection_state.as_str(),
+        guard.amp.is_connected(),
+        guard.amp.first_poll_completed,
+        guard.amp.first_poll_error.as_deref().unwrap_or("none"),
+        guard.amp.serial_port_open_error.as_deref().unwrap_or("none"),
+        guard.amp.last_successful_command.as_deref().unwrap_or("none"),
+        guard.amp.last_raw_response.as_deref().unwrap_or("none"),
+        guard.amp.runtime.poll_success_count,
+        guard.amp.runtime.poll_failure_count,
+        guard.amp.runtime.reconnect_count,
+    )
+}
+
+async fn startup_advertisement_policy_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Startup Advertisement Policy\n\n\
+        - Policy: `{}`\n\
+        - Waiting for first poll: {}\n\
+        - First KPA poll completed: {}\n\
+        - Last advertised Flex state: `{}`\n\
+        - Last advertised PGXL state: `{}`\n\
+        - Last amplifier status line: `{}`\n\n\
+        With `wait_for_first_kpa_poll`, EGB delays the direct-connect amplifier create until KPA500 has returned `^OS;`, `^TM;`, `^VI;`, and `^FL;`, or until the configured timeout emits `kpa500_not_polling`.\n",
+        guard
+            .amp
+            .startup_state_policy
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard.amp.advertisement_waiting_for_first_poll,
+        guard.amp.first_poll_completed,
+        guard
+            .flex_injection
+            .last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
 async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
     let guard = state.read().await;
     let live_state = advertised_amp_state_for_status(&guard.amp);
@@ -1761,6 +1921,13 @@ async fn latest_kpa_telemetry_json(state: &SharedState) -> serde_json::Value {
         "firmware_version": guard.amp.firmware_version,
         "serial_number": guard.amp.serial_number,
         "last_successful_poll_ms": system_time_ms(guard.amp.last_successful_poll_at),
+        "first_poll_completed": guard.amp.first_poll_completed,
+        "first_poll_error": guard.amp.first_poll_error,
+        "serial_port_open_error": guard.amp.serial_port_open_error,
+        "last_raw_response": guard.amp.last_raw_response,
+        "last_successful_command": guard.amp.last_successful_command,
+        "startup_state_policy": guard.amp.startup_state_policy,
+        "advertisement_waiting_for_first_poll": guard.amp.advertisement_waiting_for_first_poll,
     })
 }
 
@@ -1781,6 +1948,11 @@ async fn latest_pgxl_advertised_status_json(state: &SharedState) -> serde_json::
 }
 
 fn advertised_amp_state_for_status(amp: &bridge_core::state::AmpState) -> &'static str {
+    if !amp.first_poll_completed
+        && amp.startup_state_policy.as_deref() == Some("wait_for_first_kpa_poll")
+    {
+        return "UNKNOWN";
+    }
     if amp.fault.is_some() || amp.state == AmpOperatingState::Fault {
         "FAULT"
     } else {
@@ -2138,6 +2310,13 @@ async fn status_json(state: &SharedState) -> String {
             "firmware_version": guard.amp.firmware_version,
             "serial_number": guard.amp.serial_number,
             "capabilities": guard.amp.capabilities,
+            "first_poll_completed": guard.amp.first_poll_completed,
+            "first_poll_error": guard.amp.first_poll_error,
+            "serial_port_open_error": guard.amp.serial_port_open_error,
+            "last_raw_response": guard.amp.last_raw_response,
+            "last_successful_command": guard.amp.last_successful_command,
+            "startup_state_policy": guard.amp.startup_state_policy,
+            "advertisement_waiting_for_first_poll": guard.amp.advertisement_waiting_for_first_poll,
             "last_successful_poll_ms": system_time_ms(guard.amp.last_successful_poll_at),
             "stale_duration_ms": stale_duration_ms(guard.amp.last_successful_poll_at),
             "runtime": runtime_json(&guard.amp.runtime),
@@ -3240,6 +3419,7 @@ mod tests {
         assert!(names.contains(&"stability-test".to_string()));
         assert!(names.contains(&"evidence-test".to_string()));
         assert!(names.contains(&"aethersdr-smoke-test".to_string()));
+        assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
     }
 

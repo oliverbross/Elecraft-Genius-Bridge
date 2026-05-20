@@ -499,6 +499,49 @@ impl GuiApp {
             field(ui, "Fault", amp.and_then(|a| a.fault.as_deref()).unwrap_or("none"));
             field(
                 ui,
+                "First poll",
+                amp.and_then(|a| a.first_poll_completed)
+                    .map(|value| bool_text(Some(value)))
+                    .unwrap_or("unknown"),
+            );
+            field(
+                ui,
+                "First poll error",
+                amp.and_then(|a| a.first_poll_error.as_deref())
+                    .unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Port open error",
+                amp.and_then(|a| a.serial_port_open_error.as_deref())
+                    .unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Last KPA command",
+                amp.and_then(|a| a.last_successful_command.as_deref())
+                    .unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Last KPA raw",
+                amp.and_then(|a| a.last_raw_response.as_deref()).unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Startup policy",
+                amp.and_then(|a| a.startup_state_policy.as_deref())
+                    .unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Ad waiting",
+                amp.and_then(|a| a.advertisement_waiting_for_first_poll)
+                    .map(|value| bool_text(Some(value)))
+                    .unwrap_or("unknown"),
+            );
+            field(
+                ui,
                 "Last poll",
                 format_ms_age(amp.and_then(|a| a.stale_duration_ms)),
             );
@@ -1184,6 +1227,26 @@ impl GuiApp {
             checkbox(ui, "Create AMP meters", &mut self.config.flex_injection.create_meters);
             checkbox(ui, "Create AMP interlock", &mut self.config.flex_injection.create_interlock);
             checkbox(ui, "Trace amplifier advertisements", &mut self.config.flex_injection.trace_amplifier_advertisements);
+            egui::ComboBox::from_label("Amplifier startup policy")
+                .selected_text(self.config.flex_injection.amplifier_startup_state_policy.as_str())
+                .show_ui(ui, |ui| {
+                    for policy in [
+                        "wait_for_first_kpa_poll",
+                        "advertise_standby_immediately",
+                        "advertise_configured_default",
+                    ] {
+                        ui.selectable_value(
+                            &mut self.config.flex_injection.amplifier_startup_state_policy,
+                            policy.to_string(),
+                            policy,
+                        );
+                    }
+                });
+            u64_field(
+                ui,
+                "First KPA poll timeout ms",
+                &mut self.config.flex_injection.wait_first_kpa_poll_timeout_ms,
+            );
             u64_field(
                 ui,
                 "Amplifier reannounce interval ms",
@@ -1866,6 +1929,20 @@ struct DeviceStatus {
     selected_antenna: Option<u8>,
     #[serde(default)]
     unsolicited_count: Option<u64>,
+    #[serde(default)]
+    first_poll_completed: Option<bool>,
+    #[serde(default)]
+    first_poll_error: Option<String>,
+    #[serde(default)]
+    serial_port_open_error: Option<String>,
+    #[serde(default)]
+    last_raw_response: Option<String>,
+    #[serde(default)]
+    last_successful_command: Option<String>,
+    #[serde(default)]
+    startup_state_policy: Option<String>,
+    #[serde(default)]
+    advertisement_waiting_for_first_poll: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
