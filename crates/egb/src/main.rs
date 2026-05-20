@@ -81,6 +81,12 @@ enum Commands {
         #[arg(long, default_value_t = 60.0)]
         duration_seconds: f64,
     },
+    AmplifierOperateLab {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 60.0)]
+        duration_seconds: f64,
+    },
     PgxlDirectTriggerMatrix {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -266,6 +272,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             compare_pgxl_profiles(cfg, config, duration_seconds).await
+        }
+        Commands::AmplifierOperateLab {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_amplifier_operate_lab(cfg, config, duration_seconds).await
         }
         Commands::PgxlDirectTriggerMatrix {
             config,
@@ -597,6 +611,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
             trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
             pgxl_force_operate_advertisement: cfg.flex_injection.pgxl_force_operate_advertisement,
+            flex_force_operate_via_radio: cfg.flex_injection.flex_force_operate_via_radio,
             amplifier_startup_state_policy: cfg
                 .flex_injection
                 .amplifier_startup_state_policy
@@ -915,6 +930,51 @@ async fn compare_pgxl_profiles(
     Ok(())
 }
 
+async fn run_amplifier_operate_lab(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    cfg.flex_injection.pgxl_force_operate_advertisement = true;
+    cfg.flex_injection.flex_force_operate_via_radio = true;
+    cfg.flex_injection.amplifier_status_profile = "aethersdr_pgxl_direct_lab".to_string();
+    cfg.validate()?;
+
+    let evidence = EvidenceRun::start(
+        "amplifier-operate-lab",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    tokio::fs::write(
+        evidence.dir().join("amplifier-operate-lab.md"),
+        amplifier_operate_lab_markdown(&state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("amplifier-state-rewrite-analysis.md"),
+        amplifier_state_rewrite_analysis_markdown(&state).await,
+    )
+    .await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "amplifier operate lab complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn run_pgxl_direct_trigger_matrix(
     mut cfg: BridgeConfig,
     config_path: PathBuf,
@@ -1165,6 +1225,9 @@ impl EvidenceRun {
             "latest-pgxl-advertised-status.json",
             "pgxl-regression-diff.md",
             "amplifier-advertisements.jsonl",
+            "amplifier-operate-lab.md",
+            "flex-amplifier-operate-sequence.log",
+            "amplifier-state-rewrite-analysis.md",
             "pgxl-trigger-matrix.md",
             "radio-stripped-amplifier-fields.md",
             "aethersdr-amp-parser-notes.md",
@@ -1284,6 +1347,16 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("radio-stripped-amplifier-fields.md"),
             radio_stripped_amplifier_fields_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("amplifier-state-rewrite-analysis.md"),
+            amplifier_state_rewrite_analysis_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("amplifier-operate-lab.md"),
+            amplifier_operate_lab_markdown(state).await,
         )
         .await?;
         tokio::fs::write(
@@ -1896,6 +1969,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
         trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
         pgxl_force_operate_advertisement: cfg.flex_injection.pgxl_force_operate_advertisement,
+        flex_force_operate_via_radio: cfg.flex_injection.flex_force_operate_via_radio,
         amplifier_startup_state_policy: cfg.flex_injection.amplifier_startup_state_policy.clone(),
         wait_first_kpa_poll_timeout: Duration::from_millis(
             cfg.flex_injection.wait_first_kpa_poll_timeout_ms,
@@ -1982,6 +2056,100 @@ async fn radio_stripped_amplifier_fields_markdown(state: &SharedState) -> String
         observed_fields,
         stripped,
     )
+}
+
+async fn amplifier_operate_lab_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Amplifier Operate Lab\n\n\
+        This lab sends `amplifier set <handle> operate=1` to the Flex API only. It does not send `^OS1;` to the KPA500.\n\n\
+        - Flex operate lab enabled: {}\n\
+        - Lab command count: {}\n\
+        - Lab command accepted count: {}\n\
+        - Flex desired amp state: `{}`\n\
+        - Last observed radio-side amp state rewrite: `{}`\n\
+        - Last emitted amplifier advertisement: `{}`\n\
+        - Last observed amplifier status: `{}`\n\
+        - PGXL sessions started: {}\n\
+        - PGXL direct attempted after status: {}\n\n\
+        If `Lab command accepted count` increases but the observed status remains `state=STANDBY`, the Flex radio owns or rewrites amplifier operate state separately from create/status metadata.\n",
+        guard.flex_injection.flex_force_operate_via_radio,
+        guard.flex_injection.flex_operate_lab_command_count,
+        guard.flex_injection.flex_operate_lab_accept_count,
+        guard
+            .flex_injection
+            .flex_desired_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .radio_rewritten_amp_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_emitted_amplifier_advertisement_line
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        guard.clients.pgxl_session_started_count,
+        guard
+            .flex_injection
+            .amplifier_pgxl_tcp_attempted_after_status,
+    )
+}
+
+async fn amplifier_state_rewrite_analysis_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let emitted = guard
+        .flex_injection
+        .last_emitted_amplifier_advertisement_line
+        .as_deref()
+        .unwrap_or("none");
+    let observed = guard
+        .flex_injection
+        .last_amplifier_status_line
+        .as_deref()
+        .unwrap_or("none");
+    let emitted_state = field_value(emitted, "state").unwrap_or("unknown");
+    let observed_state = field_value(observed, "state").unwrap_or("unknown");
+    let conclusion = if guard.flex_injection.flex_operate_lab_accept_count > 0
+        && observed_state == "OPERATE"
+    {
+        "Flex accepted `amplifier set operate=1` and later advertised OPERATE."
+    } else if guard.flex_injection.flex_operate_lab_accept_count > 0 && observed_state == "STANDBY"
+    {
+        "Flex accepted the lab command but still advertised STANDBY, so the radio is rewriting or refusing effective operate state."
+    } else {
+        "The lab has not yet proven whether `amplifier set operate=1` changes the observed radio-side amplifier state."
+    };
+    format!(
+        "# Amplifier State Rewrite Analysis\n\n\
+        - EGB emitted state: `{emitted_state}`\n\
+        - Flex observed state: `{observed_state}`\n\
+        - Lab command count: {}\n\
+        - Lab accepted count: {}\n\
+        - Radio rewritten amp state: `{}`\n\
+        - PGXL sessions started: {}\n\n\
+        Conclusion: {conclusion}\n",
+        guard.flex_injection.flex_operate_lab_command_count,
+        guard.flex_injection.flex_operate_lab_accept_count,
+        guard
+            .flex_injection
+            .radio_rewritten_amp_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard.clients.pgxl_session_started_count,
+    )
+}
+
+fn field_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(&format!("{key}=")))
 }
 
 fn kv_field_names(line: &str) -> Vec<String> {
@@ -3632,6 +3800,7 @@ mod tests {
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
         assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));
+        assert!(names.contains(&"amplifier-operate-lab".to_string()));
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub struct FlexInjectionSettings {
     pub amplifier_status_profile: String,
     pub trace_amplifier_advertisements: bool,
     pub pgxl_force_operate_advertisement: bool,
+    pub flex_force_operate_via_radio: bool,
     pub amplifier_startup_state_policy: String,
     pub wait_first_kpa_poll_timeout: Duration,
     pub full_pgxl_registration: bool,
@@ -181,6 +182,9 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 }
 
                 if let Some((seq, code, body)) = parse_response(&line) {
+                    if settings.flex_force_operate_via_radio {
+                        append_flex_operate_lab_line(format!("RX_RESPONSE R{seq}|{code}|{body}"));
+                    }
                     session
                         .observe_response(settings, &state, seq, &code, &body)
                         .await;
@@ -196,6 +200,18 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         )
                         .await;
                         set_amplifier_handle(&state, &status.handle).await;
+                        if settings.flex_force_operate_via_radio {
+                            append_flex_operate_lab_line(format!("RX_STATUS {}", status.raw));
+                            send_flex_operate_lab_command(
+                                settings,
+                                &mut writer,
+                                &mut session,
+                                &state,
+                                &mut next_seq,
+                                &status.handle,
+                            )
+                            .await?;
+                        }
                         handle_amplifier_status(
                             settings,
                             &state,
@@ -435,12 +451,50 @@ async fn send_tracked_command(
     Ok(())
 }
 
+async fn send_flex_operate_lab_command(
+    settings: &FlexInjectionSettings,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    session: &mut FlexSession,
+    state: &SharedState,
+    next_seq: &mut u32,
+    handle: &str,
+) -> Result<()> {
+    if !settings.flex_force_operate_via_radio || session.operate_lab_sent {
+        return Ok(());
+    }
+    session.operate_lab_sent = true;
+    let command = format!("amplifier set {handle} operate=1");
+    append_flex_operate_lab_line(format!("TX_PENDING {command}"));
+    {
+        let mut guard = state.write().await;
+        guard.flex_injection.flex_force_operate_via_radio = true;
+        guard.flex_injection.flex_desired_amp_state = Some("OPERATE".to_string());
+        guard.flex_injection.flex_operate_lab_command_count = guard
+            .flex_injection
+            .flex_operate_lab_command_count
+            .saturating_add(1);
+    }
+    send_tracked_command(
+        writer,
+        session,
+        state,
+        next_seq,
+        PendingCommand::new(
+            "amplifier_operate_lab",
+            command,
+            PendingKind::AmplifierOperateLab,
+        ),
+    )
+    .await
+}
+
 #[derive(Debug, Default)]
 struct FlexSession {
     has_handle: bool,
     handle: Option<String>,
     version: Option<String>,
     amplifier_handle: Option<String>,
+    operate_lab_sent: bool,
     pending: HashMap<u32, PendingCommand>,
 }
 
@@ -528,6 +582,13 @@ impl FlexSession {
                     set_amplifier_handle(state, handle).await;
                 }
             }
+            PendingKind::AmplifierOperateLab => {
+                let mut guard = state.write().await;
+                guard.flex_injection.flex_operate_lab_accept_count = guard
+                    .flex_injection
+                    .flex_operate_lab_accept_count
+                    .saturating_add(1);
+            }
             PendingKind::MeterCreate { name } => {
                 if let Some(handle) = response_object_id(body) {
                     upsert_meter_handle(state, name, handle).await;
@@ -604,7 +665,18 @@ async fn record_amplifier_pairing_status(
     candidate_fields: Vec<String>,
 ) {
     let mut guard = state.write().await;
+    let observed_state = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("state="))
+        .map(str::to_string);
     guard.flex_injection.last_amplifier_status_line = Some(line);
+    if let Some(observed_state) = observed_state {
+        if guard.flex_injection.flex_desired_amp_state.as_deref() == Some("OPERATE")
+            && observed_state == "STANDBY"
+        {
+            guard.flex_injection.radio_rewritten_amp_state = Some("STANDBY".to_string());
+        }
+    }
     guard.flex_injection.amplifier_pairing_candidate_fields = candidate_fields;
     guard
         .flex_injection
@@ -704,6 +776,9 @@ async fn handle_amplifier_status(
     next_seq: &mut u32,
     status: &AmplifierStatus,
 ) -> Result<()> {
+    if settings.flex_force_operate_via_radio {
+        return Ok(());
+    }
     let requested = status.requested_operate();
     debug!(
         amplifier_handle = %status.handle,
@@ -833,6 +908,7 @@ enum PendingKind {
     KeepaliveEnable,
     Subscription,
     AmplifierReannounce,
+    AmplifierOperateLab,
     TunerPresenceRefresh,
     Ping,
 }
@@ -955,6 +1031,19 @@ fn append_flex_log_line(file_name: &str, line: &str) {
     {
         let _ = writeln!(file, "{line}");
     }
+}
+
+fn append_flex_operate_lab_line(line: impl AsRef<str>) {
+    let line = format!(
+        "{} {}",
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        line.as_ref()
+    );
+    append_flex_log_line("flex-amplifier-operate-sequence.log", &line);
+    append_evidence_line("flex-amplifier-operate-sequence.log", line);
 }
 
 async fn trace_amplifier_advertisement(
@@ -1453,6 +1542,7 @@ mod tests {
             amplifier_status_profile: "strict_real_pgxl".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1501,6 +1591,7 @@ mod tests {
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1546,6 +1637,7 @@ mod tests {
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1604,6 +1696,7 @@ mod tests {
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1643,6 +1736,7 @@ mod tests {
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1678,6 +1772,7 @@ mod tests {
             amplifier_status_profile: "pgxl_paired".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1731,6 +1826,7 @@ mod tests {
             amplifier_status_profile: "aethersdr_pgxl_direct_lab".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: true,
+            flex_force_operate_via_radio: false,
             amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1756,5 +1852,37 @@ mod tests {
         assert!(variants.iter().any(|variant| {
             variant.name == "STANDBY-A-model-ip" && variant.line.contains("state=STANDBY")
         }));
+    }
+
+    #[test]
+    fn lab_force_radio_operate_setting_is_separate_from_rf_risk() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_pgxl_direct_lab".to_string(),
+            trace_amplifier_advertisements: true,
+            pgxl_force_operate_advertisement: true,
+            flex_force_operate_via_radio: true,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        assert!(settings.flex_force_operate_via_radio);
+        assert!(!settings.allow_rf_risk);
+        assert!(settings.lab_forces_operate_advertisement());
     }
 }

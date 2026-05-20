@@ -80,6 +80,8 @@ flex_injection:
   trace_amplifier_advertisements: false
   # Lab-only: advertises OPERATE to AetherSDR without sending any KPA500 command.
   pgxl_force_operate_advertisement: false
+  # Lab-only: sends Flex API amplifier set <handle> operate=1 without touching KPA500.
+  flex_force_operate_via_radio: false
   amplifier_startup_state_policy: wait_for_first_kpa_poll
   wait_first_kpa_poll_timeout_ms: 10000
   amplifier_reannounce_interval_ms: 5000

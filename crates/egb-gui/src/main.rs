@@ -719,6 +719,24 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "EGB desired amp",
+                    status
+                        .flex_injection
+                        .flex_desired_amp_state
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Radio-rewritten amp",
+                    status
+                        .flex_injection
+                        .radio_rewritten_amp_state
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
                     "Advertised PGXL",
                     status
                         .flex_injection
@@ -883,6 +901,15 @@ impl GuiApp {
                             .flex_injection
                             .amplifier_pgxl_tcp_attempted_after_status,
                     )),
+                );
+                field(
+                    ui,
+                    "Flex operate lab",
+                    format!(
+                        "sent={} accepted={}",
+                        status.flex_injection.flex_operate_lab_command_count,
+                        status.flex_injection.flex_operate_lab_accept_count
+                    ),
                 );
                 field(
                     ui,
@@ -2042,6 +2069,16 @@ struct FlexStatus {
     state_advertisement_mismatch: Option<String>,
     #[serde(default)]
     state_advertisement_mismatch_count: u64,
+    #[serde(default)]
+    flex_desired_amp_state: Option<String>,
+    #[serde(default)]
+    radio_rewritten_amp_state: Option<String>,
+    #[serde(default)]
+    flex_force_operate_via_radio: bool,
+    #[serde(default)]
+    flex_operate_lab_command_count: u64,
+    #[serde(default)]
+    flex_operate_lab_accept_count: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
