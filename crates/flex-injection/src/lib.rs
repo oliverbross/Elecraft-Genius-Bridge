@@ -76,6 +76,7 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
         let mut guard = state.write().await;
         guard.flex_injection.enabled = true;
         guard.flex_injection.connection_state = ConnectionState::Connecting;
+        guard.flex_injection.radio_addr = Some(settings.radio_addr.to_string());
         guard.flex_injection.pgxl_connect_assist_enabled = settings.pgxl_connect_assist;
         guard.flex_injection.flex_force_operate_via_radio = settings.flex_force_operate_via_radio;
     }
@@ -91,6 +92,8 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
                     retry_ms = backoff.as_millis(),
                     "Flex amplifier injection session failed"
                 );
+                let mut guard = state.write().await;
+                guard.flex_injection.last_error = Some(err.to_string());
             }
         }
         {
@@ -130,8 +133,17 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         let mut guard = state.write().await;
         guard.flex_injection.connection_state = ConnectionState::Connected;
         guard.flex_injection.degraded_reason = None;
+        guard.flex_injection.last_error = None;
+        guard.flex_injection.tcp_connect_success_count = guard
+            .flex_injection
+            .tcp_connect_success_count
+            .saturating_add(1);
         guard.flex_injection.last_command = None;
         guard.flex_injection.last_response = None;
+        guard.flex_injection.client_handle_received = false;
+        guard.flex_injection.amplifier_create_sent = false;
+        guard.flex_injection.amplifier_create_accepted = false;
+        guard.flex_injection.sub_amplifier_all_accepted = false;
     }
 
     let mut registration: Option<Vec<PendingCommand>> = None;
@@ -154,8 +166,13 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 if let Some(handle) = session.handle.clone() {
                     let mut guard = state.write().await;
                     guard.flex_injection.client_handle = Some(handle);
+                    guard.flex_injection.client_handle_received = true;
                 }
                 trace_flex_rx(&line);
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.last_rx_line = Some(line.clone());
+                }
 
                 if session.has_handle && !registration_sent {
                     wait_for_kpa_first_poll_if_needed(settings, &state).await;
@@ -462,7 +479,11 @@ async fn send_tracked_command(
     session.pending.insert(seq, pending.clone());
     {
         let mut guard = state.write().await;
-        guard.flex_injection.last_command = Some(pending.command);
+        guard.flex_injection.last_command = Some(pending.command.clone());
+        guard.flex_injection.last_tx_line = Some(format!("C{seq}|{}", pending.command));
+        if pending.kind == PendingKind::AmplifierCreate {
+            guard.flex_injection.amplifier_create_sent = true;
+        }
         guard.flex_injection.pending_count = session.pending.len();
     }
     *next_seq = next_seq.saturating_add(1);
@@ -641,6 +662,10 @@ impl FlexSession {
         }
         match pending.kind {
             PendingKind::AmplifierCreate => {
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.amplifier_create_accepted = true;
+                }
                 if let Some(handle) = response_object_id(body) {
                     set_amplifier_handle(state, handle).await;
                 }
@@ -669,8 +694,13 @@ impl FlexSession {
                     guard.flex_injection.interlock_handle = Some(handle.to_string());
                 }
             }
+            PendingKind::Subscription => {
+                if pending.command.contains("sub amplifier all") {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.sub_amplifier_all_accepted = true;
+                }
+            }
             PendingKind::KeepaliveEnable
-            | PendingKind::Subscription
             | PendingKind::AmplifierReannounce
             | PendingKind::TunerPresenceRefresh => {}
             PendingKind::Ping => {

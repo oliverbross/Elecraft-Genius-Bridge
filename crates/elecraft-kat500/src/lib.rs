@@ -564,6 +564,25 @@ impl Kat500Driver {
         );
         self.ensure_can_send(command)?;
         send_command(port, command, Duration::from_secs(5), transcript).await?;
+        {
+            let mut guard = self.state.write().await;
+            guard.controls.last_executed_elecraft_command = Some(command.wire.to_string());
+            guard.controls.last_safety_decision = Some("executed".to_string());
+        }
+        if command.label == "autotune" {
+            if let Ok(response) =
+                send_command(port, CMD_TUNE_POLL, Duration::from_millis(750), transcript).await
+            {
+                let mut guard = self.state.write().await;
+                parse_kat500_response(&response, &mut guard.tuner);
+            }
+            if let Ok(response) =
+                send_command(port, CMD_VSWR, Duration::from_millis(750), transcript).await
+            {
+                let mut guard = self.state.write().await;
+                parse_kat500_response(&response, &mut guard.tuner);
+            }
+        }
         Ok(())
     }
 

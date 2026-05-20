@@ -540,6 +540,14 @@ impl Kpa500Driver {
         let result = self
             .send_ackless_verified(port, transcript, command, operate)
             .await?;
+        {
+            let mut guard = self.state.write().await;
+            guard.controls.last_executed_elecraft_command = Some(command.wire.to_string());
+            guard.controls.last_safety_decision = Some(format!(
+                "send_result={:?}; verify_result={:?}",
+                result.send_result, result.verify_result
+            ));
+        }
         info!(
             event_id = "pgxl_control_result",
             command = command.label,

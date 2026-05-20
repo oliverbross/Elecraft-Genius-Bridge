@@ -100,6 +100,7 @@ pub struct BridgeState {
     pub desired: DesiredState,
     pub protocol: ProtocolCounters,
     pub controls: ControlDiagnostics,
+    pub effective_controls: EffectiveControlPolicy,
 }
 
 impl Default for BridgeState {
@@ -114,6 +115,7 @@ impl Default for BridgeState {
             desired: DesiredState::default(),
             protocol: ProtocolCounters::default(),
             controls: ControlDiagnostics::default(),
+            effective_controls: EffectiveControlPolicy::default(),
         }
     }
 }
@@ -331,6 +333,15 @@ pub struct FlexInjectionState {
     pub interlock_handle: Option<String>,
     pub last_command: Option<String>,
     pub last_response: Option<String>,
+    pub radio_addr: Option<String>,
+    pub tcp_connect_success_count: u64,
+    pub last_error: Option<String>,
+    pub last_rx_line: Option<String>,
+    pub last_tx_line: Option<String>,
+    pub client_handle_received: bool,
+    pub amplifier_create_sent: bool,
+    pub amplifier_create_accepted: bool,
+    pub sub_amplifier_all_accepted: bool,
     pub command_success_count: u64,
     pub command_failure_count: u64,
     pub ping_count: u64,
@@ -493,10 +504,42 @@ pub struct ControlDiagnostics {
     pub last_pgxl_control_command: Option<String>,
     pub last_flex_amp_set_command: Option<String>,
     pub last_mapped_elecraft_action: Option<String>,
+    pub last_executed_elecraft_command: Option<String>,
     pub last_safety_decision: Option<String>,
     pub blocked_by_dry_run_count: u64,
     pub blocked_by_rf_risk_count: u64,
     pub control_requested_count: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EffectiveControlPolicy {
+    pub raw_kpa_dry_run: bool,
+    pub raw_kpa_allow_control: bool,
+    pub raw_kpa_allow_rf_risk: bool,
+    pub raw_kat_dry_run: bool,
+    pub raw_kat_allow_control: bool,
+    pub raw_kat_allow_rf_risk: bool,
+    pub operational_enabled: bool,
+    pub operational_confirmation_valid: bool,
+    pub operational_override_active: bool,
+    pub effective_kat_tune_enabled: bool,
+    pub effective_kat_bypass_enabled: bool,
+    pub effective_kat_antenna_enabled: bool,
+    pub effective_kpa_standby_enabled: bool,
+    pub effective_kpa_operate_enabled: bool,
+    pub effective_clear_fault_enabled: bool,
+    pub effective_kpa_dry_run: bool,
+    pub effective_kpa_allow_control: bool,
+    pub effective_kpa_allow_rf_risk: bool,
+    pub effective_kat_dry_run: bool,
+    pub effective_kat_allow_control: bool,
+    pub effective_kat_allow_rf_risk: bool,
+    pub kat_tune_reason: String,
+    pub kat_bypass_reason: String,
+    pub kat_antenna_reason: String,
+    pub kpa_standby_reason: String,
+    pub kpa_operate_reason: String,
+    pub clear_fault_reason: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

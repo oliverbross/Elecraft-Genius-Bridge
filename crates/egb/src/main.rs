@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
 use bridge_core::{
     append_evidence_json, append_evidence_line, set_evidence_dir, AmpOperatingState,
-    ConnectionState, SharedState,
+    ConnectionState, EffectiveControlPolicy, SharedState,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use egb_config::{is_lan_or_loopback_or_cgnat, BridgeConfig};
@@ -487,14 +487,16 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
         shared_default_state()
     };
     apply_mock_config(cfg, &state).await;
-    let kpa_dry_run = effective_kpa_dry_run(cfg);
-    let kat_dry_run = effective_kat_dry_run(cfg);
-    let kpa_allow_control = effective_kpa_allow_control(cfg);
-    let kat_allow_control = effective_kat_allow_control(cfg);
-    let kpa_allow_rf_risk = effective_kpa_allow_rf_risk(cfg);
-    let kat_allow_rf_risk = effective_kat_allow_rf_risk(cfg);
+    let control_policy = effective_control_policy(cfg);
+    let kpa_dry_run = control_policy.effective_kpa_dry_run;
+    let kat_dry_run = control_policy.effective_kat_dry_run;
+    let kpa_allow_control = control_policy.effective_kpa_allow_control;
+    let kat_allow_control = control_policy.effective_kat_allow_control;
+    let kpa_allow_rf_risk = control_policy.effective_kpa_allow_rf_risk;
+    let kat_allow_rf_risk = control_policy.effective_kat_allow_rf_risk;
     {
         let mut guard = state.write().await;
+        guard.effective_controls = control_policy.clone();
         guard.flex_injection.active_amplifier_status_profile =
             Some(cfg.flex_injection.amplifier_status_profile.clone());
         guard.flex_injection.active_tgxl_control_profile = Some(cfg.tgxl.control_profile.clone());
@@ -762,47 +764,118 @@ fn operational_controls_confirmed(cfg: &BridgeConfig) -> bool {
     cfg.operational.enable_real_controls && cfg.operational.controls_confirmed()
 }
 
-fn effective_kpa_dry_run(cfg: &BridgeConfig) -> bool {
-    if operational_controls_confirmed(cfg)
-        && (cfg.operational.enable_kpa_standby || cfg.operational.enable_kpa_operate)
-    {
-        false
+fn enabled_reason(enabled: bool, enabled_text: &str, disabled_text: &str) -> String {
+    if enabled {
+        enabled_text.to_string()
     } else {
-        cfg.kpa500.dry_run
+        disabled_text.to_string()
     }
+}
+
+fn effective_control_policy(cfg: &BridgeConfig) -> EffectiveControlPolicy {
+    let confirmed = operational_controls_confirmed(cfg);
+    let operational_confirmation_valid = cfg.operational.controls_confirmed();
+
+    let effective_kat_tune_enabled = (!cfg.kat500.dry_run && cfg.kat500.allow_rf_risk)
+        || (confirmed && cfg.operational.enable_kat_tune);
+    let effective_kat_bypass_enabled = (!cfg.kat500.dry_run && cfg.kat500.allow_control)
+        || (confirmed && cfg.operational.enable_kat_bypass);
+    let effective_kat_antenna_enabled = (!cfg.kat500.dry_run && cfg.kat500.allow_control)
+        || (confirmed && cfg.operational.enable_kat_antenna);
+    let effective_kpa_standby_enabled = (!cfg.kpa500.dry_run && cfg.kpa500.allow_control)
+        || (confirmed && cfg.operational.enable_kpa_standby);
+    let effective_kpa_operate_enabled = (!cfg.kpa500.dry_run && cfg.kpa500.allow_rf_risk)
+        || (confirmed && cfg.operational.enable_kpa_operate);
+    let effective_clear_fault_enabled = confirmed && cfg.operational.enable_clear_fault;
+
+    let effective_kpa_dry_run = !(effective_kpa_standby_enabled
+        || effective_kpa_operate_enabled
+        || effective_clear_fault_enabled)
+        && cfg.kpa500.dry_run;
+    let effective_kat_dry_run = !(effective_kat_tune_enabled
+        || effective_kat_bypass_enabled
+        || effective_kat_antenna_enabled)
+        && cfg.kat500.dry_run;
+
+    EffectiveControlPolicy {
+        raw_kpa_dry_run: cfg.kpa500.dry_run,
+        raw_kpa_allow_control: cfg.kpa500.allow_control,
+        raw_kpa_allow_rf_risk: cfg.kpa500.allow_rf_risk,
+        raw_kat_dry_run: cfg.kat500.dry_run,
+        raw_kat_allow_control: cfg.kat500.allow_control,
+        raw_kat_allow_rf_risk: cfg.kat500.allow_rf_risk,
+        operational_enabled: cfg.operational.enable_real_controls,
+        operational_confirmation_valid,
+        operational_override_active: confirmed,
+        effective_kat_tune_enabled,
+        effective_kat_bypass_enabled,
+        effective_kat_antenna_enabled,
+        effective_kpa_standby_enabled,
+        effective_kpa_operate_enabled,
+        effective_clear_fault_enabled,
+        effective_kpa_dry_run,
+        effective_kpa_allow_control: cfg.kpa500.allow_control || effective_kpa_standby_enabled,
+        effective_kpa_allow_rf_risk: cfg.kpa500.allow_rf_risk || effective_kpa_operate_enabled,
+        effective_kat_dry_run,
+        effective_kat_allow_control: cfg.kat500.allow_control
+            || effective_kat_bypass_enabled
+            || effective_kat_antenna_enabled,
+        effective_kat_allow_rf_risk: cfg.kat500.allow_rf_risk || effective_kat_tune_enabled,
+        kat_tune_reason: enabled_reason(
+            effective_kat_tune_enabled,
+            "enabled by operational KAT tune or raw kat500.allow_rf_risk",
+            "disabled: enable operational real controls, set enable_kat_tune=true, and confirm",
+        ),
+        kat_bypass_reason: enabled_reason(
+            effective_kat_bypass_enabled,
+            "enabled by operational KAT bypass/standby or raw kat500.allow_control",
+            "disabled: enable operational KAT bypass/standby or raw kat500.allow_control",
+        ),
+        kat_antenna_reason: enabled_reason(
+            effective_kat_antenna_enabled,
+            "enabled by operational KAT antenna switching or raw kat500.allow_control",
+            "disabled: enable operational KAT antenna switching or raw kat500.allow_control",
+        ),
+        kpa_standby_reason: enabled_reason(
+            effective_kpa_standby_enabled,
+            "enabled by operational KPA standby or raw kpa500.allow_control",
+            "disabled: enable operational KPA standby or raw kpa500.allow_control",
+        ),
+        kpa_operate_reason: enabled_reason(
+            effective_kpa_operate_enabled,
+            "enabled by operational KPA operate or raw kpa500.allow_rf_risk",
+            "disabled: RF-risk gate closed; enable KPA operate only for deliberate local testing",
+        ),
+        clear_fault_reason: enabled_reason(
+            effective_clear_fault_enabled,
+            "enabled by operational clear-fault gate",
+            "disabled: clear fault remains advanced/destructive by default",
+        ),
+    }
+}
+
+fn effective_kpa_dry_run(cfg: &BridgeConfig) -> bool {
+    effective_control_policy(cfg).effective_kpa_dry_run
 }
 
 fn effective_kat_dry_run(cfg: &BridgeConfig) -> bool {
-    if operational_controls_confirmed(cfg)
-        && (cfg.operational.enable_kat_tune
-            || cfg.operational.enable_kat_bypass
-            || cfg.operational.enable_kat_antenna)
-    {
-        false
-    } else {
-        cfg.kat500.dry_run
-    }
+    effective_control_policy(cfg).effective_kat_dry_run
 }
 
 fn effective_kpa_allow_control(cfg: &BridgeConfig) -> bool {
-    cfg.kpa500.allow_control
-        || (operational_controls_confirmed(cfg) && cfg.operational.enable_kpa_standby)
+    effective_control_policy(cfg).effective_kpa_allow_control
 }
 
 fn effective_kat_allow_control(cfg: &BridgeConfig) -> bool {
-    cfg.kat500.allow_control
-        || (operational_controls_confirmed(cfg)
-            && (cfg.operational.enable_kat_bypass || cfg.operational.enable_kat_antenna))
+    effective_control_policy(cfg).effective_kat_allow_control
 }
 
 fn effective_kpa_allow_rf_risk(cfg: &BridgeConfig) -> bool {
-    cfg.kpa500.allow_rf_risk
-        || (operational_controls_confirmed(cfg) && cfg.operational.enable_kpa_operate)
+    effective_control_policy(cfg).effective_kpa_allow_rf_risk
 }
 
 fn effective_kat_allow_rf_risk(cfg: &BridgeConfig) -> bool {
-    cfg.kat500.allow_rf_risk
-        || (operational_controls_confirmed(cfg) && cfg.operational.enable_kat_tune)
+    effective_control_policy(cfg).effective_kat_allow_rf_risk
 }
 
 async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
@@ -1125,6 +1198,26 @@ async fn run_full_operational_test(
     )
     .await?;
     tokio::fs::write(
+        evidence.dir().join("operational-readiness-verdict.md"),
+        operational_readiness_verdict_markdown(&cfg, &state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("effective-control-policy.md"),
+        effective_control_policy_markdown(&state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("flex-injection-health.md"),
+        flex_injection_health_markdown(&cfg, &state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("applet-visibility-paths.md"),
+        applet_visibility_paths_markdown(),
+    )
+    .await?;
+    tokio::fs::write(
         evidence.dir().join("smartsdr-interlock-analysis.md"),
         smartsdr_interlock_analysis_markdown(&cfg, &state).await,
     )
@@ -1400,6 +1493,11 @@ impl EvidenceRun {
             "real-vs-ui-amp-state.md",
             "aethersdr-operational-test.md",
             "operational-readiness.md",
+            "operational-readiness-verdict.md",
+            "effective-control-policy.md",
+            "flex-injection-health.md",
+            "control-execution-events.jsonl",
+            "applet-visibility-paths.md",
             "smartsdr-interlock-analysis.md",
             "smartsdr-visibility-analysis.md",
             "pgxl-trigger-matrix.md",
@@ -2519,6 +2617,160 @@ async fn operational_readiness_from_state_markdown(state: &SharedState) -> Strin
     )
 }
 
+async fn effective_control_policy_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let policy = &guard.effective_controls;
+    format!(
+        "# Effective Control Policy\n\n\
+        - Operational override active: {}\n\
+        - Operational confirmation valid: {}\n\
+        - Raw KPA dry_run: {}\n\
+        - Raw KPA allow_control: {}\n\
+        - Raw KPA allow_rf_risk: {}\n\
+        - Raw KAT dry_run: {}\n\
+        - Raw KAT allow_control: {}\n\
+        - Raw KAT allow_rf_risk: {}\n\
+        - Effective KAT tune: {} ({})\n\
+        - Effective KAT bypass: {} ({})\n\
+        - Effective KAT antenna: {} ({})\n\
+        - Effective KPA standby: {} ({})\n\
+        - Effective KPA operate: {} ({})\n\
+        - Effective clear fault: {} ({})\n",
+        policy.operational_override_active,
+        policy.operational_confirmation_valid,
+        policy.raw_kpa_dry_run,
+        policy.raw_kpa_allow_control,
+        policy.raw_kpa_allow_rf_risk,
+        policy.raw_kat_dry_run,
+        policy.raw_kat_allow_control,
+        policy.raw_kat_allow_rf_risk,
+        policy.effective_kat_tune_enabled,
+        policy.kat_tune_reason,
+        policy.effective_kat_bypass_enabled,
+        policy.kat_bypass_reason,
+        policy.effective_kat_antenna_enabled,
+        policy.kat_antenna_reason,
+        policy.effective_kpa_standby_enabled,
+        policy.kpa_standby_reason,
+        policy.effective_kpa_operate_enabled,
+        policy.kpa_operate_reason,
+        policy.effective_clear_fault_enabled,
+        policy.clear_fault_reason,
+    )
+}
+
+async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    let flex = &guard.flex_injection;
+    format!(
+        "# Flex Injection Health\n\n\
+        - Enabled in config: {}\n\
+        - Attempted radio endpoint: `{}`\n\
+        - Connection state: `{}`\n\
+        - Degraded reason: `{}`\n\
+        - Last error: `{}`\n\
+        - TCP connect success count: {}\n\
+        - H/client handle received: {}\n\
+        - Client handle: `{}`\n\
+        - Amplifier create sent: {}\n\
+        - Amplifier create accepted: {}\n\
+        - Amplifier handle: `{}`\n\
+        - Meter handles: {:?}\n\
+        - Interlock handle: `{}`\n\
+        - `sub amplifier all` accepted: {}\n\
+        - Last Flex TX: `{}`\n\
+        - Last Flex RX: `{}`\n\n\
+        Operational note: if Flex injection is degraded or no amplifier handle is present, the AMP applet may not appear even while PGXL/TGXL direct sockets are healthy.\n",
+        cfg.flex_injection.enabled,
+        flex.radio_addr.as_deref().unwrap_or("unknown"),
+        flex.connection_state.as_str(),
+        flex.degraded_reason.as_deref().unwrap_or("none"),
+        flex.last_error.as_deref().unwrap_or("none"),
+        flex.tcp_connect_success_count,
+        flex.client_handle_received,
+        flex.client_handle.as_deref().unwrap_or("none"),
+        flex.amplifier_create_sent,
+        flex.amplifier_create_accepted,
+        flex.amplifier_handle.as_deref().unwrap_or("none"),
+        flex.meter_handles,
+        flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.sub_amplifier_all_accepted,
+        flex.last_tx_line.as_deref().unwrap_or("none"),
+        flex.last_rx_line.as_deref().unwrap_or("none"),
+    )
+}
+
+async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    let mut failures = Vec::new();
+    let mut warnings = Vec::new();
+    if guard.amp.runtime.poll_success_count == 0 {
+        failures.push("KPA500 polling did not succeed");
+    }
+    if guard.tuner.runtime.poll_success_count == 0 {
+        failures.push("KAT500 polling did not succeed");
+    }
+    if guard.clients.pgxl_session_started_count == 0 {
+        warnings.push("No PGXL direct client connected during the test");
+    }
+    if guard.clients.tgxl_session_started_count == 0 {
+        warnings.push("No TGXL direct client connected during the test");
+    }
+    if cfg.flex_injection.enabled {
+        if guard.flex_injection.connection_state != ConnectionState::Connected {
+            failures.push("Flex injection is not connected");
+        }
+        if guard.flex_injection.amplifier_handle.is_none() {
+            failures.push("Flex amplifier handle was not created");
+        }
+    }
+    if guard.effective_controls.operational_override_active
+        && guard
+            .controls
+            .last_safety_decision
+            .as_deref()
+            .is_some_and(|reason| {
+                reason.contains("dry_run") && !reason.contains("intentionally blocked")
+            })
+    {
+        warnings.push("A control was still blocked by dry_run despite operational override");
+    }
+    let verdict = if failures.is_empty() {
+        if warnings.is_empty() {
+            "PASS"
+        } else {
+            "WARN"
+        }
+    } else {
+        "FAIL"
+    };
+    format!(
+        "# Operational Readiness Verdict\n\n\
+        - Verdict: **{}**\n\
+        - Failures: {}\n\
+        - Warnings: {}\n",
+        verdict,
+        if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join("; ")
+        },
+        if warnings.is_empty() {
+            "none".to_string()
+        } else {
+            warnings.join("; ")
+        },
+    )
+}
+
+fn applet_visibility_paths_markdown() -> &'static str {
+    "# Applet Visibility Paths\n\n\
+    - AetherSDR TGXL/TUN can work through the direct TGXL TCP path on port 9010.\n\
+    - AetherSDR and SmartSDR AMP visibility depends on Flex amplifier injection, not PGXL TCP alone.\n\
+    - SmartSDR tuner visibility requires Flex-side tuner/accessory registration. Direct TGXL TCP alone is not enough for SmartSDR.\n\
+    - If Flex injection is degraded or no amplifier handle is present, direct sockets may still connect while the AMP applet is absent.\n"
+}
+
 async fn smartsdr_interlock_analysis_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
     let guard = state.read().await;
     format!(
@@ -3156,6 +3408,7 @@ async fn status_json(state: &SharedState) -> String {
         },
         "flex_injection": guard.flex_injection,
         "controls": guard.controls,
+        "effective_controls": guard.effective_controls,
         "flex_diagnostics": {
             "ping_count": guard.flex_injection.ping_count,
             "ping_ack_count": guard.flex_injection.ping_ack_count,
@@ -4233,6 +4486,32 @@ mod tests {
         assert!(require_rf_risk_confirmation(true, None).is_err());
         assert!(require_rf_risk_confirmation(true, Some("wrong")).is_err());
         assert!(require_rf_risk_confirmation(true, Some("I understand")).is_ok());
+    }
+
+    #[test]
+    fn operational_policy_overrides_raw_dry_run_for_selected_controls() {
+        let mut cfg = BridgeConfig::default();
+        cfg.kpa500.dry_run = true;
+        cfg.kpa500.allow_control = false;
+        cfg.kpa500.allow_rf_risk = false;
+        cfg.kat500.dry_run = true;
+        cfg.kat500.allow_control = false;
+        cfg.kat500.allow_rf_risk = false;
+        cfg.operational.enable_real_controls = true;
+        cfg.operational.enable_kat_tune = true;
+        cfg.operational.enable_kpa_standby = true;
+        cfg.operational.confirm_real_hardware_control = "I understand".to_string();
+
+        let policy = effective_control_policy(&cfg);
+        assert!(policy.operational_override_active);
+        assert!(policy.effective_kat_tune_enabled);
+        assert!(policy.effective_kpa_standby_enabled);
+        assert!(!policy.effective_kpa_operate_enabled);
+        assert!(!policy.effective_kat_dry_run);
+        assert!(!policy.effective_kpa_dry_run);
+        assert!(policy.effective_kat_allow_rf_risk);
+        assert!(policy.effective_kpa_allow_control);
+        assert!(!policy.effective_kpa_allow_rf_risk);
     }
 
     #[test]

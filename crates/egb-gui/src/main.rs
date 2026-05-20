@@ -444,6 +444,37 @@ impl GuiApp {
                     &status.flex_injection.connection_state,
                     connection_color(&status.flex_injection.connection_state),
                 );
+                let hardware_ok = status.amp.connection_state == "connected"
+                    && status.tuner.connection_state == "connected";
+                self.summary_card(
+                    ui,
+                    "Hardware",
+                    if hardware_ok { "OK" } else { "WARN" },
+                    status_color(hardware_ok),
+                );
+                let sockets_ok = status.clients.pgxl_connected && status.clients.tgxl_connected;
+                self.summary_card(
+                    ui,
+                    "Direct sockets",
+                    if sockets_ok { "OK" } else { "WARN" },
+                    status_color(sockets_ok),
+                );
+                let controls_ok = status.effective_controls.operational_override_active
+                    && (status.effective_controls.effective_kat_tune_enabled
+                        || status.effective_controls.effective_kpa_standby_enabled);
+                self.summary_card(
+                    ui,
+                    "Controls",
+                    if controls_ok { "OK" } else { "WARN" },
+                    status_color(controls_ok),
+                );
+                let smartsdr_ok = status.flex_injection.amplifier_handle.is_some();
+                self.summary_card(
+                    ui,
+                    "SmartSDR",
+                    if smartsdr_ok { "AMP OK" } else { "WARN" },
+                    status_color(smartsdr_ok),
+                );
             }
         });
         ui.add_space(8.0);
@@ -791,6 +822,24 @@ impl GuiApp {
                         .as_deref()
                         .unwrap_or("-"),
                 );
+                if status.flex_injection.enabled
+                    && status.flex_injection.connection_state != "connected"
+                {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Flex injection not active - AMP applet may not appear.",
+                    );
+                }
+                field(
+                    ui,
+                    "Radio endpoint",
+                    status.flex_injection.radio_addr.as_deref().unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Last Flex error",
+                    status.flex_injection.last_error.as_deref().unwrap_or("-"),
+                );
                 field(
                     ui,
                     "Client handle",
@@ -817,6 +866,26 @@ impl GuiApp {
                         .interlock_handle
                         .as_deref()
                         .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Amp create",
+                    format!(
+                        "sent={} accepted={} sub_amp_all={}",
+                        status.flex_injection.amplifier_create_sent,
+                        status.flex_injection.amplifier_create_accepted,
+                        status.flex_injection.sub_amplifier_all_accepted
+                    ),
+                );
+                field(
+                    ui,
+                    "Last Flex TX",
+                    status.flex_injection.last_tx_line.as_deref().unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Last Flex RX",
+                    status.flex_injection.last_rx_line.as_deref().unwrap_or("-"),
                 );
                 field(
                     ui,
@@ -1166,6 +1235,90 @@ impl GuiApp {
                 );
             }
         });
+        ui.separator();
+        if let Some(status) = &self.status {
+            ui.heading("Effective Runtime Policy");
+            let policy = &status.effective_controls;
+            field(
+                ui,
+                "Operational override",
+                bool_text(Some(policy.operational_override_active)),
+            );
+            field(
+                ui,
+                "Raw KPA dry_run",
+                bool_text(Some(policy.raw_kpa_dry_run)),
+            );
+            field(
+                ui,
+                "Raw KAT dry_run",
+                bool_text(Some(policy.raw_kat_dry_run)),
+            );
+            field(
+                ui,
+                "KAT tune allowed",
+                format!(
+                    "{} - {}",
+                    bool_text(Some(policy.effective_kat_tune_enabled)),
+                    policy.kat_tune_reason
+                ),
+            );
+            field(
+                ui,
+                "KAT bypass allowed",
+                format!(
+                    "{} - {}",
+                    bool_text(Some(policy.effective_kat_bypass_enabled)),
+                    policy.kat_bypass_reason
+                ),
+            );
+            field(
+                ui,
+                "KPA standby allowed",
+                format!(
+                    "{} - {}",
+                    bool_text(Some(policy.effective_kpa_standby_enabled)),
+                    policy.kpa_standby_reason
+                ),
+            );
+            field(
+                ui,
+                "KPA operate allowed",
+                format!(
+                    "{} - {}",
+                    bool_text(Some(policy.effective_kpa_operate_enabled)),
+                    policy.kpa_operate_reason
+                ),
+            );
+            field(
+                ui,
+                "Last control command",
+                status
+                    .controls
+                    .last_mapped_elecraft_action
+                    .as_deref()
+                    .unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Last executed wire",
+                status
+                    .controls
+                    .last_executed_elecraft_command
+                    .as_deref()
+                    .unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Last block/result",
+                status
+                    .controls
+                    .last_safety_decision
+                    .as_deref()
+                    .unwrap_or("-"),
+            );
+            ui.separator();
+        }
         ui.separator();
         ui.heading("Command Map");
         ui.monospace("KAT500 Tune: T;");
@@ -2012,6 +2165,8 @@ struct StatusSnapshot {
     #[serde(default)]
     controls: ControlStatus,
     #[serde(default)]
+    effective_controls: EffectiveControlStatus,
+    #[serde(default)]
     flex_diagnostics: FlexDiagnostics,
 }
 
@@ -2141,6 +2296,24 @@ struct FlexStatus {
     interlock_handle: Option<String>,
     last_command: Option<String>,
     last_response: Option<String>,
+    #[serde(default)]
+    radio_addr: Option<String>,
+    #[serde(default)]
+    tcp_connect_success_count: u64,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    last_rx_line: Option<String>,
+    #[serde(default)]
+    last_tx_line: Option<String>,
+    #[serde(default)]
+    client_handle_received: bool,
+    #[serde(default)]
+    amplifier_create_sent: bool,
+    #[serde(default)]
+    amplifier_create_accepted: bool,
+    #[serde(default)]
+    sub_amplifier_all_accepted: bool,
     command_success_count: u64,
     command_failure_count: u64,
     ping_count: u64,
@@ -2231,6 +2404,8 @@ struct ControlStatus {
     #[serde(default)]
     last_mapped_elecraft_action: Option<String>,
     #[serde(default)]
+    last_executed_elecraft_command: Option<String>,
+    #[serde(default)]
     last_safety_decision: Option<String>,
     #[serde(default)]
     blocked_by_dry_run_count: u64,
@@ -2238,6 +2413,52 @@ struct ControlStatus {
     blocked_by_rf_risk_count: u64,
     #[serde(default)]
     control_requested_count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct EffectiveControlStatus {
+    #[serde(default)]
+    raw_kpa_dry_run: bool,
+    #[serde(default)]
+    raw_kpa_allow_control: bool,
+    #[serde(default)]
+    raw_kpa_allow_rf_risk: bool,
+    #[serde(default)]
+    raw_kat_dry_run: bool,
+    #[serde(default)]
+    raw_kat_allow_control: bool,
+    #[serde(default)]
+    raw_kat_allow_rf_risk: bool,
+    #[serde(default)]
+    operational_enabled: bool,
+    #[serde(default)]
+    operational_confirmation_valid: bool,
+    #[serde(default)]
+    operational_override_active: bool,
+    #[serde(default)]
+    effective_kat_tune_enabled: bool,
+    #[serde(default)]
+    effective_kat_bypass_enabled: bool,
+    #[serde(default)]
+    effective_kat_antenna_enabled: bool,
+    #[serde(default)]
+    effective_kpa_standby_enabled: bool,
+    #[serde(default)]
+    effective_kpa_operate_enabled: bool,
+    #[serde(default)]
+    effective_clear_fault_enabled: bool,
+    #[serde(default)]
+    kat_tune_reason: String,
+    #[serde(default)]
+    kat_bypass_reason: String,
+    #[serde(default)]
+    kat_antenna_reason: String,
+    #[serde(default)]
+    kpa_standby_reason: String,
+    #[serde(default)]
+    kpa_operate_reason: String,
+    #[serde(default)]
+    clear_fault_reason: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
