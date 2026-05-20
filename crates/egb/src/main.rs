@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
 use bridge_core::{
     append_evidence_json, append_evidence_line, set_evidence_dir, AmpOperatingState,
-    ConnectionState, EffectiveControlPolicy, SharedState,
+    ConnectionState, EffectiveControlPolicy, RuntimeConfigIdentity, SharedState,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use egb_config::{is_lan_or_loopback_or_cgnat, BridgeConfig};
@@ -478,7 +478,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
+async fn start_bridge(cfg: &BridgeConfig, config_path: Option<&Path>) -> Result<SharedState> {
     let _ = BRIDGE_STARTED_AT.set(SystemTime::now());
     let all_mock = cfg.kpa500.mock && cfg.kat500.mock;
     let state = if all_mock {
@@ -488,6 +488,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
     };
     apply_mock_config(cfg, &state).await;
     let control_policy = effective_control_policy(cfg);
+    let config_identity = runtime_config_identity(cfg, config_path)?;
     let kpa_dry_run = control_policy.effective_kpa_dry_run;
     let kat_dry_run = control_policy.effective_kat_dry_run;
     let kpa_allow_control = control_policy.effective_kpa_allow_control;
@@ -497,6 +498,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
     {
         let mut guard = state.write().await;
         guard.effective_controls = control_policy.clone();
+        guard.config_identity = config_identity;
         guard.flex_injection.active_amplifier_status_profile =
             Some(cfg.flex_injection.amplifier_status_profile.clone());
         guard.flex_injection.active_tgxl_control_profile = Some(cfg.tgxl.control_profile.clone());
@@ -854,6 +856,54 @@ fn effective_control_policy(cfg: &BridgeConfig) -> EffectiveControlPolicy {
     }
 }
 
+fn stable_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn runtime_config_identity(
+    cfg: &BridgeConfig,
+    config_path: Option<&Path>,
+) -> Result<RuntimeConfigIdentity> {
+    let effective_yaml = serde_yaml::to_string(cfg)?;
+    let effective_hash = stable_hash_hex(effective_yaml.as_bytes());
+    let (path_text, source_hash, hash_match) = if let Some(path) = config_path {
+        let display_path = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string();
+        let source = fs::read(path).unwrap_or_default();
+        let source_hash = if source.is_empty() {
+            None
+        } else {
+            Some(stable_hash_hex(&source))
+        };
+        let parsed_source_hash = BridgeConfig::load(path)
+            .ok()
+            .and_then(|loaded| serde_yaml::to_string(&loaded).ok())
+            .map(|yaml| stable_hash_hex(yaml.as_bytes()));
+        let hash_match = parsed_source_hash
+            .as_ref()
+            .map(|parsed| parsed == &effective_hash);
+        (Some(display_path), source_hash, hash_match)
+    } else {
+        (None, None, None)
+    };
+    Ok(RuntimeConfigIdentity {
+        config_path: path_text,
+        config_hash: Some(effective_hash.clone()),
+        config_loaded_at_ms: system_time_ms(Some(SystemTime::now())),
+        config_source_hash: source_hash,
+        config_effective_hash: Some(effective_hash),
+        config_hash_match: hash_match,
+    })
+}
+
 fn effective_kpa_dry_run(cfg: &BridgeConfig) -> bool {
     effective_control_policy(cfg).effective_kpa_dry_run
 }
@@ -880,7 +930,7 @@ fn effective_kat_allow_rf_risk(cfg: &BridgeConfig) -> bool {
 
 async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
     let evidence = EvidenceRun::start("run", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     info!("Elecraft Genius Bridge running; press Ctrl+C to stop");
@@ -899,7 +949,7 @@ async fn run_soak_test(cfg: BridgeConfig, config_path: PathBuf, duration_hours: 
         anyhow::bail!("--duration-hours must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start("soak-test", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_hours * 3600.0);
@@ -946,7 +996,7 @@ async fn run_evidence_test(
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start(mode, &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_minutes * 60.0);
@@ -999,7 +1049,7 @@ async fn run_pgxl_pairing_lab(
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start("pgxl-pairing-lab", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_minutes * 60.0);
@@ -1070,7 +1120,7 @@ async fn compare_pgxl_profiles(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1107,7 +1157,7 @@ async fn run_amplifier_operate_lab(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1149,7 +1199,7 @@ async fn run_aethersdr_operational_test(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1186,7 +1236,7 @@ async fn run_full_operational_test(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1255,7 +1305,7 @@ async fn run_pgxl_direct_trigger_matrix(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1303,7 +1353,7 @@ async fn test_startup_sequence(
         "first-poll-sequence.log",
         "Starting bridge with KPA first-poll gate before Flex amplifier advertisement",
     );
-    let state = start_bridge(&cfg).await?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1448,6 +1498,19 @@ impl EvidenceRun {
             dir.join("config-effective.yaml"),
             serde_yaml::to_string(cfg)?,
         )?;
+        let source_config = fs::read_to_string(config_path).unwrap_or_default();
+        fs::write(dir.join("config-source.yaml"), &source_config)?;
+        let identity = runtime_config_identity(cfg, Some(config_path))?;
+        fs::write(
+            dir.join("config-hashes.json"),
+            serde_json::to_vec_pretty(&identity)?,
+        )?;
+        if identity.config_hash_match == Some(false) {
+            fs::write(
+                dir.join("warnings-errors.log"),
+                "CONFIG_MISMATCH: loaded source config does not match effective runtime config\n",
+            )?;
+        }
         fs::write(
             dir.join("egb-run.log"),
             format!(
@@ -1509,7 +1572,10 @@ impl EvidenceRun {
             "startup-advertisement-policy.md",
             "serial-port-open-errors.log",
         ] {
-            File::create(dir.join(file))?;
+            let path = dir.join(file);
+            if !path.exists() {
+                File::create(path)?;
+            }
         }
         Ok(Self {
             zip_path: root.join(format!("{stamp}-{safe_mode}.zip")),
@@ -2724,6 +2790,9 @@ async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &Shar
             failures.push("Flex amplifier handle was not created");
         }
     }
+    if guard.config_identity.config_hash_match == Some(false) {
+        failures.push("CONFIG_MISMATCH: source config and effective runtime config differ");
+    }
     if guard.effective_controls.operational_override_active
         && guard
             .controls
@@ -3341,7 +3410,12 @@ async fn status_json(state: &SharedState) -> String {
             "git_commit": option_env!("GIT_HASH").unwrap_or("unknown"),
             "process_id": std::process::id(),
             "uptime_ms": SystemTime::now().duration_since(started).unwrap_or_default().as_millis(),
-            "config_path": "unknown",
+            "config_path": guard.config_identity.config_path,
+            "config_loaded_at": guard.config_identity.config_loaded_at_ms,
+            "config_hash": guard.config_identity.config_hash,
+            "config_source_hash": guard.config_identity.config_source_hash,
+            "config_effective_hash": guard.config_identity.config_effective_hash,
+            "config_hash_match": guard.config_identity.config_hash_match,
         },
         "amp": {
             "connection_state": guard.amp.connection_state.as_str(),
@@ -4512,6 +4586,47 @@ mod tests {
         assert!(policy.effective_kat_allow_rf_risk);
         assert!(policy.effective_kpa_allow_control);
         assert!(!policy.effective_kpa_allow_rf_risk);
+    }
+
+    #[test]
+    fn runtime_config_identity_reports_effective_hash_match() {
+        let cfg = BridgeConfig::default();
+        let identity = runtime_config_identity(&cfg, None).unwrap();
+        assert!(identity.config_hash.is_some());
+        assert!(identity.config_effective_hash.is_some());
+        assert_eq!(identity.config_hash, identity.config_effective_hash);
+    }
+
+    #[test]
+    fn status_exposes_effective_controls_and_connect_assist() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let state = shared_default_state();
+        rt.block_on(async {
+            let mut guard = state.write().await;
+            guard.effective_controls = EffectiveControlPolicy {
+                operational_enabled: true,
+                operational_confirmation_valid: true,
+                operational_override_active: true,
+                effective_kat_tune_enabled: true,
+                ..EffectiveControlPolicy::default()
+            };
+            guard.flex_injection.pgxl_connect_assist_enabled = true;
+            drop(guard);
+            let status: serde_json::Value =
+                serde_json::from_str(&status_json(&state).await).unwrap();
+            assert_eq!(
+                status["effective_controls"]["operational_enabled"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                status["effective_controls"]["effective_kat_tune_enabled"],
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                status["flex_injection"]["pgxl_connect_assist_enabled"],
+                serde_json::json!(true)
+            );
+        });
     }
 
     #[test]

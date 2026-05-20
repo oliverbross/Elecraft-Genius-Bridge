@@ -101,6 +101,7 @@ pub struct BridgeState {
     pub protocol: ProtocolCounters,
     pub controls: ControlDiagnostics,
     pub effective_controls: EffectiveControlPolicy,
+    pub config_identity: RuntimeConfigIdentity,
 }
 
 impl Default for BridgeState {
@@ -116,6 +117,7 @@ impl Default for BridgeState {
             protocol: ProtocolCounters::default(),
             controls: ControlDiagnostics::default(),
             effective_controls: EffectiveControlPolicy::default(),
+            config_identity: RuntimeConfigIdentity::default(),
         }
     }
 }
@@ -540,6 +542,16 @@ pub struct EffectiveControlPolicy {
     pub kpa_standby_reason: String,
     pub kpa_operate_reason: String,
     pub clear_fault_reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuntimeConfigIdentity {
+    pub config_path: Option<String>,
+    pub config_hash: Option<String>,
+    pub config_loaded_at_ms: Option<u128>,
+    pub config_source_hash: Option<String>,
+    pub config_effective_hash: Option<String>,
+    pub config_hash_match: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

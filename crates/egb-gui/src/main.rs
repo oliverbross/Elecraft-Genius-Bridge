@@ -186,17 +186,20 @@ impl GuiApp {
     }
 
     fn save_config(&mut self) {
+        match self.save_config_result() {
+            Ok(()) => self.push_log(format!("saved {}", self.config_path.display())),
+            Err(err) => self.push_log(format!("save failed: {err}")),
+        }
+    }
+
+    fn save_config_result(&mut self) -> Result<()> {
         if self.config.kpa500.allow_rf_risk && !self.rf_acknowledged {
-            self.push_log("refusing to save allow_rf_risk=true until warning is acknowledged");
-            return;
+            anyhow::bail!("refusing to save allow_rf_risk=true until warning is acknowledged");
         }
         if let Err(err) = self.settings.save(Path::new(GUI_SETTINGS_PATH)) {
             self.push_log(format!("GUI settings save failed: {err}"));
         }
-        match save_config(&self.config_path, &self.config) {
-            Ok(()) => self.push_log(format!("saved {}", self.config_path.display())),
-            Err(err) => self.push_log(format!("save failed: {err}")),
-        }
+        save_config(&self.config_path, &self.config)
     }
 
     fn start_bridge(&mut self) {
@@ -204,8 +207,24 @@ impl GuiApp {
             self.push_log("bridge already running");
             return;
         }
+        if self.config_path.as_os_str().is_empty() {
+            self.push_log("refusing to start: config path is unknown");
+            return;
+        }
+        if let Err(err) = self.config.validate() {
+            self.push_log(format!(
+                "refusing to start: config validation failed: {err}"
+            ));
+            return;
+        }
         if self.config.kpa500.allow_rf_risk && !self.rf_acknowledged {
             self.push_log("refusing to start with RF-risk enabled until warning is acknowledged");
+            return;
+        }
+        if let Err(err) = self.save_config_result() {
+            self.push_log(format!(
+                "refusing to start: failed to save current config: {err}"
+            ));
             return;
         }
         match self.bridge.start(&self.config_path, self.tx.clone()) {
@@ -722,12 +741,40 @@ impl GuiApp {
                     .unwrap_or_else(|| "-".to_string()),
             );
             ui.separator();
-            ui.horizontal(|ui| {
-                ui.add_enabled(false, egui::Button::new("Tune"));
-                ui.add_enabled(false, egui::Button::new("Bypass"));
-                ui.add_enabled(false, egui::Button::new("Antenna"));
-            });
-            ui.label("KAT500 controls remain disabled until control mappings are validated.");
+            if let Some(status) = &self.status {
+                let policy = &status.effective_controls;
+                ui.horizontal(|ui| {
+                    ui.add_enabled(policy.effective_kat_tune_enabled, egui::Button::new("Tune"));
+                    ui.add_enabled(
+                        policy.effective_kat_bypass_enabled,
+                        egui::Button::new("Bypass"),
+                    );
+                    ui.add_enabled(
+                        policy.effective_kat_antenna_enabled,
+                        egui::Button::new("Antenna"),
+                    );
+                });
+                ui.label(format!(
+                    "KAT Tune {}; Bypass {}; Antenna {}",
+                    if policy.effective_kat_tune_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    if policy.effective_kat_bypass_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    if policy.effective_kat_antenna_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                ));
+            } else {
+                ui.label("KAT500 control policy unavailable until /status is available.");
+            }
         });
     }
 
@@ -1239,6 +1286,18 @@ impl GuiApp {
         if let Some(status) = &self.status {
             ui.heading("Effective Runtime Policy");
             let policy = &status.effective_controls;
+            if self.config.operational.enable_real_controls && !policy.operational_enabled {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "Operational Mode: ON in config, OFF in running bridge - restart required or config mismatch.",
+                );
+            }
+            if self.config.operational.enable_kat_tune && !policy.effective_kat_tune_enabled {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "KAT Tune: enabled in config, disabled in running bridge.",
+                );
+            }
             field(
                 ui,
                 "Operational override",
@@ -1397,6 +1456,50 @@ impl GuiApp {
             if ui.button("Validate").clicked() {
                 self.validate_config();
             }
+        });
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading("Preflight");
+            let config_path = self
+                .config_path
+                .canonicalize()
+                .unwrap_or_else(|_| self.config_path.clone());
+            field(
+                ui,
+                "Command",
+                format!("egb.exe run --config {}", config_path.display()),
+            );
+            field(ui, "Config path", config_path.display().to_string());
+            field(ui, "Flex IP", &self.config.flex_injection.radio_ip);
+            field(
+                ui,
+                "KPA COM",
+                format!(
+                    "{} @ {}",
+                    self.config.kpa500.com_port, self.config.kpa500.baud
+                ),
+            );
+            field(
+                ui,
+                "KAT COM",
+                format!(
+                    "{} @ {}",
+                    self.config.kat500.com_port, self.config.kat500.baud
+                ),
+            );
+            match self.config.validate() {
+                Ok(()) => field(ui, "Validation", "OK"),
+                Err(err) => field(ui, "Validation", format!("ERROR: {err}")),
+            }
+            let preview = effective_policy_preview(&self.config);
+            field(
+                ui,
+                "Operational override",
+                bool_text(Some(preview.operational_override_active)),
+            );
+            field(ui, "KAT tune", bool_text(Some(preview.kat_tune)));
+            field(ui, "KPA standby", bool_text(Some(preview.kpa_standby)));
+            field(ui, "KPA operate", bool_text(Some(preview.kpa_operate)));
         });
         ui.separator();
 
@@ -1664,6 +1767,32 @@ impl GuiApp {
                     "Config path",
                     status.bridge.config_path.as_deref().unwrap_or("unknown"),
                 );
+                field(
+                    ui,
+                    "Config loaded",
+                    status
+                        .bridge
+                        .config_loaded_at
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                field(
+                    ui,
+                    "Config hash",
+                    status.bridge.config_hash.as_deref().unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Config hash match",
+                    status
+                        .bridge
+                        .config_hash_match
+                        .map(|value| bool_text(Some(value)).to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
+                if status.bridge.config_hash_match == Some(false) {
+                    ui.colored_label(egui::Color32::RED, "CONFIG_MISMATCH");
+                }
             });
             ui.separator();
             ui.group(|ui| {
@@ -2074,10 +2203,13 @@ impl BridgeProcess {
 
     fn start(&mut self, config_path: &Path, tx: Sender<AsyncMessage>) -> Result<()> {
         let egb = find_egb_binary()?;
+        let config_path = config_path
+            .canonicalize()
+            .with_context(|| format!("config path does not exist: {}", config_path.display()))?;
         let mut child = Command::new(egb)
             .arg("run")
             .arg("--config")
-            .arg(config_path)
+            .arg(&config_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -2177,6 +2309,16 @@ struct BridgeStatus {
     process_id: Option<u32>,
     uptime_ms: Option<u128>,
     config_path: Option<String>,
+    #[serde(default)]
+    config_loaded_at: Option<u128>,
+    #[serde(default)]
+    config_hash: Option<String>,
+    #[serde(default)]
+    config_source_hash: Option<String>,
+    #[serde(default)]
+    config_effective_hash: Option<String>,
+    #[serde(default)]
+    config_hash_match: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -2477,6 +2619,15 @@ fn save_config(path: &Path, config: &BridgeConfig) -> Result<()> {
     fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
 }
 
+fn stable_hash_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn export_diagnostics_bundle(
     config_path: &Path,
     status: Option<&StatusSnapshot>,
@@ -2492,15 +2643,50 @@ fn export_diagnostics_bundle(
     let options =
         zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let config_text = fs::read_to_string(config_path).unwrap_or_default();
+    let effective_config_text = BridgeConfig::load(config_path)
+        .ok()
+        .and_then(|config| serde_yaml::to_string(&config).ok())
+        .unwrap_or_default();
     zip_text(
         &mut zip,
         options,
-        "config.yaml",
+        "config-source.yaml",
         if redact {
             redact_text(&config_text)
         } else {
-            config_text
+            config_text.clone()
         },
+    )?;
+    zip_text(
+        &mut zip,
+        options,
+        "config-effective.yaml",
+        if redact {
+            redact_text(&effective_config_text)
+        } else {
+            effective_config_text.clone()
+        },
+    )?;
+    let effective_hash = stable_hash_hex(effective_config_text.as_bytes());
+    let runtime_hash = status.and_then(|snapshot| snapshot.bridge.config_hash.clone());
+    let mismatch = runtime_hash
+        .as_deref()
+        .is_some_and(|hash| hash != effective_hash);
+    zip_text(
+        &mut zip,
+        options,
+        "config-hash-comparison.txt",
+        format!(
+            "source_hash={}\neffective_hash={}\nruntime_hash={}\n{}\n",
+            stable_hash_hex(config_text.as_bytes()),
+            effective_hash,
+            runtime_hash.unwrap_or_else(|| "unknown".to_string()),
+            if mismatch {
+                "CONFIG_MISMATCH"
+            } else {
+                "CONFIG_MATCH_OR_RUNTIME_UNKNOWN"
+            }
+        ),
     )?;
     zip_text(
         &mut zip,
@@ -2773,6 +2959,27 @@ fn status_color(ok: bool) -> egui::Color32 {
         egui::Color32::from_rgb(72, 210, 135)
     } else {
         egui::Color32::from_rgb(225, 96, 96)
+    }
+}
+
+struct EffectivePolicyPreview {
+    operational_override_active: bool,
+    kat_tune: bool,
+    kpa_standby: bool,
+    kpa_operate: bool,
+}
+
+fn effective_policy_preview(config: &BridgeConfig) -> EffectivePolicyPreview {
+    let confirmed = config.operational.enable_real_controls
+        && config.operational.confirm_real_hardware_control == "I understand";
+    EffectivePolicyPreview {
+        operational_override_active: confirmed,
+        kat_tune: (!config.kat500.dry_run && config.kat500.allow_rf_risk)
+            || (confirmed && config.operational.enable_kat_tune),
+        kpa_standby: (!config.kpa500.dry_run && config.kpa500.allow_control)
+            || (confirmed && config.operational.enable_kpa_standby),
+        kpa_operate: (!config.kpa500.dry_run && config.kpa500.allow_rf_risk)
+            || (confirmed && config.operational.enable_kpa_operate),
     }
 }
 
