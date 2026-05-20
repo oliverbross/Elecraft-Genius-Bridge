@@ -81,6 +81,12 @@ enum Commands {
         #[arg(long, default_value_t = 60.0)]
         duration_seconds: f64,
     },
+    PgxlDirectTriggerMatrix {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 60.0)]
+        duration_seconds: f64,
+    },
     TestStartupSequence {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -260,6 +266,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             compare_pgxl_profiles(cfg, config, duration_seconds).await
+        }
+        Commands::PgxlDirectTriggerMatrix {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_pgxl_direct_trigger_matrix(cfg, config, duration_seconds).await
         }
         Commands::TestStartupSequence {
             config,
@@ -582,6 +596,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             ant_map: cfg.flex_injection.ant_map.clone(),
             amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
             trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
+            pgxl_force_operate_advertisement: cfg.flex_injection.pgxl_force_operate_advertisement,
             amplifier_startup_state_policy: cfg
                 .flex_injection
                 .amplifier_startup_state_policy
@@ -900,6 +915,55 @@ async fn compare_pgxl_profiles(
     Ok(())
 }
 
+async fn run_pgxl_direct_trigger_matrix(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    cfg.flex_injection.amplifier_status_profile = "aethersdr_pgxl_direct_lab".to_string();
+    cfg.flex_injection.pgxl_force_operate_advertisement = true;
+    cfg.validate()?;
+
+    let evidence = EvidenceRun::start(
+        "pgxl-direct-trigger-matrix",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    tokio::fs::write(
+        evidence.dir().join("pgxl-trigger-matrix.md"),
+        pgxl_trigger_matrix_markdown(&cfg, &state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("radio-stripped-amplifier-fields.md"),
+        radio_stripped_amplifier_fields_markdown(&state).await,
+    )
+    .await?;
+    tokio::fs::write(
+        evidence.dir().join("aethersdr-amp-parser-notes.md"),
+        aethersdr_amp_parser_notes_markdown(),
+    )
+    .await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "PGXL direct trigger matrix complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn test_startup_sequence(
     cfg: BridgeConfig,
     config_path: PathBuf,
@@ -1101,6 +1165,9 @@ impl EvidenceRun {
             "latest-pgxl-advertised-status.json",
             "pgxl-regression-diff.md",
             "amplifier-advertisements.jsonl",
+            "pgxl-trigger-matrix.md",
+            "radio-stripped-amplifier-fields.md",
+            "aethersdr-amp-parser-notes.md",
             "pgxl-connect-attempt-timeline.md",
             "kpa-startup-diagnostics.md",
             "first-poll-sequence.log",
@@ -1212,6 +1279,16 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("pgxl-connect-attempt-timeline.md"),
             pgxl_connect_attempt_timeline_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("radio-stripped-amplifier-fields.md"),
+            radio_stripped_amplifier_fields_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("aethersdr-amp-parser-notes.md"),
+            aethersdr_amp_parser_notes_markdown(),
         )
         .await?;
         tokio::fs::write(
@@ -1792,6 +1869,139 @@ async fn startup_advertisement_policy_markdown(state: &SharedState) -> String {
             .as_deref()
             .unwrap_or("none"),
     )
+}
+
+fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
+    let advertised_ip = cfg
+        .flex_injection
+        .force_advertised_pgxl_ip
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&cfg.flex_injection.amplifier_ip)
+        .parse()
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+    let radio_ip = cfg
+        .flex_injection
+        .radio_ip
+        .parse()
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+    FlexInjectionSettings {
+        radio_addr: SocketAddr::new(radio_ip, cfg.flex_injection.radio_port),
+        amplifier_ip: advertised_ip,
+        amplifier_port: cfg.flex_injection.amplifier_port,
+        amplifier_model: cfg.flex_injection.amplifier_model.clone(),
+        serial: cfg.flex_injection.serial.clone(),
+        handle_label: cfg.flex_injection.handle.clone(),
+        ant_map: cfg.flex_injection.ant_map.clone(),
+        amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
+        trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
+        pgxl_force_operate_advertisement: cfg.flex_injection.pgxl_force_operate_advertisement,
+        amplifier_startup_state_policy: cfg.flex_injection.amplifier_startup_state_policy.clone(),
+        wait_first_kpa_poll_timeout: Duration::from_millis(
+            cfg.flex_injection.wait_first_kpa_poll_timeout_ms,
+        ),
+        full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
+        create_meters: cfg.flex_injection.create_meters,
+        create_interlock: cfg.flex_injection.create_interlock,
+        allow_rf_risk: cfg.kpa500.allow_rf_risk,
+        reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
+        reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
+        ping_interval: Duration::from_millis(cfg.flex_injection.ping_interval_ms),
+        tuner_presence_refresh: cfg.tgxl.experimental_presence_refresh,
+        tuner_refresh_interval: Duration::from_millis(cfg.flex_injection.tuner_refresh_interval_ms),
+        amplifier_reannounce_interval: Duration::from_millis(
+            cfg.flex_injection.amplifier_reannounce_interval_ms,
+        ),
+    }
+}
+
+async fn pgxl_trigger_matrix_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let settings = flex_settings_for_markdown(cfg);
+    let guard = state.read().await;
+    let mut body = String::from("# PGXL Direct Trigger Matrix\n\n");
+    body.push_str("This run uses lab-only `aethersdr_pgxl_direct_lab` plus `pgxl_force_operate_advertisement=true`. That advertises `state=OPERATE` without sending any KPA500 command.\n\n");
+    body.push_str(&format!(
+        "- Runtime profile: `{}`\n- Advertised IP: `{}`\n- PGXL sessions started: {}\n- PGXL direct attempted after status: {}\n- No-socket warnings: {}\n- Last amplifier status line: `{}`\n- Last emitted advertisement: `{}`\n\n",
+        cfg.flex_injection.amplifier_status_profile,
+        settings.amplifier_ip,
+        guard.clients.pgxl_session_started_count,
+        guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status,
+        guard.clients.pgxl_manual_connect_no_socket_attempt_count,
+        guard.flex_injection.last_amplifier_status_line.as_deref().unwrap_or("none"),
+        guard.flex_injection.last_emitted_amplifier_advertisement_line.as_deref().unwrap_or("none"),
+    ));
+    drop(guard);
+    body.push_str(
+        "| Variant | State | Candidate status line | Notes |\n| --- | --- | --- | --- |\n",
+    );
+    for variant in flex_injection::pgxl_direct_trigger_variants(&settings) {
+        body.push_str(&format!(
+            "| `{}` | `{}` | `{}` | {} |\n",
+            variant.name, variant.state, variant.line, variant.notes
+        ));
+    }
+    body.push_str("\nIf this run still shows zero PGXL sessions, compare `radio-stripped-amplifier-fields.md` to see whether the Flex radio forwarded the trigger fields to AetherSDR.\n");
+    body
+}
+
+async fn radio_stripped_amplifier_fields_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let emitted = guard
+        .flex_injection
+        .last_emitted_amplifier_advertisement_line
+        .as_deref()
+        .unwrap_or("none");
+    let observed = guard
+        .flex_injection
+        .last_amplifier_status_line
+        .as_deref()
+        .unwrap_or("none");
+    let emitted_fields = kv_field_names(emitted);
+    let observed_fields = kv_field_names(observed);
+    let stripped = emitted_fields
+        .iter()
+        .filter(|field| !observed_fields.contains(*field))
+        .cloned()
+        .collect::<Vec<_>>();
+    format!(
+        "# Radio-Stripped Amplifier Fields\n\n\
+        This compares the last amplifier advertisement EGB emitted/logged with the last amplifier status line observed back from the Flex API.\n\n\
+        - Last emitted advertisement kind: `{}`\n\
+        - Last emitted advertisement: `{emitted}`\n\
+        - Last observed radio-side status: `{observed}`\n\
+        - Emitted fields: {:?}\n\
+        - Observed fields: {:?}\n\
+        - Fields present in emitted line but missing from observed line: {:?}\n\n\
+        Interpretation: if `port`, `connected`, `configured`, `enabled`, `direct`, or `lan` are missing from the observed line, the Flex radio/client path may be stripping those trigger hints before AetherSDR sees them.\n",
+        guard
+            .flex_injection
+            .last_emitted_amplifier_advertisement_kind
+            .as_deref()
+            .unwrap_or("unknown"),
+        emitted_fields,
+        observed_fields,
+        stripped,
+    )
+}
+
+fn kv_field_names(line: &str) -> Vec<String> {
+    line.split_whitespace()
+        .filter_map(|token| token.split_once('=').map(|(key, _)| key.to_string()))
+        .collect()
+}
+
+fn aethersdr_amp_parser_notes_markdown() -> String {
+    "# AetherSDR Amp Parser Notes\n\n\
+    Source inspected: `research/AetherSDR/src/models/RadioModel.cpp` and `research/AetherSDR/src/gui/MainWindow.cpp`.\n\n\
+    - `RadioModel.cpp` parses `amplifier <handle> ...` status/event lines.\n\
+    - `model=TunerGeniusXL` is routed to the tuner model.\n\
+    - Any non-empty `model` that is not `TunerGeniusXL` is treated as a power amplifier.\n\
+    - On first power amplifier status, AetherSDR stores `m_ampIp = kvs.value(\"ip\")`, stores the model, and emits `amplifierChanged(true)`.\n\
+    - `MainWindow.cpp` handles `amplifierChanged(true)` by calling `m_pgxlConn.connectToPgxl(m_radioModel.ampIp())` if the IP is non-empty and PGXL direct is not already connected.\n\
+    - The direct auto-connect path does not inspect `port`; the manual peripherals UI defaults PGXL to port 9008.\n\
+    - The parser updates operate state from `state=IDLE|OPERATE|TRANSMIT*`; `STANDBY` is present but not an operate state.\n\n\
+    Current implication: if AetherSDR receives an amplifier line with non-empty `model` and `ip`, it should attempt PGXL TCP unless the installed binary differs, the status line is not delivered through the subscription path, or an internal UI/peripheral setting suppresses direct connect.\n"
+        .to_string()
 }
 
 async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
@@ -3421,6 +3631,7 @@ mod tests {
         assert!(names.contains(&"aethersdr-smoke-test".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
+        assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));
     }
 
     #[test]

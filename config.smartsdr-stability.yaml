@@ -73,6 +73,7 @@ flex_injection:
   create_interlock: true
   amplifier_status_profile: aethersdr_force_direct
   trace_amplifier_advertisements: true
+  pgxl_force_operate_advertisement: false
   amplifier_startup_state_policy: wait_for_first_kpa_poll
   wait_first_kpa_poll_timeout_ms: 10000
   amplifier_reannounce_interval_ms: 5000

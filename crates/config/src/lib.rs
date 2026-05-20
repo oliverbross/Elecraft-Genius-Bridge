@@ -356,6 +356,7 @@ pub struct FlexInjectionConfig {
     pub create_interlock: bool,
     pub amplifier_status_profile: String,
     pub trace_amplifier_advertisements: bool,
+    pub pgxl_force_operate_advertisement: bool,
     pub amplifier_startup_state_policy: String,
     pub wait_first_kpa_poll_timeout_ms: u64,
     pub amplifier_reannounce_interval_ms: u64,
@@ -440,9 +441,10 @@ impl FlexInjectionConfig {
             | "pgxl_verbose"
             | "old_good_pgxl"
             | "aethersdr_force_direct"
+            | "aethersdr_pgxl_direct_lab"
             | "strict_real_pgxl" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_force_direct, strict_real_pgxl; got {other}"
+                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_force_direct, aethersdr_pgxl_direct_lab, strict_real_pgxl; got {other}"
             ))),
         }
     }
@@ -466,6 +468,7 @@ impl Default for FlexInjectionConfig {
             create_interlock: true,
             amplifier_status_profile: "pgxl_paired".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
             wait_first_kpa_poll_timeout_ms: 10000,
             amplifier_reannounce_interval_ms: 5000,
@@ -594,6 +597,9 @@ pgxl:
         cfg.validate().unwrap();
 
         cfg.flex_injection.amplifier_status_profile = "old_good_pgxl".to_string();
+        cfg.validate().unwrap();
+
+        cfg.flex_injection.amplifier_status_profile = "aethersdr_pgxl_direct_lab".to_string();
         cfg.validate().unwrap();
 
         cfg.flex_injection.amplifier_status_profile = "invented".to_string();

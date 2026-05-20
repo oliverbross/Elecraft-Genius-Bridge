@@ -23,6 +23,7 @@ pub struct FlexInjectionSettings {
     pub ant_map: String,
     pub amplifier_status_profile: String,
     pub trace_amplifier_advertisements: bool,
+    pub pgxl_force_operate_advertisement: bool,
     pub amplifier_startup_state_policy: String,
     pub wait_first_kpa_poll_timeout: Duration,
     pub full_pgxl_registration: bool,
@@ -59,6 +60,11 @@ impl FlexInjectionSettings {
             &self.amplifier_status_profile,
             Some(state_value),
         )
+    }
+
+    fn lab_forces_operate_advertisement(&self) -> bool {
+        self.pgxl_force_operate_advertisement
+            || self.amplifier_status_profile == "aethersdr_pgxl_direct_lab"
     }
 }
 
@@ -605,6 +611,14 @@ async fn record_amplifier_pairing_status(
         .amplifier_pgxl_tcp_attempted_after_status = guard.clients.pgxl_session_started_count > 0;
 }
 
+async fn record_amplifier_candidate_fields(state: &SharedState, candidate_fields: Vec<String>) {
+    let mut guard = state.write().await;
+    guard.flex_injection.amplifier_pairing_candidate_fields = candidate_fields;
+    guard
+        .flex_injection
+        .amplifier_pgxl_tcp_attempted_after_status = guard.clients.pgxl_session_started_count > 0;
+}
+
 async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
     let mut guard = state.write().await;
     if let Some(existing) = guard
@@ -955,7 +969,7 @@ async fn trace_amplifier_advertisement(
         (
             guard.amp.state.pgxl_state().to_string(),
             guard.amp.fault.clone(),
-            advertised_amp_state(&guard.amp).to_string(),
+            advertised_amp_state_for_settings(settings, &guard.amp).to_string(),
         )
     };
     let record = serde_json::json!({
@@ -977,6 +991,12 @@ async fn trace_amplifier_advertisement(
     if matches!(kind, "amplifier_create" | "amplifier_status") {
         let mut guard = state.write().await;
         guard.flex_injection.last_advertised_flex_amp_state = Some(advertised_state);
+        guard
+            .flex_injection
+            .last_emitted_amplifier_advertisement_line = Some(line.to_string());
+        guard
+            .flex_injection
+            .last_emitted_amplifier_advertisement_kind = Some(kind.to_string());
     }
 }
 
@@ -1021,7 +1041,7 @@ pub fn amplifier_create_command_with_state(
             }
             command.push_str(" connected=1 configured=1 enabled=1");
         }
-        "aethersdr_force_direct" => {
+        "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
             if let Some(state_value) = state_value {
                 command.push_str(&format!(" state={}", sanitize_token(state_value)));
             }
@@ -1043,7 +1063,7 @@ async fn synthetic_amplifier_status_line(
         let guard = state.read().await;
         guard.amp.clone()
     };
-    let state_value = advertised_amp_state(&amp);
+    let state_value = advertised_amp_state_for_settings(settings, &amp);
     let fault = amp.fault.as_deref().unwrap_or("");
     let mut candidate_fields = vec![
         "model".to_string(),
@@ -1087,7 +1107,7 @@ async fn synthetic_amplifier_status_line(
             ]);
             line.push_str(" connected=1 configured=1 enabled=1");
         }
-        "aethersdr_force_direct" => {
+        "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
             candidate_fields.extend([
                 "connected".to_string(),
                 "configured".to_string(),
@@ -1099,7 +1119,7 @@ async fn synthetic_amplifier_status_line(
         }
         _ => {}
     }
-    record_amplifier_pairing_status(state, line.clone(), candidate_fields).await;
+    record_amplifier_candidate_fields(state, candidate_fields).await;
     line
 }
 
@@ -1113,6 +1133,17 @@ fn advertised_amp_state(amp: &bridge_core::AmpState) -> &'static str {
         "FAULT"
     } else {
         amp.state.pgxl_state()
+    }
+}
+
+fn advertised_amp_state_for_settings(
+    settings: &FlexInjectionSettings,
+    amp: &bridge_core::AmpState,
+) -> &'static str {
+    if settings.lab_forces_operate_advertisement() {
+        "OPERATE"
+    } else {
+        advertised_amp_state(amp)
     }
 }
 
@@ -1133,7 +1164,7 @@ async fn registration_commands_with_state(
 ) -> Vec<PendingCommand> {
     let state_value = {
         let guard = state.read().await;
-        advertised_amp_state(&guard.amp).to_string()
+        advertised_amp_state_for_settings(settings, &guard.amp).to_string()
     };
     registration_commands_inner(settings, Some(&state_value))
 }
@@ -1228,6 +1259,65 @@ fn sanitize_token(value: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_whitespace() && *ch != '|')
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgxlTriggerVariant {
+    pub name: String,
+    pub state: String,
+    pub line: String,
+    pub notes: String,
+}
+
+pub fn pgxl_direct_trigger_variants(settings: &FlexInjectionSettings) -> Vec<PgxlTriggerVariant> {
+    let handle = "0x42000001";
+    let model = sanitize_token(&settings.amplifier_model);
+    let ip = settings.amplifier_ip;
+    let port = settings.amplifier_port;
+    let serial = sanitize_token(&settings.serial);
+    let serial_num = format!("serial_num={serial}");
+    let serial_short = format!("serial={serial}");
+    let mut variants = Vec::new();
+    for state in ["STANDBY", "OPERATE"] {
+        variants.push(PgxlTriggerVariant {
+            name: format!("{state}-A-model-ip"),
+            state: state.to_string(),
+            line: format!("amplifier {handle} model={model} ip={ip} state={state}"),
+            notes: "AetherSDR source only requires non-TGXL model plus non-empty ip for amplifierChanged(true).".to_string(),
+        });
+        variants.push(PgxlTriggerVariant {
+            name: format!("{state}-B-model-ip-port"),
+            state: state.to_string(),
+            line: format!("amplifier {handle} model={model} ip={ip} port={port} state={state}"),
+            notes: "Adds explicit PGXL TCP port; AetherSDR direct auto-connect currently uses default 9008 when only an IP is supplied.".to_string(),
+        });
+        variants.push(PgxlTriggerVariant {
+            name: format!("{state}-C-ip-model-port-connected"),
+            state: state.to_string(),
+            line: format!(
+                "amplifier {handle} ip={ip} model={model} port={port} state={state} connected=1"
+            ),
+            notes: "Tests field ordering and connected=1 without extra direct/lan flags."
+                .to_string(),
+        });
+        variants.push(PgxlTriggerVariant {
+            name: format!("{state}-D-serial-field"),
+            state: state.to_string(),
+            line: format!(
+                "amplifier {handle} ip={ip} model={model} port={port} {serial_short} state={state} connected=1"
+            ),
+            notes: "Tests serial= spelling in case client code or radio firmware rewrites serial_num.".to_string(),
+        });
+        variants.push(PgxlTriggerVariant {
+            name: format!("{state}-E-serial-num-direct-lan"),
+            state: state.to_string(),
+            line: format!(
+                "amplifier {handle} ip={ip} model={model} port={port} {serial_num} state={state} connected=1 configured=1 enabled=1 direct=1 lan=1"
+            ),
+            notes: "Current EGB direct-trigger candidate with full AetherSDR lab flags.".to_string(),
+        });
+    }
+    variants
 }
 
 pub fn parse_response(line: &str) -> Option<(u32, String, String)> {
@@ -1362,6 +1452,7 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "strict_real_pgxl".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1409,6 +1500,7 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1453,6 +1545,7 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1510,6 +1603,7 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1548,6 +1642,7 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1582,6 +1677,7 @@ mod tests {
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "pgxl_paired".to_string(),
             trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
             amplifier_startup_state_policy: "advertise_standby_immediately".to_string(),
             wait_first_kpa_poll_timeout: Duration::from_millis(10000),
             full_pgxl_registration: true,
@@ -1620,5 +1716,45 @@ mod tests {
             commands.last().map(String::as_str),
             Some("sub amplifier all")
         );
+    }
+
+    #[tokio::test]
+    async fn lab_force_operate_advertises_operate_without_live_state() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_pgxl_direct_lab".to_string(),
+            trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: true,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        let commands = registration_commands_with_state(&settings, &state).await;
+        assert!(commands[0].command.contains("state=OPERATE"));
+        assert!(commands[0].command.contains("direct=1"));
+
+        let variants = pgxl_direct_trigger_variants(&settings);
+        assert!(variants.iter().any(|variant| {
+            variant.name == "OPERATE-E-serial-num-direct-lan" && variant.line.contains("direct=1")
+        }));
+        assert!(variants.iter().any(|variant| {
+            variant.name == "STANDBY-A-model-ip" && variant.line.contains("state=STANDBY")
+        }));
     }
 }

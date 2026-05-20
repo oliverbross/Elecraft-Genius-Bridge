@@ -347,6 +347,8 @@ pub struct FlexInjectionState {
     pub amplifier_reannounce_count: u64,
     pub amplifier_direct_connect_expected: Option<bool>,
     pub last_amplifier_status_line: Option<String>,
+    pub last_emitted_amplifier_advertisement_line: Option<String>,
+    pub last_emitted_amplifier_advertisement_kind: Option<String>,
     pub amplifier_pairing_candidate_fields: Vec<String>,
     pub amplifier_pgxl_tcp_attempted_after_status: bool,
     pub last_amplifier_reannounce_reason: Option<String>,

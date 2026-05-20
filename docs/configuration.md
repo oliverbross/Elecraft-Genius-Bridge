@@ -126,6 +126,7 @@ flex_injection:
   create_meters: true
   create_interlock: true
   amplifier_status_profile: pgxl_paired
+  pgxl_force_operate_advertisement: false
   amplifier_reannounce_interval_ms: 5000
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
@@ -143,7 +144,9 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
 
-`amplifier_status_profile` controls PGXL trigger experiments. `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative. `strict_real_pgxl` keeps amplifier status candidates to the documented PGXL fields: `model`, `ip`, `port`, `serial_num`, `ant`, and live `state`. `pgxl_verbose`, `old_good_pgxl`, and `aethersdr_force_direct` add status-like direct-connect fields and are the preferred profiles for AetherSDR regression checks. No profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
+`amplifier_status_profile` controls PGXL trigger experiments. `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative. `strict_real_pgxl` keeps amplifier status candidates to the documented PGXL fields: `model`, `ip`, `port`, `serial_num`, `ant`, and live `state`. `pgxl_verbose`, `old_good_pgxl`, and `aethersdr_force_direct` add status-like direct-connect fields and are the preferred profiles for AetherSDR regression checks. `aethersdr_pgxl_direct_lab` is a lab-only profile for direct-connect trigger experiments. No normal profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
+
+`pgxl_force_operate_advertisement` is a lab-only switch. It advertises `state=OPERATE` to AetherSDR without sending any KPA500 command. Use it only to determine whether AetherSDR refuses to open TCP 9008 while the injected amplifier is in `STANDBY`.
 
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 
