@@ -30,6 +30,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+#[allow(dead_code)]
 struct GuiApp {
     config_path: PathBuf,
     config: BridgeConfig,
@@ -49,6 +50,8 @@ struct GuiApp {
     controls: ControlFlags,
     log_filter: LogFilter,
     logs_paused: bool,
+    support_bundle_modal: Option<PathBuf>,
+    start_progress_open: bool,
     tx: Sender<AsyncMessage>,
     rx: Receiver<AsyncMessage>,
 }
@@ -79,6 +82,8 @@ impl GuiApp {
             controls,
             log_filter: LogFilter::All,
             logs_paused: false,
+            support_bundle_modal: None,
+            start_progress_open: false,
             tx,
             rx,
         };
@@ -227,8 +232,12 @@ impl GuiApp {
             ));
             return;
         }
+        stop_stale_bridge_processes();
         match self.bridge.start(&self.config_path, self.tx.clone()) {
-            Ok(()) => self.push_log("bridge process started"),
+            Ok(()) => {
+                self.start_progress_open = true;
+                self.push_log("bridge process started");
+            }
             Err(err) => self.push_log(format!("bridge start failed: {err}")),
         }
     }
@@ -278,6 +287,100 @@ impl GuiApp {
         });
     }
 
+    fn apply_recommended_aethersdr_setup(&mut self, preserve_safe_mode: bool) {
+        self.config.pgxl.enabled = true;
+        self.config.tgxl.enabled = true;
+        self.config.pgxl.aethersdr_compat = true;
+        self.config.tgxl.aethersdr_compat = true;
+        self.config.pgxl.compat_profile = "aethersdr".to_string();
+        self.config.tgxl.control_profile = "control_ready".to_string();
+        self.config.flex_injection.enabled = true;
+        self.config.flex_injection.full_pgxl_registration = true;
+        self.config.flex_injection.create_meters = true;
+        self.config.flex_injection.create_interlock = true;
+        self.config.flex_injection.amplifier_status_profile = "aethersdr_force_direct".to_string();
+        self.config.flex_injection.pgxl_connect_assist = true;
+        self.config.flex_injection.amplifier_startup_state_policy =
+            "wait_for_first_kpa_poll".to_string();
+        self.config.flex_injection.amplifier_reannounce_interval_ms = self
+            .config
+            .flex_injection
+            .amplifier_reannounce_interval_ms
+            .max(30_000);
+        self.config.kpa500.mock = false;
+        self.config.kat500.mock = false;
+        self.config.kpa500.dry_run = true;
+        self.config.kat500.dry_run = true;
+        self.config.kpa500.allow_control = false;
+        self.config.kat500.allow_control = false;
+        self.config.kpa500.allow_rf_risk = false;
+        self.config.kat500.allow_rf_risk = false;
+        if preserve_safe_mode {
+            self.config.operational.enable_real_controls = true;
+            self.config.operational.enable_kat_tune = true;
+            self.config.operational.enable_kpa_standby = true;
+            self.config.operational.enable_kpa_operate = false;
+            self.config.operational.enable_clear_fault = false;
+            self.config.operational.confirm_real_hardware_control = "I understand".to_string();
+        }
+        self.push_log("recommended AetherSDR setup applied");
+    }
+
+    fn current_config_hash(&self) -> Option<String> {
+        serde_yaml::to_string(&self.config)
+            .ok()
+            .map(|text| stable_hash_hex(text.as_bytes()))
+    }
+
+    fn saved_config_hash(&self) -> Option<String> {
+        BridgeConfig::load(&self.config_path)
+            .ok()
+            .and_then(|config| serde_yaml::to_string(&config).ok())
+            .map(|text| stable_hash_hex(text.as_bytes()))
+    }
+
+    fn restart_required(&self) -> bool {
+        let Some(status) = &self.status else {
+            return false;
+        };
+        self.current_config_hash()
+            .zip(status.bridge.config_hash.clone())
+            .is_some_and(|(current, running)| current != running)
+    }
+
+    fn ui_config_state_banner(&self, ui: &mut egui::Ui) {
+        let saved = self
+            .current_config_hash()
+            .zip(self.saved_config_hash())
+            .is_some_and(|(current, saved)| current == saved);
+        let running_path = self
+            .status
+            .as_ref()
+            .and_then(|status| status.bridge.config_path.as_deref())
+            .unwrap_or("not running");
+        let restart_required = self.restart_required();
+        ui.horizontal_wrapped(|ui| {
+            field(ui, "Loaded config", self.config_path.display().to_string());
+            field(ui, "Saved", if saved { "Saved" } else { "Unsaved" });
+            field(ui, "Running config", running_path);
+            field(
+                ui,
+                "Apply state",
+                if restart_required {
+                    "Restart required"
+                } else {
+                    "Current"
+                },
+            );
+        });
+        if restart_required {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Setup changed after the bridge started. Restart Bridge to Apply.",
+            );
+        }
+    }
+
     fn export_diagnostics_bundle(&self) -> Result<PathBuf> {
         export_diagnostics_bundle(
             &self.config_path,
@@ -305,11 +408,8 @@ impl eframe::App for GuiApp {
                 ui.label("Elecraft Genius Bridge");
                 ui.separator();
                 nav_button(ui, &mut self.tab, Tab::Dashboard, "Dashboard");
-                nav_button(ui, &mut self.tab, Tab::Config, "Configuration");
-                nav_button(ui, &mut self.tab, Tab::Operational, "Operational");
-                nav_button(ui, &mut self.tab, Tab::Controls, "Controls");
+                nav_button(ui, &mut self.tab, Tab::Setup, "Setup");
                 nav_button(ui, &mut self.tab, Tab::Diagnostics, "Diagnostics");
-                nav_button(ui, &mut self.tab, Tab::Logs, "Logs");
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     process_badge(
                         ui,
@@ -320,79 +420,136 @@ impl eframe::App for GuiApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Dashboard => self.ui_dashboard(ui),
-            Tab::Config => self.ui_config(ui),
-            Tab::Operational => self.ui_operational(ui),
-            Tab::Controls => self.ui_controls(ui),
+            Tab::Setup => self.ui_setup_simple(ui),
             Tab::Diagnostics => self.ui_diagnostics(ui),
-            Tab::Logs => self.ui_logs(ui),
         });
+        self.ui_progress_modal(ctx);
+        self.ui_support_bundle_modal(ctx);
 
         ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
 impl GuiApp {
-    fn ui_dashboard(&mut self, ui: &mut egui::Ui) {
+    fn ui_progress_modal(&mut self, ctx: &egui::Context) {
+        if !self.start_progress_open {
+            return;
+        }
+        let mut open = self.start_progress_open;
+        egui::Window::new("Starting Operational Bridge")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("EGB is starting with the saved setup.");
+                self.progress_step(
+                    ui,
+                    "Step 1: KPA500 detected",
+                    self.status
+                        .as_ref()
+                        .is_some_and(|status| status.amp.connected),
+                );
+                self.progress_step(
+                    ui,
+                    "Step 2: KAT500 detected",
+                    self.status
+                        .as_ref()
+                        .is_some_and(|status| status.tuner.connected),
+                );
+                self.progress_step(
+                    ui,
+                    "Step 3: Flex API connected",
+                    self.status.as_ref().is_some_and(|status| {
+                        status.flex_injection.connection_state == "connected"
+                    }),
+                );
+                self.progress_step(
+                    ui,
+                    "Step 4: PGXL/TGXL sockets ready",
+                    matches!(
+                        self.bridge.state(),
+                        ProcessState::Starting | ProcessState::Running | ProcessState::Degraded
+                    ),
+                );
+                self.progress_step(
+                    ui,
+                    "Step 5: Waiting for AetherSDR/SmartSDR clients",
+                    self.status.as_ref().is_some_and(|status| {
+                        status.clients.pgxl_client_count > 0 || status.clients.tgxl_client_count > 0
+                    }),
+                );
+            });
+        self.start_progress_open = open;
+    }
+
+    fn progress_step(&self, ui: &mut egui::Ui, label: &str, ok: bool) {
         ui.horizontal(|ui| {
-            if ui.button("Start Bridge").clicked() {
-                self.start_bridge();
-            }
-            if ui.button("Stop Bridge").clicked() {
-                self.stop_bridge();
-            }
-            if ui.button("Restart Bridge").clicked() {
-                self.restart_bridge();
-            }
+            ui.colored_label(status_color(ok), if ok { "OK" } else { "..." });
+            ui.label(label);
+        });
+    }
+
+    fn ui_support_bundle_modal(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.support_bundle_modal.clone() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Support Bundle Exported")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Support bundle created.");
+                ui.monospace(path.display().to_string());
+                ui.horizontal(|ui| {
+                    if ui.button("Copy path").clicked() {
+                        ui.output_mut(|out| out.copied_text = path.display().to_string());
+                    }
+                    if ui.button("Open folder").clicked() {
+                        if let Some(parent) = path.parent() {
+                            open_path(parent);
+                        }
+                    }
+                });
+            });
+        if !open {
+            self.support_bundle_modal = None;
+        }
+    }
+
+    fn ui_dashboard(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .button("Start Stability Test and Export Evidence")
+                .add_sized([230.0, 44.0], egui::Button::new("Start Operational Bridge"))
                 .clicked()
             {
-                self.tab = Tab::Dashboard;
-                self.run_egb_command(
-                    "evidence-test-10min",
-                    vec![
-                        "evidence-test".into(),
-                        "--config".into(),
-                        self.config_path.display().to_string(),
-                        "--duration-minutes".into(),
-                        "10".into(),
-                    ],
-                );
-                self.push_log("10-minute evidence test started");
+                self.start_bridge();
             }
-            if ui.button("Export Last Evidence Bundle").clicked() {
+            if ui.button("Stop").clicked() {
+                self.stop_bridge();
+            }
+            let restart_required = self.restart_required();
+            if ui
+                .add_enabled(
+                    restart_required || self.bridge.is_running(),
+                    egui::Button::new(if restart_required {
+                        "Restart Bridge to Apply"
+                    } else {
+                        "Restart"
+                    }),
+                )
+                .clicked()
+            {
+                self.restart_bridge();
+            }
+            if ui.button("Export Support Bundle").clicked() {
                 match self.export_diagnostics_bundle() {
                     Ok(path) => {
                         self.latest_evidence_bundle = Some(path.clone());
-                        self.push_log(format!("diagnostics bundle written to {}", path.display()));
+                        self.support_bundle_modal = Some(path.clone());
+                        self.push_log(format!("support bundle written to {}", path.display()));
                     }
-                    Err(err) => self.push_log(format!("diagnostics bundle failed: {err}")),
-                }
-            }
-            if ui.button("Open Evidence Folder").clicked() {
-                open_path(Path::new("diagnostics/runs"));
-            }
-            if ui.button("Copy Latest Bundle Path").clicked() {
-                if let Some(path) = &self.latest_evidence_bundle {
-                    ui.output_mut(|out| out.copied_text = path.display().to_string());
-                    self.push_log("latest evidence bundle path copied");
-                }
-            }
-            if ui.button("Open Logs Folder").clicked() {
-                open_path(Path::new("logs"));
-            }
-            if ui.button("Open /status").clicked() {
-                open_url(&format!(
-                    "http://{}:{}/status",
-                    self.config.metrics.bind_ip, self.config.metrics.port
-                ));
-            }
-            if ui.button("Export Full Diagnostics Bundle").clicked() {
-                match self.export_diagnostics_bundle() {
-                    Ok(path) => {
-                        self.push_log(format!("diagnostics bundle written to {}", path.display()))
-                    }
-                    Err(err) => self.push_log(format!("diagnostics bundle failed: {err}")),
+                    Err(err) => self.push_log(format!("support bundle failed: {err}")),
                 }
             }
         });
@@ -402,40 +559,41 @@ impl GuiApp {
                 format!("/status unavailable: {error}"),
             );
         }
-        ui.horizontal_wrapped(|ui| {
-            field(
-                ui,
-                "Latest evidence",
-                self.latest_evidence_bundle
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            field(
-                ui,
-                "Current run dir",
-                self.current_evidence_dir
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-            );
-            let warning_count = self
-                .diagnostics
-                .iter()
-                .filter(|line| {
-                    let lower = line.to_ascii_lowercase();
-                    lower.contains("warn") || lower.contains("error") || lower.contains("failed")
-                })
-                .count();
-            field(ui, "Captured warnings/errors", warning_count);
-            if let Some(status) = &self.status {
+        self.ui_config_state_banner(ui);
+        if let Some(status) = &self.status {
+            ui.horizontal_wrapped(|ui| {
                 field(
                     ui,
-                    "SmartSDR tuner flaps",
-                    status.flex_diagnostics.smartsdr_tuner_disappeared_count,
+                    "Last client command",
+                    status
+                        .controls
+                        .last_tgxl_control_command
+                        .as_deref()
+                        .or(status.controls.last_pgxl_control_command.as_deref())
+                        .or(status.controls.last_flex_amp_set_command.as_deref())
+                        .unwrap_or("-"),
                 );
-            }
-        });
+                field(
+                    ui,
+                    "Mapped Elecraft",
+                    status
+                        .controls
+                        .last_mapped_elecraft_action
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Executed/Blocked",
+                    status
+                        .controls
+                        .last_executed_elecraft_command
+                        .as_deref()
+                        .or(status.controls.last_safety_decision.as_deref())
+                        .unwrap_or("-"),
+                );
+            });
+        }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             self.summary_card(
@@ -448,8 +606,8 @@ impl GuiApp {
                 self.summary_card(
                     ui,
                     "PGXL",
-                    bool_text(Some(status.clients.pgxl_connected)),
-                    status_color(status.clients.pgxl_connected),
+                    status.pgxl_lifecycle.state.as_str(),
+                    connection_color(pgxl_lifecycle_color_key(&status.pgxl_lifecycle.state)),
                 );
                 self.summary_card(
                     ui,
@@ -939,10 +1097,26 @@ impl GuiApp {
                     "PGXL clients",
                     status.clients.pgxl_client_count.to_string(),
                 );
+                field(ui, "PGXL lifecycle", &status.pgxl_lifecycle.state);
+                field(ui, "PGXL reason", &status.pgxl_lifecycle.reason);
                 field(
                     ui,
                     "TGXL clients",
                     status.clients.tgxl_client_count.to_string(),
+                );
+                field(
+                    ui,
+                    "SmartSDR PGXL",
+                    if status.flex_injection.amplifier_handle.is_some() {
+                        "supported / seen"
+                    } else {
+                        "supported / not seen"
+                    },
+                );
+                field(
+                    ui,
+                    "SmartSDR TGXL",
+                    "unsupported until Flex tuner injection is verified",
                 );
                 field(
                     ui,
@@ -1127,6 +1301,7 @@ impl GuiApp {
         });
     }
 
+    #[allow(dead_code)]
     fn ui_controls(&mut self, ui: &mut egui::Ui) {
         ui.heading("Guarded Controls");
         ui.colored_label(
@@ -1228,6 +1403,7 @@ impl GuiApp {
         });
     }
 
+    #[allow(dead_code)]
     fn ui_operational(&mut self, ui: &mut egui::Ui) {
         ui.heading("Operational Mode");
         ui.colored_label(
@@ -1401,6 +1577,7 @@ impl GuiApp {
         }
     }
 
+    #[allow(dead_code)]
     fn ui_logs(&mut self, ui: &mut egui::Ui) {
         ui.heading("Logs");
         ui.horizontal(|ui| {
@@ -1440,7 +1617,177 @@ impl GuiApp {
         });
     }
 
-    fn ui_config(&mut self, ui: &mut egui::Ui) {
+    fn ui_setup_simple(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Setup");
+        ui.label(
+            "Configure the station once, save, then start the operational bridge from Dashboard.",
+        );
+        ui.separator();
+
+        egui::Grid::new("simple_setup")
+            .num_columns(2)
+            .spacing([18.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("KPA500 COM port");
+                text_field(ui, "", &mut self.config.kpa500.com_port);
+                ui.end_row();
+
+                ui.label("KAT500 COM port");
+                text_field(ui, "", &mut self.config.kat500.com_port);
+                ui.end_row();
+
+                ui.label("Flex radio IP");
+                text_field(ui, "", &mut self.config.flex_injection.radio_ip);
+                ui.end_row();
+
+                ui.label("This PC / EGB LAN IP");
+                text_field(ui, "", &mut self.config.flex_injection.amplifier_ip);
+                ui.end_row();
+            });
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(
+                &mut self.config.operational.enable_real_controls,
+                false,
+                "Safe mode - monitor only",
+            );
+            if ui
+                .radio(
+                    self.config.operational.enable_real_controls
+                        && !self.config.operational.enable_kpa_operate,
+                    "Operational mode - Tune/Standby",
+                )
+                .clicked()
+            {
+                self.config.operational.enable_real_controls = true;
+                self.config.operational.enable_kat_tune = true;
+                self.config.operational.enable_kpa_standby = true;
+                self.config.operational.enable_kpa_operate = false;
+                self.config.operational.confirm_real_hardware_control = "I understand".to_string();
+            }
+            if ui
+                .radio(
+                    self.config.operational.enable_real_controls
+                        && self.config.operational.enable_kpa_operate,
+                    "RF-risk mode - Operate enabled",
+                )
+                .clicked()
+            {
+                self.config.operational.enable_real_controls = true;
+                self.config.operational.enable_kat_tune = true;
+                self.config.operational.enable_kpa_standby = true;
+                self.config.operational.enable_kpa_operate = true;
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.config.operational.enable_kat_tune,
+                "Enable KAT500 Tune",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kpa_standby,
+                "Enable KPA500 Standby",
+            );
+            ui.checkbox(
+                &mut self.config.operational.enable_kpa_operate,
+                "Enable KPA500 Operate",
+            );
+        });
+        if self.config.operational.enable_kpa_operate {
+            ui.colored_label(
+                egui::Color32::RED,
+                "Operate can put the amplifier on-air. Type I understand to allow RF-risk mode.",
+            );
+            text_field(
+                ui,
+                "RF-risk confirmation",
+                &mut self.config.operational.confirm_real_hardware_control,
+            );
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("Save Setup").clicked() {
+                self.apply_recommended_aethersdr_setup(false);
+                self.save_config();
+            }
+            if ui.button("Reset to Recommended AetherSDR Setup").clicked() {
+                self.apply_recommended_aethersdr_setup(true);
+                self.save_config();
+            }
+            if ui.button("Scan Serial Ports").clicked() {
+                self.scan_serial_ports();
+            }
+        });
+        if !self.serial_ports.is_empty() {
+            ui.label(format!(
+                "Available serial ports: {}",
+                self.serial_ports.join(", ")
+            ));
+        }
+
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading("Preflight");
+            let config_path = self
+                .config_path
+                .canonicalize()
+                .unwrap_or_else(|_| self.config_path.clone());
+            field(
+                ui,
+                "Command",
+                format!("egb.exe run --config {}", config_path.display()),
+            );
+            field(ui, "Config path", config_path.display().to_string());
+            match self.config.validate() {
+                Ok(()) => field(ui, "Validation", "OK"),
+                Err(err) => field(ui, "Validation", format!("ERROR: {err}")),
+            }
+            let preview = effective_policy_preview(&self.config);
+            field(
+                ui,
+                "Operational override",
+                bool_text(Some(preview.operational_override_active)),
+            );
+            field(ui, "KAT Tune", bool_text(Some(preview.kat_tune)));
+            field(ui, "KPA Standby", bool_text(Some(preview.kpa_standby)));
+            field(ui, "KPA Operate", bool_text(Some(preview.kpa_operate)));
+        });
+
+        ui.separator();
+        ui.collapsing("Advanced Diagnostics", |ui| {
+            ui.label(
+                "Lab and protocol settings are intentionally hidden from the normal workflow.",
+            );
+            if ui.button("Open /status").clicked() {
+                open_url(&format!(
+                    "http://{}:{}/status",
+                    self.config.metrics.bind_ip, self.config.metrics.port
+                ));
+            }
+            if ui.button("Open Logs Folder").clicked() {
+                open_path(Path::new("logs"));
+            }
+            ui.horizontal(|ui| {
+                ui.label("Config file");
+                let mut path = self.config_path.display().to_string();
+                if ui.text_edit_singleline(&mut path).changed() {
+                    self.config_path = PathBuf::from(path);
+                }
+                if ui.button("Load").clicked() {
+                    self.load_config();
+                }
+                if ui.button("Validate").clicked() {
+                    self.validate_config();
+                }
+            });
+        });
+    }
+
+    #[allow(dead_code)]
+    fn ui_setup(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Config file");
             let mut path = self.config_path.display().to_string();
@@ -2086,11 +2433,8 @@ impl GuiApp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Dashboard,
-    Config,
-    Operational,
-    Controls,
+    Setup,
     Diagnostics,
-    Logs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2124,6 +2468,7 @@ impl GuiSettings {
 }
 
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 struct ControlFlags {
     kpa_safe: bool,
     kpa_rf_risk: bool,
@@ -2135,6 +2480,7 @@ struct ControlFlags {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum LogFilter {
     All,
     Error,
@@ -2143,6 +2489,7 @@ enum LogFilter {
     Debug,
 }
 
+#[allow(dead_code)]
 impl LogFilter {
     fn label(self) -> &'static str {
         match self {
@@ -2298,6 +2645,8 @@ struct StatusSnapshot {
     controls: ControlStatus,
     #[serde(default)]
     effective_controls: EffectiveControlStatus,
+    #[serde(default)]
+    pgxl_lifecycle: PgxlLifecycleStatus,
     #[serde(default)]
     flex_diagnostics: FlexDiagnostics,
 }
@@ -2603,6 +2952,20 @@ struct EffectiveControlStatus {
     clear_fault_reason: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct PgxlLifecycleStatus {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    last_disconnect_reason: Option<String>,
+    #[serde(default)]
+    sessions_started: u64,
+    #[serde(default)]
+    active_clients: usize,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct MeterHandle {
     name: String,
@@ -2626,6 +2989,48 @@ fn stable_hash_hex(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+fn support_summary_text(status: &StatusSnapshot) -> String {
+    format!(
+        "Elecraft Genius Bridge Support Summary\n\n\
+        Bridge: {}\n\
+        KPA500: {} state={} temp={:?} voltage={:?}\n\
+        KAT500: {} swr={:?} antenna={:?} mode={:?}\n\
+        AetherSDR PGXL/TGXL clients: {}/{}\n\
+        Flex API: {} reason={}\n\
+        Controls: kat_tune={} kpa_standby={} kpa_operate={}\n\
+        PGXL lifecycle: {} - {}\n\
+        Config path: {}\n\
+        Config hash match: {:?}\n",
+        status
+            .bridge
+            .process_id
+            .map_or("stopped".to_string(), |_| "running".to_string()),
+        status.amp.connection_state,
+        status.amp.state.as_deref().unwrap_or("unknown"),
+        status.amp.temperature_c,
+        status.amp.pa_voltage_volts,
+        status.tuner.connection_state,
+        status.tuner.swr,
+        status.tuner.selected_antenna,
+        status.tuner.mode,
+        status.clients.pgxl_client_count,
+        status.clients.tgxl_client_count,
+        status.flex_injection.connection_state,
+        status
+            .flex_injection
+            .degraded_reason
+            .as_deref()
+            .unwrap_or("none"),
+        status.effective_controls.effective_kat_tune_enabled,
+        status.effective_controls.effective_kpa_standby_enabled,
+        status.effective_controls.effective_kpa_operate_enabled,
+        status.pgxl_lifecycle.state,
+        status.pgxl_lifecycle.reason,
+        status.bridge.config_path.as_deref().unwrap_or("unknown"),
+        status.bridge.config_hash_match,
+    )
 }
 
 fn export_diagnostics_bundle(
@@ -2706,6 +3111,12 @@ fn export_diagnostics_bundle(
             options,
             "status.json",
             serde_json::to_string_pretty(status)?,
+        )?;
+        zip_text(
+            &mut zip,
+            options,
+            "summary.txt",
+            support_summary_text(status),
         )?;
     }
     zip_text(&mut zip, options, "windows-info.txt", windows_info())?;
@@ -2807,6 +3218,17 @@ fn run_command_text(program: &str, args: &[&str]) -> String {
         .unwrap_or_else(|err| format!("failed to run {program}: {err}"))
 }
 
+fn stop_stale_bridge_processes() {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/IM", "egb.exe", "/F", "/T"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 fn fetch_status(host: &str, port: u16) -> Result<StatusSnapshot> {
     let addr = (host, port)
         .to_socket_addrs()
@@ -2886,6 +3308,7 @@ fn find_egb_binary() -> Result<PathBuf> {
     Ok(PathBuf::from("egb.exe"))
 }
 
+#[allow(dead_code)]
 fn export_visible_logs(logs: &VecDeque<String>, filter: LogFilter) -> Result<PathBuf> {
     fs::create_dir_all("logs")?;
     let path = PathBuf::from("logs").join(format!("egb-visible-logs-{}.txt", timestamp_filename()));
@@ -2993,6 +3416,15 @@ fn connection_color(state: &str) -> egui::Color32 {
     }
 }
 
+fn pgxl_lifecycle_color_key(state: &str) -> &str {
+    match state {
+        "stable" | "pgxl_tcp_connected" => "connected",
+        "degraded" => "degraded",
+        "not_advertised" => "disconnected",
+        _ => "connecting",
+    }
+}
+
 fn effective_process_state(state: ProcessState, status: Option<&StatusSnapshot>) -> ProcessState {
     if state != ProcessState::Running {
         return state;
@@ -3024,6 +3456,7 @@ fn text_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     });
 }
 
+#[allow(dead_code)]
 fn serial_port_field(ui: &mut egui::Ui, label: &str, value: &mut String, ports: &[String]) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -3041,10 +3474,12 @@ fn serial_port_field(ui: &mut egui::Ui, label: &str, value: &mut String, ports: 
     });
 }
 
+#[allow(dead_code)]
 fn checkbox(ui: &mut egui::Ui, label: &str, value: &mut bool) -> egui::Response {
     ui.checkbox(value, label)
 }
 
+#[allow(dead_code)]
 fn port_field(ui: &mut egui::Ui, label: &str, value: &mut u16) {
     let mut text = value.to_string();
     ui.horizontal(|ui| {
@@ -3057,6 +3492,7 @@ fn port_field(ui: &mut egui::Ui, label: &str, value: &mut u16) {
     });
 }
 
+#[allow(dead_code)]
 fn u32_field(ui: &mut egui::Ui, label: &str, value: &mut u32) {
     let mut text = value.to_string();
     ui.horizontal(|ui| {
@@ -3069,6 +3505,7 @@ fn u32_field(ui: &mut egui::Ui, label: &str, value: &mut u32) {
     });
 }
 
+#[allow(dead_code)]
 fn u64_field(ui: &mut egui::Ui, label: &str, value: &mut u64) {
     let mut text = value.to_string();
     ui.horizontal(|ui| {

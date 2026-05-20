@@ -672,7 +672,9 @@ async fn start_bridge(cfg: &BridgeConfig, config_path: Option<&Path>) -> Result<
                 cfg.flex_injection.tuner_refresh_interval_ms,
             ),
             amplifier_reannounce_interval: Duration::from_millis(
-                cfg.flex_injection.amplifier_reannounce_interval_ms,
+                cfg.flex_injection
+                    .amplifier_reannounce_interval_ms
+                    .max(30_000),
             ),
         };
         let state = state.clone();
@@ -2343,7 +2345,9 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         tuner_presence_refresh: cfg.tgxl.experimental_presence_refresh,
         tuner_refresh_interval: Duration::from_millis(cfg.flex_injection.tuner_refresh_interval_ms),
         amplifier_reannounce_interval: Duration::from_millis(
-            cfg.flex_injection.amplifier_reannounce_interval_ms,
+            cfg.flex_injection
+                .amplifier_reannounce_interval_ms
+                .max(30_000),
         ),
     }
 }
@@ -3483,6 +3487,7 @@ async fn status_json(state: &SharedState) -> String {
         "flex_injection": guard.flex_injection,
         "controls": guard.controls,
         "effective_controls": guard.effective_controls,
+        "pgxl_lifecycle": pgxl_lifecycle_json(&guard),
         "flex_diagnostics": {
             "ping_count": guard.flex_injection.ping_count,
             "ping_ack_count": guard.flex_injection.ping_ack_count,
@@ -3516,6 +3521,64 @@ fn tuner_mode_label(tuner: &bridge_core::TunerState) -> &'static str {
     } else {
         "manual"
     }
+}
+
+fn pgxl_lifecycle_json(guard: &bridge_core::state::BridgeState) -> serde_json::Value {
+    let (state, reason) = if !guard.flex_injection.enabled {
+        ("not_advertised", "Flex amplifier injection is disabled")
+    } else if guard.flex_injection.amplifier_handle.is_none() {
+        if guard.flex_injection.amplifier_create_accepted {
+            (
+                "flex_accepted",
+                "Flex accepted amplifier create; waiting for amplifier handle/status",
+            )
+        } else if guard.flex_injection.amplifier_create_sent {
+            (
+                "advertised_to_flex",
+                "Amplifier create sent; waiting for Flex response",
+            )
+        } else {
+            ("not_advertised", "Waiting to advertise amplifier to Flex")
+        }
+    } else if guard.clients.pgxl_client_count > 0 && guard.clients.pgxl_session_started_count > 0 {
+        if guard.protocol.pgxl.parse_failures == 0 && guard.protocol.pgxl.unknown_commands == 0 {
+            ("stable", "PGXL TCP connected with no protocol errors")
+        } else {
+            (
+                "degraded",
+                "PGXL TCP connected but protocol counters show errors",
+            )
+        }
+    } else if guard.clients.pgxl_session_started_count > 0 {
+        (
+            "pgxl_tcp_connected",
+            guard
+                .clients
+                .pgxl_last_disconnect_reason
+                .as_deref()
+                .unwrap_or("PGXL TCP session has started but no client is currently active"),
+        )
+    } else if guard
+        .flex_injection
+        .amplifier_pgxl_tcp_attempted_after_status
+    {
+        (
+            "aethersdr_applet_visible",
+            "AetherSDR attempted PGXL TCP after amplifier status",
+        )
+    } else {
+        (
+            "flex_accepted",
+            "Amplifier handle exists; waiting for AetherSDR PGXL TCP connection",
+        )
+    };
+    serde_json::json!({
+        "state": state,
+        "reason": reason,
+        "last_disconnect_reason": guard.clients.pgxl_last_disconnect_reason,
+        "sessions_started": guard.clients.pgxl_session_started_count,
+        "active_clients": guard.clients.pgxl_client_count,
+    })
 }
 
 async fn print_soak_summary(state: &SharedState, elapsed: Duration) {
