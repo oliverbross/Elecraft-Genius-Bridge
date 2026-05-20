@@ -966,6 +966,10 @@ impl EvidenceRun {
             "state-mismatch-events.jsonl",
             "profile-summary.md",
             "last-known-good-comparison.md",
+            "pgxl-status-mapping.md",
+            "flex-state-mapping.md",
+            "latest-kpa-telemetry.json",
+            "latest-pgxl-advertised-status.json",
         ] {
             File::create(dir.join(file))?;
         }
@@ -1050,6 +1054,20 @@ impl EvidenceRun {
         tokio::fs::write(self.dir.join("profile-summary.md"), profile_summary).await?;
         let comparison = last_known_good_comparison_markdown(state).await;
         tokio::fs::write(self.dir.join("last-known-good-comparison.md"), comparison).await?;
+        let pgxl_mapping = pgxl_status_mapping_markdown(state).await;
+        tokio::fs::write(self.dir.join("pgxl-status-mapping.md"), pgxl_mapping).await?;
+        let flex_mapping = flex_state_mapping_markdown(state).await;
+        tokio::fs::write(self.dir.join("flex-state-mapping.md"), flex_mapping).await?;
+        tokio::fs::write(
+            self.dir.join("latest-kpa-telemetry.json"),
+            serde_json::to_string_pretty(&latest_kpa_telemetry_json(state).await)?,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("latest-pgxl-advertised-status.json"),
+            serde_json::to_string_pretty(&latest_pgxl_advertised_status_json(state).await)?,
+        )
+        .await?;
         zip_dir(&self.dir, &self.zip_path)?;
         println!("evidence bundle: {}", self.zip_path.display());
         Ok(self.zip_path.clone())
@@ -1482,6 +1500,150 @@ async fn last_known_good_comparison_markdown(state: &SharedState) -> String {
     )
 }
 
+async fn pgxl_status_mapping_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let pgxl_state = advertised_amp_state_for_status(&guard.amp);
+    format!(
+        "# PGXL Status Mapping\n\n\
+        - KPA500 operate flag: {}\n\
+        - KPA500 state: `{}`\n\
+        - KPA500 fault: `{}`\n\
+        - PGXL advertised state: `{pgxl_state}`\n\
+        - Forward power watts: {:.1}\n\
+        - SWR ratio: {:.2}\n\
+        - Temperature C: {:.1}\n\
+        - PA voltage V: {:.1}\n\
+        - PA current A: {:.1}\n\
+        - PGXL VAC: `{}` (0 means unknown/not mapped from KPA500 supply voltage)\n\
+        - MEFFA: `{}`\n",
+        guard.amp.operate,
+        guard.amp.state.pgxl_state(),
+        guard.amp.fault.as_deref().unwrap_or("none"),
+        guard.amp.forward_power_watts,
+        guard.amp.swr,
+        guard.amp.temperature_c,
+        guard.amp.pa_voltage_volts,
+        guard.amp.pa_current_amps,
+        pgxl_vac_value_for_status(&guard.amp),
+        pgxl_meffa_for_status(&guard.amp),
+    )
+}
+
+async fn flex_state_mapping_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Flex State Mapping\n\n\
+        - Live KPA500 state: `{}`\n\
+        - Last advertised Flex amp state: `{}`\n\
+        - Last advertised PGXL state: `{}`\n\
+        - Active amplifier profile: `{}`\n\
+        - Last amplifier line: `{}`\n\
+        - State mismatch: `{}`\n",
+        advertised_amp_state_for_status(&guard.amp),
+        guard
+            .flex_injection
+            .last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .state_advertisement_mismatch
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn latest_kpa_telemetry_json(state: &SharedState) -> serde_json::Value {
+    let guard = state.read().await;
+    serde_json::json!({
+        "connection_state": guard.amp.connection_state.as_str(),
+        "operate": guard.amp.operate,
+        "state": guard.amp.state.pgxl_state(),
+        "fault": guard.amp.fault,
+        "meffa": guard.amp.meffa,
+        "forward_power_watts": guard.amp.forward_power_watts,
+        "swr": guard.amp.swr,
+        "temperature_c": guard.amp.temperature_c,
+        "pa_voltage_volts": guard.amp.pa_voltage_volts,
+        "pa_current_amps": guard.amp.pa_current_amps,
+        "firmware_version": guard.amp.firmware_version,
+        "serial_number": guard.amp.serial_number,
+        "last_successful_poll_ms": system_time_ms(guard.amp.last_successful_poll_at),
+    })
+}
+
+async fn latest_pgxl_advertised_status_json(state: &SharedState) -> serde_json::Value {
+    let guard = state.read().await;
+    serde_json::json!({
+        "state": advertised_amp_state_for_status(&guard.amp),
+        "peakfwd_dbm": watts_to_dbm_for_status(guard.amp.forward_power_watts),
+        "return_loss_db": return_loss_for_status(guard.amp.swr),
+        "temp": guard.amp.temperature_c,
+        "id": guard.amp.pa_current_amps,
+        "vac": pgxl_vac_value_for_status(&guard.amp),
+        "meffa": pgxl_meffa_for_status(&guard.amp),
+        "fault": guard.amp.fault,
+        "last_advertised_pgxl_state": guard.flex_injection.last_advertised_pgxl_state,
+        "last_advertised_flex_amp_state": guard.flex_injection.last_advertised_flex_amp_state,
+    })
+}
+
+fn advertised_amp_state_for_status(amp: &bridge_core::state::AmpState) -> &'static str {
+    if amp.fault.is_some() || amp.state == AmpOperatingState::Fault {
+        "FAULT"
+    } else {
+        amp.state.pgxl_state()
+    }
+}
+
+fn pgxl_meffa_for_status(amp: &bridge_core::state::AmpState) -> &str {
+    if amp.fault.is_none() && (amp.meffa == "UNKNOWN" || amp.meffa.trim().is_empty()) {
+        "OK"
+    } else {
+        amp.meffa.as_str()
+    }
+}
+
+fn pgxl_vac_value_for_status(amp: &bridge_core::state::AmpState) -> u16 {
+    if amp.pa_voltage_volts >= 100.0 {
+        amp.pa_voltage_volts.round().clamp(0.0, f32::from(u16::MAX)) as u16
+    } else {
+        0
+    }
+}
+
+fn watts_to_dbm_for_status(watts: f32) -> f32 {
+    if watts <= 0.0 {
+        -120.0
+    } else {
+        10.0 * (watts * 1000.0).log10()
+    }
+}
+
+fn return_loss_for_status(swr: f32) -> f32 {
+    if swr.is_finite() && swr > 1.0 {
+        let rho = ((swr - 1.0) / (swr + 1.0)).clamp(0.001, 0.999);
+        20.0 * rho.log10()
+    } else {
+        -30.0
+    }
+}
+
 fn zip_dir(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -1676,11 +1838,8 @@ async fn state_advertisement_watchdog(state: SharedState) {
 }
 
 fn state_advertisement_mismatch_reason(guard: &bridge_core::state::BridgeState) -> Option<String> {
-    let real_amp = if guard.amp.is_connected() {
-        guard.amp.state.pgxl_state()
-    } else {
-        "FAULT"
-    };
+    let real_amp = advertised_amp_state_for_status(&guard.amp);
+    let fault = guard.amp.fault.as_deref().unwrap_or("none");
     if let Some(advertised) = guard
         .flex_injection
         .last_advertised_flex_amp_state
@@ -1688,7 +1847,12 @@ fn state_advertisement_mismatch_reason(guard: &bridge_core::state::BridgeState) 
     {
         if advertised != real_amp {
             return Some(format!(
-                "Flex amp advertised state mismatch: real_serial_state={real_amp} advertised_flex_state={advertised} profile={}",
+                "Flex amp advertised state mismatch: live_kpa_state={real_amp} pgxl_advertised_state={} flex_advertised_state={advertised} kpa_fault={fault} profile={} reason=flex_status_not_following_live_kpa",
+                guard
+                    .flex_injection
+                    .last_advertised_pgxl_state
+                    .as_deref()
+                    .unwrap_or("unknown"),
                 guard
                     .flex_injection
                     .active_amplifier_status_profile
@@ -1700,7 +1864,12 @@ fn state_advertisement_mismatch_reason(guard: &bridge_core::state::BridgeState) 
     if let Some(advertised) = guard.flex_injection.last_advertised_pgxl_state.as_deref() {
         if advertised != real_amp {
             return Some(format!(
-                "PGXL advertised state mismatch: real_serial_state={real_amp} advertised_pgxl_state={advertised} profile={}",
+                "PGXL advertised state mismatch: live_kpa_state={real_amp} pgxl_advertised_state={advertised} flex_advertised_state={} kpa_fault={fault} profile={} reason=pgxl_status_not_following_live_kpa",
+                guard
+                    .flex_injection
+                    .last_advertised_flex_amp_state
+                    .as_deref()
+                    .unwrap_or("unknown"),
                 guard
                     .flex_injection
                     .active_amplifier_status_profile
@@ -2944,8 +3113,9 @@ mod tests {
             Some("aethersdr_force_direct".to_string());
         state.flex_injection.last_advertised_flex_amp_state = Some("STANDBY".to_string());
         let reason = state_advertisement_mismatch_reason(&state).unwrap();
-        assert!(reason.contains("real_serial_state=OPERATE"));
-        assert!(reason.contains("advertised_flex_state=STANDBY"));
+        assert!(reason.contains("live_kpa_state=OPERATE"));
+        assert!(reason.contains("flex_advertised_state=STANDBY"));
+        assert!(reason.contains("kpa_fault=none"));
 
         state.flex_injection.last_advertised_flex_amp_state = Some("OPERATE".to_string());
         assert!(state_advertisement_mismatch_reason(&state).is_none());

@@ -886,11 +886,7 @@ async fn synthetic_amplifier_status_line(
         let guard = state.read().await;
         guard.amp.clone()
     };
-    let state_value = if amp.is_connected() {
-        amp.state.pgxl_state()
-    } else {
-        "FAULT"
-    };
+    let state_value = advertised_amp_state(&amp);
     let fault = amp.fault.as_deref().unwrap_or("");
     let mut candidate_fields = vec![
         "model".to_string(),
@@ -948,6 +944,14 @@ async fn synthetic_amplifier_status_line(
     }
     record_amplifier_pairing_status(state, line.clone(), candidate_fields).await;
     line
+}
+
+fn advertised_amp_state(amp: &bridge_core::AmpState) -> &'static str {
+    if amp.fault.is_some() || amp.state == bridge_core::AmpOperatingState::Fault {
+        "FAULT"
+    } else {
+        amp.state.pgxl_state()
+    }
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -1253,6 +1257,42 @@ mod tests {
         }
         let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
         assert!(line.contains("state=STANDBY"));
+    }
+
+    #[tokio::test]
+    async fn amplifier_status_does_not_report_fault_without_kpa_fault() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.connection_state = bridge_core::ConnectionState::Degraded;
+            guard.amp.connected = false;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+            guard.amp.fault = None;
+        }
+        let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
+        assert!(line.contains("state=OPERATE"));
+        assert!(!line.contains("state=FAULT"));
     }
 
     #[test]

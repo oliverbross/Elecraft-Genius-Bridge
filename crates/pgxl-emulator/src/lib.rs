@@ -457,12 +457,13 @@ fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> 
         .fault
         .as_deref()
         .unwrap_or(if degraded { "device_degraded" } else { "" });
+    let meffa = pgxl_meffa_value(amp);
     let native = format!(
         "state={state} peakfwd={peakfwd:.4} swr={swr:.4} temp={:.1} id={:.1} vac={} meffa={}",
         amp.temperature_c,
         amp.pa_current_amps,
         pgxl_vac_value(amp),
-        amp.meffa
+        meffa
     );
     if aethersdr_compat {
         native
@@ -475,13 +476,20 @@ fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> 
 }
 
 fn advertised_state_from_amp(amp: &bridge_core::AmpState) -> &'static str {
-    if matches!(
-        amp.connection_state,
-        ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
-    ) {
+    if amp.fault.is_some() || amp.state == bridge_core::AmpOperatingState::Fault {
         "FAULT"
     } else {
         amp.state.pgxl_state()
+    }
+}
+
+fn pgxl_meffa_value(amp: &bridge_core::AmpState) -> &str {
+    if amp.fault.is_some() || amp.state == bridge_core::AmpOperatingState::Fault {
+        amp.meffa.as_str()
+    } else if amp.meffa == "UNKNOWN" || amp.meffa.trim().is_empty() {
+        "OK"
+    } else {
+        amp.meffa.as_str()
     }
 }
 
@@ -899,6 +907,50 @@ mod tests {
             guard.flex_injection.last_advertised_pgxl_state.as_deref(),
             Some("OPERATE")
         );
+    }
+
+    #[tokio::test]
+    async fn pgxl_status_does_not_report_fault_for_no_kpa_fault() {
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.connection_state = ConnectionState::Degraded;
+            guard.amp.connected = false;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+            guard.amp.fault = None;
+            guard.amp.meffa = "UNKNOWN".to_string();
+        }
+        let body = status_body(&state, true).await;
+        assert!(body.contains("state=OPERATE"));
+        assert!(body.contains("meffa=OK"));
+        assert!(!body.contains("state=FAULT"));
+    }
+
+    #[tokio::test]
+    async fn pgxl_status_maps_kpa_telemetry_fields() {
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.connection_state = ConnectionState::Connected;
+            guard.amp.connected = true;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+            guard.amp.forward_power_watts = 30.0;
+            guard.amp.swr = 1.1;
+            guard.amp.temperature_c = 35.0;
+            guard.amp.pa_voltage_volts = 68.7;
+            guard.amp.pa_current_amps = 0.0;
+            guard.amp.fault = None;
+            guard.amp.meffa = "OK".to_string();
+        }
+        let body = status_body(&state, true).await;
+        assert!(body.contains("state=OPERATE"));
+        assert!(body.contains("temp=35.0"));
+        assert!(body.contains("id=0.0"));
+        assert!(body.contains("vac=0"));
+        assert!(body.contains("meffa=OK"));
+        assert!(body.contains("peakfwd=44.7712"));
     }
 
     #[test]

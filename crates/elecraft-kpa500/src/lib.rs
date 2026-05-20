@@ -908,6 +908,7 @@ fn parse_fault(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
     match raw.parse::<u16>() {
         Ok(0) => {
             amp.fault = None;
+            amp.meffa = "OK".to_string();
             if amp.operate {
                 amp.state = AmpOperatingState::Operate;
             } else {
@@ -1249,6 +1250,26 @@ mod tests {
         assert_eq!(amp.pa_voltage_volts, 68.9);
         assert_eq!(amp.pa_current_amps, 0.0);
         assert_eq!(amp.fault, None);
+    }
+
+    #[test]
+    fn parser_maps_no_fault_without_forcing_fault_state() {
+        let mut amp = bridge_core::AmpState::default();
+        parse_kpa500_response("^OS1;", &mut amp);
+        parse_kpa500_response("^TM035;", &mut amp);
+        parse_kpa500_response("^VI687 000;", &mut amp);
+        parse_kpa500_response("^FL00;", &mut amp);
+        assert!(amp.operate);
+        assert_eq!(amp.state, AmpOperatingState::Operate);
+        assert_eq!(amp.fault, None);
+        assert_eq!(amp.meffa, "OK");
+        assert_eq!(amp.temperature_c, 35.0);
+        assert_eq!(amp.pa_voltage_volts, 68.7);
+        assert_eq!(amp.pa_current_amps, 0.0);
+
+        parse_kpa500_response("^OS0;", &mut amp);
+        parse_kpa500_response("^FL00;", &mut amp);
+        assert_eq!(amp.state, AmpOperatingState::Standby);
     }
 
     #[test]
