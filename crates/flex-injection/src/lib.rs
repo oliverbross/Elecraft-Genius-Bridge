@@ -3,6 +3,8 @@ use bridge_core::{
     append_evidence_json, append_evidence_line, ConnectionState, FlexMeterHandle, SharedState,
 };
 use std::collections::HashMap;
+use std::fs::{create_dir_all, OpenOptions};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -153,6 +155,12 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 if let Some(status) = parse_amplifier_status(&line) {
                     observe_tuner_presence(&state, &status).await;
                     if session.observe_amplifier_status(settings, &status) {
+                        record_amplifier_pairing_status(
+                            &state,
+                            status.raw.clone(),
+                            status.kvs.iter().map(|(key, _)| key.clone()).collect(),
+                        )
+                        .await;
                         set_amplifier_handle(&state, &status.handle).await;
                         handle_amplifier_status(
                             settings,
@@ -204,6 +212,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         session.amplifier_handle.as_deref(),
                     )
                     .await;
+                    append_flex_log_line("amplifier-status-lines.log", &line);
                     append_evidence_line("amplifier-reannounce.log", line.clone());
                     append_evidence_line("amplifier-status-lines.log", line);
                     {
@@ -212,6 +221,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                             guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
                         guard.flex_injection.amplifier_direct_connect_expected =
                             Some(!settings.amplifier_ip.is_loopback());
+                        guard.flex_injection.last_amplifier_reannounce_reason =
+                            Some("periodic_sub_amplifier_all".to_string());
+                        guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
+                            guard.clients.pgxl_session_started_count > 0;
                     }
                     info!(
                         event_id = "amplifier_presence_refreshed",
@@ -292,6 +305,16 @@ async fn send_tracked_command(
     }
     let seq = *next_seq;
     send_command(writer, seq, &pending.command).await?;
+    if pending.kind == PendingKind::AmplifierCreate {
+        append_flex_log_line(
+            "amplifier-status-lines.log",
+            &format!("TX C{seq}|{}", pending.command),
+        );
+        append_evidence_line(
+            "amplifier-status-lines.log",
+            format!("TX C{seq}|{}", pending.command),
+        );
+    }
     info!(
         seq,
         label = %pending.label,
@@ -457,6 +480,7 @@ impl FlexSession {
                     "Flex amplifier object handle observed"
                 );
             }
+            append_flex_log_line("amplifier-status-lines.log", &status.raw);
             true
         } else {
             false
@@ -468,6 +492,19 @@ async fn set_amplifier_handle(state: &SharedState, handle: &str) {
     let mut guard = state.write().await;
     guard.flex_injection.amplifier_handle = Some(handle.to_string());
     guard.flex_injection.amplifier_last_seen_at = Some(SystemTime::now());
+}
+
+async fn record_amplifier_pairing_status(
+    state: &SharedState,
+    line: String,
+    candidate_fields: Vec<String>,
+) {
+    let mut guard = state.write().await;
+    guard.flex_injection.last_amplifier_status_line = Some(line);
+    guard.flex_injection.amplifier_pairing_candidate_fields = candidate_fields;
+    guard
+        .flex_injection
+        .amplifier_pgxl_tcp_attempted_after_status = guard.clients.pgxl_session_started_count > 0;
 }
 
 async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
@@ -676,7 +713,7 @@ impl PendingCommand {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingKind {
     AmplifierCreate,
     MeterCreate { name: &'static str },
@@ -796,6 +833,18 @@ fn trace_flex_tx(line: &str) {
     append_evidence_line("flex-tx.log", line);
 }
 
+fn append_flex_log_line(file_name: &str, line: &str) {
+    let dir = std::path::Path::new("logs").join("flex");
+    let _ = create_dir_all(&dir);
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(file_name))
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 pub fn amplifier_create_command(
     amplifier_ip: IpAddr,
     amplifier_port: u16,
@@ -817,6 +866,7 @@ pub fn amplifier_create_command(
         "aethersdr_force_direct" => {
             command.push_str(" state=STANDBY connected=1 configured=1 enabled=1 direct=1 lan=1");
         }
+        "strict_real_pgxl" => {}
         _ => {}
     }
     command
@@ -838,25 +888,61 @@ async fn synthetic_amplifier_status_line(
         "FAULT"
     };
     let fault = amp.fault.as_deref().unwrap_or("");
-    let mut line = format!(
-        "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state={} temp={:.1} id={:.1} fault={}",
-        sanitize_token(&settings.amplifier_model),
-        settings.amplifier_ip,
-        settings.amplifier_port,
-        sanitize_token(&settings.serial),
-        sanitize_token(&settings.ant_map),
-        state_value,
-        amp.temperature_c,
-        amp.pa_current_amps,
-        sanitize_token(fault)
-    );
+    let mut candidate_fields = vec![
+        "model".to_string(),
+        "ip".to_string(),
+        "port".to_string(),
+        "serial_num".to_string(),
+        "ant".to_string(),
+        "state".to_string(),
+    ];
+    let mut line = if settings.amplifier_status_profile == "strict_real_pgxl" {
+        format!(
+            "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state={}",
+            sanitize_token(&settings.amplifier_model),
+            settings.amplifier_ip,
+            settings.amplifier_port,
+            sanitize_token(&settings.serial),
+            sanitize_token(&settings.ant_map),
+            state_value
+        )
+    } else {
+        candidate_fields.extend(["temp".to_string(), "id".to_string(), "fault".to_string()]);
+        format!(
+            "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state={} temp={:.1} id={:.1} fault={}",
+            sanitize_token(&settings.amplifier_model),
+            settings.amplifier_ip,
+            settings.amplifier_port,
+            sanitize_token(&settings.serial),
+            sanitize_token(&settings.ant_map),
+            state_value,
+            amp.temperature_c,
+            amp.pa_current_amps,
+            sanitize_token(fault)
+        )
+    };
     match settings.amplifier_status_profile.as_str() {
-        "pgxl_verbose" => line.push_str(" connected=1 configured=1 enabled=1"),
+        "pgxl_verbose" => {
+            candidate_fields.extend([
+                "connected".to_string(),
+                "configured".to_string(),
+                "enabled".to_string(),
+            ]);
+            line.push_str(" connected=1 configured=1 enabled=1");
+        }
         "aethersdr_force_direct" => {
+            candidate_fields.extend([
+                "connected".to_string(),
+                "configured".to_string(),
+                "enabled".to_string(),
+                "direct".to_string(),
+                "lan".to_string(),
+            ]);
             line.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1")
         }
         _ => {}
     }
+    record_amplifier_pairing_status(state, line.clone(), candidate_fields).await;
     line
 }
 
@@ -1071,6 +1157,50 @@ mod tests {
                 .last_tuner_disappearance_reason
                 .as_deref(),
             Some("connected=0")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_real_pgxl_status_uses_conservative_fields() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "2-50/18-0005".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "strict_real_pgxl".to_string(),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_mock_state();
+        let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
+        assert_eq!(
+            line,
+            "amplifier 0x42000001 model=PowerGeniusXL ip=192.168.1.50 port=9008 serial_num=2-50/18-0005 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY"
+        );
+        assert!(!line.contains("connected="));
+        assert!(!line.contains("direct="));
+        let guard = state.read().await;
+        assert_eq!(
+            guard.flex_injection.amplifier_pairing_candidate_fields,
+            vec![
+                "model".to_string(),
+                "ip".to_string(),
+                "port".to_string(),
+                "serial_num".to_string(),
+                "ant".to_string(),
+                "state".to_string(),
+            ]
         );
     }
 

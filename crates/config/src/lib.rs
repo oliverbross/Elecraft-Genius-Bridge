@@ -337,6 +337,7 @@ pub struct FlexInjectionConfig {
     pub radio_ip: String,
     pub radio_port: u16,
     pub amplifier_ip: String,
+    pub force_advertised_pgxl_ip: Option<String>,
     pub amplifier_port: u16,
     pub amplifier_model: String,
     pub serial: String,
@@ -360,8 +361,17 @@ impl FlexInjectionConfig {
         }
         let radio_ip = parse_ip("flex_injection.radio_ip", &self.radio_ip)?;
         let amplifier_ip = parse_ip("flex_injection.amplifier_ip", &self.amplifier_ip)?;
+        let advertised_ip = match &self.force_advertised_pgxl_ip {
+            Some(value) if !value.trim().is_empty() => {
+                Some(parse_ip("flex_injection.force_advertised_pgxl_ip", value)?)
+            }
+            _ => None,
+        };
         validate_lan_or_loopback("flex_injection.radio_ip", radio_ip)?;
         validate_lan_or_loopback("flex_injection.amplifier_ip", amplifier_ip)?;
+        if let Some(ip) = advertised_ip {
+            validate_lan_or_loopback("flex_injection.force_advertised_pgxl_ip", ip)?;
+        }
         validate_port("flex_injection.radio_port", self.radio_port)?;
         validate_port("flex_injection.amplifier_port", self.amplifier_port)?;
         validate_nonempty_token("flex_injection.amplifier_model", &self.amplifier_model)?;
@@ -399,9 +409,13 @@ impl FlexInjectionConfig {
 
     fn validate_status_profile(&self) -> Result<(), ConfigError> {
         match self.amplifier_status_profile.as_str() {
-            "minimal" | "pgxl_paired" | "pgxl_verbose" | "aethersdr_force_direct" => Ok(()),
+            "minimal"
+            | "pgxl_paired"
+            | "pgxl_verbose"
+            | "aethersdr_force_direct"
+            | "strict_real_pgxl" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, aethersdr_force_direct; got {other}"
+                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, aethersdr_force_direct, strict_real_pgxl; got {other}"
             ))),
         }
     }
@@ -414,6 +428,7 @@ impl Default for FlexInjectionConfig {
             radio_ip: "127.0.0.1".to_string(),
             radio_port: 4992,
             amplifier_ip: "127.0.0.1".to_string(),
+            force_advertised_pgxl_ip: None,
             amplifier_port: 9008,
             amplifier_model: "PowerGeniusXL".to_string(),
             serial: "EGB-KPA500".to_string(),
@@ -534,7 +549,22 @@ pgxl:
 
         cfg.flex_injection.radio_ip = "192.168.1.100".to_string();
         cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
+        cfg.flex_injection.force_advertised_pgxl_ip = Some("192.168.1.51".to_string());
         cfg.validate().unwrap();
+
+        cfg.flex_injection.force_advertised_pgxl_ip = Some("8.8.8.8".to_string());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validates_strict_real_pgxl_status_profile() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.amplifier_status_profile = "strict_real_pgxl".to_string();
+        cfg.validate().unwrap();
+
+        cfg.flex_injection.amplifier_status_profile = "invented".to_string();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

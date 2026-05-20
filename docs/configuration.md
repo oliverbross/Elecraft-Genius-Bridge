@@ -116,6 +116,7 @@ flex_injection:
   radio_ip: 127.0.0.1
   radio_port: 4992
   amplifier_ip: 127.0.0.1
+  force_advertised_pgxl_ip:
   amplifier_port: 9008
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
@@ -136,11 +137,13 @@ Phase 19 `flex_injection` is a LAN/local-only registration client. It connects t
 
 `amplifier_ip` must be the Windows bridge IP that macOS AetherSDR can reach. AetherSDR should use that IP for its direct PGXL connection on `amplifier_port`.
 
+`force_advertised_pgxl_ip` overrides only the PGXL IP advertised to the radio/client. Leave it empty to advertise `amplifier_ip`. Use it for loopback-vs-LAN pairing tests, for example comparing `127.0.0.1`, the Windows LAN IP, and a VPN/Tailscale IP.
+
 The configured `handle` is an EGB log/config label. The real Flex amplifier object handle is assigned by the radio and observed by AetherSDR through normal radio status.
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
 
-`amplifier_status_profile` controls PGXL trigger experiments. `minimal` and `pgxl_paired` stay conservative. `pgxl_verbose` and `aethersdr_force_direct` add unverified status-like fields to the amplifier create command and should be used only during isolated trigger lab runs.
+`amplifier_status_profile` controls PGXL trigger experiments. `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative. `strict_real_pgxl` keeps amplifier status candidates to the documented PGXL fields: `model`, `ip`, `port`, `serial_num`, `ant`, and `state`. `pgxl_verbose` and `aethersdr_force_direct` add unverified status-like fields to the amplifier create command and should be used only during isolated pairing lab runs.
 
 `amplifier_reannounce_interval_ms` controls the rate-limited amplifier refresh query and evidence logging. It does not create duplicate amplifier objects.
 

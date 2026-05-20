@@ -122,6 +122,14 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    PgxlPairingLab {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value = "strict_real_pgxl")]
+        profile: String,
+        #[arg(long)]
+        duration_minutes: f64,
+    },
     SerialProbeBatch {
         #[arg(long)]
         port: String,
@@ -296,11 +304,17 @@ async fn main() -> Result<()> {
             config,
             profile,
             duration_minutes,
+        }
+        | Commands::PgxlPairingLab {
+            config,
+            profile,
+            duration_minutes,
         } => {
             let mut cfg = BridgeConfig::load(&config)?;
             cfg.flex_injection.amplifier_status_profile = profile;
+            cfg.validate()?;
             init_logging(&cfg.logging.level);
-            run_pgxl_trigger_lab(cfg, config, duration_minutes).await
+            run_pgxl_pairing_lab(cfg, config, duration_minutes).await
         }
         Commands::SerialProbe {
             port,
@@ -498,14 +512,19 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             .radio_ip
             .parse()
             .context("flex_injection.radio_ip passed validation but failed to parse")?;
-        let amplifier_ip: IpAddr = cfg
+        let advertised_amplifier_ip: IpAddr = cfg
             .flex_injection
-            .amplifier_ip
+            .force_advertised_pgxl_ip
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&cfg.flex_injection.amplifier_ip)
             .parse()
-            .context("flex_injection.amplifier_ip passed validation but failed to parse")?;
+            .context(
+                "flex_injection force advertised PGXL IP passed validation but failed to parse",
+            )?;
         let settings = FlexInjectionSettings {
             radio_addr: SocketAddr::new(radio_ip, cfg.flex_injection.radio_port),
-            amplifier_ip,
+            amplifier_ip: advertised_amplifier_ip,
             amplifier_port: cfg.flex_injection.amplifier_port,
             amplifier_model: cfg.flex_injection.amplifier_model.clone(),
             serial: cfg.flex_injection.serial.clone(),
@@ -693,7 +712,7 @@ async fn run_evidence_test(
     Ok(())
 }
 
-async fn run_pgxl_trigger_lab(
+async fn run_pgxl_pairing_lab(
     cfg: BridgeConfig,
     config_path: PathBuf,
     duration_minutes: f64,
@@ -701,7 +720,7 @@ async fn run_pgxl_trigger_lab(
     if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
-    let evidence = EvidenceRun::start("pgxl-trigger-lab", &config_path, &cfg, std::env::args())?;
+    let evidence = EvidenceRun::start("pgxl-pairing-lab", &config_path, &cfg, std::env::args())?;
     let state = start_bridge(&cfg).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
@@ -711,10 +730,17 @@ async fn run_pgxl_trigger_lab(
     sampler.abort();
     let guard = state.read().await;
     let analysis = format!(
-        "# PGXL Trigger Lab\n\nProfile: `{}`\n\nPGXL sessions started: {}\nPGXL active clients: {}\nNo-socket warnings: {}\nLast no-socket warning: {}\nAmplifier handle: {:?}\nAmplifier reannounce count: {}\nDirect connect expected: {:?}\n",
+        "# PGXL Pairing Lab\n\nProfile: `{}`\n\nAdvertised IP: `{}`\n\nPGXL sessions started: {}\nPGXL active clients: {}\nTCP 9008 attempted after amplifier status: {}\nNo-socket warnings: {}\nLast no-socket warning: {}\nAmplifier handle: {:?}\nLast amplifier status line: `{}`\nCandidate fields: {:?}\nAmplifier reannounce count: {}\nLast reannounce reason: {}\nDirect connect expected: {:?}\n",
         cfg.flex_injection.amplifier_status_profile,
+        cfg.flex_injection
+            .force_advertised_pgxl_ip
+            .as_deref()
+            .unwrap_or(&cfg.flex_injection.amplifier_ip),
         guard.clients.pgxl_session_started_count,
         guard.clients.pgxl_client_count,
+        guard
+            .flex_injection
+            .amplifier_pgxl_tcp_attempted_after_status,
         guard.clients.pgxl_manual_connect_no_socket_attempt_count,
         guard
             .clients
@@ -722,11 +748,26 @@ async fn run_pgxl_trigger_lab(
             .as_deref()
             .unwrap_or("none"),
         guard.flex_injection.amplifier_handle,
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.amplifier_pairing_candidate_fields,
         guard.flex_injection.amplifier_reannounce_count,
+        guard
+            .flex_injection
+            .last_amplifier_reannounce_reason
+            .as_deref()
+            .unwrap_or("none"),
         guard.flex_injection.amplifier_direct_connect_expected,
     );
     drop(guard);
     tokio::fs::write(evidence.dir().join("pgxl-trigger-analysis.md"), analysis).await?;
+    let pairing = tokio::fs::read_to_string(evidence.dir().join("pgxl-trigger-analysis.md"))
+        .await
+        .unwrap_or_default();
+    tokio::fs::write(evidence.dir().join("pgxl-pairing-analysis.md"), pairing).await?;
     evidence.write_status("status-end.json", &state).await?;
     let zip = evidence.finish(&state, Some(started.elapsed())).await?;
     println!(
@@ -882,6 +923,7 @@ impl EvidenceRun {
             "amplifier-reannounce.log",
             "pgxl-direct-selftest.log",
             "pgxl-trigger-analysis.md",
+            "pgxl-pairing-analysis.md",
             "kpa500-serial.log",
             "kat500-serial.log",
             "client-sessions.jsonl",
@@ -1084,6 +1126,21 @@ async fn evidence_summary_markdown(state: &SharedState, elapsed: Option<Duration
         "- Amplifier reannounce/direct-expected: {}/{:?}\n",
         guard.flex_injection.amplifier_reannounce_count,
         guard.flex_injection.amplifier_direct_connect_expected
+    ));
+    body.push_str(&format!(
+        "- Last amplifier status line: `{}`\n",
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none")
+    ));
+    body.push_str(&format!(
+        "- Pairing candidate fields: {:?}\n- PGXL TCP attempted after status: {}\n",
+        guard.flex_injection.amplifier_pairing_candidate_fields,
+        guard
+            .flex_injection
+            .amplifier_pgxl_tcp_attempted_after_status
     ));
     body.push_str(&format!(
         "- Last PGXL/TGXL disconnect: {}/{}\n",
@@ -2609,6 +2666,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"stability-test".to_string()));
         assert!(names.contains(&"evidence-test".to_string()));
+        assert!(names.contains(&"pgxl-pairing-lab".to_string()));
     }
 
     #[test]

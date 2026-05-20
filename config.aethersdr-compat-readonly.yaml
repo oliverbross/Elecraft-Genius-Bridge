@@ -61,6 +61,7 @@ flex_injection:
   radio_ip: 127.0.0.1
   radio_port: 4992
   amplifier_ip: 127.0.0.1
+  force_advertised_pgxl_ip:
   amplifier_port: 9008
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
