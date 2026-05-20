@@ -75,6 +75,12 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    ComparePgxlProfiles {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 60.0)]
+        duration_seconds: f64,
+    },
     CheckConfig {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -240,6 +246,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("aethersdr-smoke-test", cfg, config, duration_minutes).await
+        }
+        Commands::ComparePgxlProfiles {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            compare_pgxl_profiles(cfg, config, duration_seconds).await
         }
         Commands::CheckConfig { config } => {
             let cfg = BridgeConfig::load(&config)?;
@@ -551,6 +565,7 @@ async fn start_bridge(cfg: &BridgeConfig) -> Result<SharedState> {
             handle_label: cfg.flex_injection.handle.clone(),
             ant_map: cfg.flex_injection.ant_map.clone(),
             amplifier_status_profile: cfg.flex_injection.amplifier_status_profile.clone(),
+            trace_amplifier_advertisements: cfg.flex_injection.trace_amplifier_advertisements,
             full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
             create_meters: cfg.flex_injection.create_meters,
             create_interlock: cfg.flex_injection.create_interlock,
@@ -804,6 +819,38 @@ async fn run_pgxl_pairing_lab(
     Ok(())
 }
 
+async fn compare_pgxl_profiles(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    let evidence = EvidenceRun::start(
+        "compare-pgxl-profiles",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    let report = pgxl_profile_comparison_markdown(&cfg, &state).await;
+    tokio::fs::write(evidence.dir().join("pgxl-regression-diff.md"), report).await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "PGXL profile comparison complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn test_pgxl_direct(host: &str, port: u16) -> Result<()> {
     let log_path = PathBuf::from("logs")
         .join("tests")
@@ -970,6 +1017,9 @@ impl EvidenceRun {
             "flex-state-mapping.md",
             "latest-kpa-telemetry.json",
             "latest-pgxl-advertised-status.json",
+            "pgxl-regression-diff.md",
+            "amplifier-advertisements.jsonl",
+            "pgxl-connect-attempt-timeline.md",
         ] {
             File::create(dir.join(file))?;
         }
@@ -1066,6 +1116,16 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("latest-pgxl-advertised-status.json"),
             serde_json::to_string_pretty(&latest_pgxl_advertised_status_json(state).await)?,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("pgxl-regression-diff.md"),
+            pgxl_regression_diff_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("pgxl-connect-attempt-timeline.md"),
+            pgxl_connect_attempt_timeline_markdown(state).await,
         )
         .await?;
         zip_dir(&self.dir, &self.zip_path)?;
@@ -1498,6 +1558,123 @@ async fn last_known_good_comparison_markdown(state: &SharedState) -> String {
         guard.flex_injection.state_advertisement_mismatch.is_none(),
         recommendation,
     )
+}
+
+async fn pgxl_regression_diff_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let live_state = advertised_amp_state_for_status(&guard.amp);
+    format!(
+        "# PGXL Regression Diff\n\n\
+        ## Working-era trigger candidate\n\n\
+        Phase 27-era `aethersdr_force_direct` and `pgxl_verbose` create commands carried direct-connect status fields on the amplifier create line, including `state`, `connected`, `configured`, and `enabled`.\n\n\
+        ## Broken-era candidate\n\n\
+        Phase 29 removed the create-time `state` field to avoid hard-coded standby. AetherSDR can see the AMP applet from Flex status but may not attempt TCP 9008 when create-time pairing fields are incomplete.\n\n\
+        ## Current correction\n\n\
+        Create-time `state` is restored for direct-connect profiles, but it is now generated from live shared KPA500 state instead of hard-coded `STANDBY`.\n\n\
+        - Active profile: `{}`\n\
+        - Live KPA state: `{live_state}`\n\
+        - Last Flex advertised state: `{}`\n\
+        - Last PGXL advertised state: `{}`\n\
+        - PGXL sessions started: {}\n\
+        - PGXL direct attempted after status: {}\n\
+        - Last amplifier line: `{}`\n",
+        guard
+            .flex_injection
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard.clients.pgxl_session_started_count,
+        guard
+            .flex_injection
+            .amplifier_pgxl_tcp_attempted_after_status,
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn pgxl_connect_attempt_timeline_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# PGXL Connect Attempt Timeline\n\n\
+        - PGXL sessions started: {}\n\
+        - Active PGXL clients: {}\n\
+        - Manual no-socket warnings: {}\n\
+        - Last no-socket warning: `{}`\n\
+        - Amplifier reannounce count: {}\n\
+        - Last reannounce reason: `{}`\n\
+        - Amplifier direct expected: {:?}\n",
+        guard.clients.pgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard.clients.pgxl_manual_connect_no_socket_attempt_count,
+        guard
+            .clients
+            .pgxl_last_no_socket_attempt_warning
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.amplifier_reannounce_count,
+        guard
+            .flex_injection
+            .last_amplifier_reannounce_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.amplifier_direct_connect_expected,
+    )
+}
+
+async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    let live_state = advertised_amp_state_for_status(&guard.amp);
+    let advertised_ip = cfg
+        .flex_injection
+        .force_advertised_pgxl_ip
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&cfg.flex_injection.amplifier_ip)
+        .parse()
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+    let mut body = String::from("# PGXL Profile Comparison\n\n");
+    body.push_str(&format!(
+        "Observed during this run: PGXL sessions started={} active_clients={} direct_attempted_after_status={}\n\n",
+        guard.clients.pgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard
+            .flex_injection
+            .amplifier_pgxl_tcp_attempted_after_status
+    ));
+    body.push_str("| Profile | Create command with live state |\n| --- | --- |\n");
+    for profile in [
+        "strict_real_pgxl",
+        "aethersdr_force_direct",
+        "old_good_pgxl",
+        "pgxl_verbose",
+        "pgxl_paired",
+    ] {
+        let command = flex_injection::amplifier_create_command_with_state(
+            advertised_ip,
+            cfg.flex_injection.amplifier_port,
+            &cfg.flex_injection.amplifier_model,
+            &cfg.flex_injection.serial,
+            &cfg.flex_injection.ant_map,
+            profile,
+            Some(live_state),
+        );
+        body.push_str(&format!("| `{profile}` | `{command}` |\n"));
+    }
+    body.push_str("\n`aethersdr_force_direct` is the recommended AetherSDR trigger profile. `strict_real_pgxl` is intentionally conservative and may not trigger TCP 9008.\n");
+    body
 }
 
 async fn pgxl_status_mapping_markdown(state: &SharedState) -> String {

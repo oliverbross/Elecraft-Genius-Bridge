@@ -145,6 +145,8 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 `amplifier_status_profile` controls PGXL trigger experiments. `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative. `strict_real_pgxl` keeps amplifier status candidates to the documented PGXL fields: `model`, `ip`, `port`, `serial_num`, `ant`, and live `state`. `pgxl_verbose`, `old_good_pgxl`, and `aethersdr_force_direct` add status-like direct-connect fields and are the preferred profiles for AetherSDR regression checks. No profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
 
+Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
+
 `amplifier_reannounce_interval_ms` controls the rate-limited amplifier refresh query and evidence logging. It does not create duplicate amplifier objects.
 
 This mode does not implement live radio-side meter value streaming, proxying, TLS, or WAN exposure. Operate remains RF-risk gated by `kpa500.allow_rf_risk`.

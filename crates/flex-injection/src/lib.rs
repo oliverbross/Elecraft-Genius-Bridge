@@ -22,6 +22,7 @@ pub struct FlexInjectionSettings {
     pub handle_label: String,
     pub ant_map: String,
     pub amplifier_status_profile: String,
+    pub trace_amplifier_advertisements: bool,
     pub full_pgxl_registration: bool,
     pub create_meters: bool,
     pub create_interlock: bool,
@@ -43,6 +44,18 @@ impl FlexInjectionSettings {
             &self.serial,
             &self.ant_map,
             &self.amplifier_status_profile,
+        )
+    }
+
+    pub fn amplifier_create_command_with_state(&self, state_value: &str) -> String {
+        amplifier_create_command_with_state(
+            self.amplifier_ip,
+            self.amplifier_port,
+            &self.amplifier_model,
+            &self.serial,
+            &self.ant_map,
+            &self.amplifier_status_profile,
+            Some(state_value),
         )
     }
 }
@@ -109,7 +122,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         guard.flex_injection.last_response = None;
     }
 
-    let registration = registration_commands(settings);
+    let mut registration: Option<Vec<PendingCommand>> = None;
     let mut registration_sent = false;
     let mut next_seq = 1_u32;
     let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
@@ -133,7 +146,19 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 trace_flex_rx(&line);
 
                 if session.has_handle && !registration_sent {
-                    for item in &registration {
+                    let items = registration
+                        .get_or_insert(registration_commands_with_state(settings, &state).await);
+                    for item in items.iter() {
+                        if item.label == "amplifier_create" {
+                            trace_amplifier_advertisement(
+                                settings,
+                                &state,
+                                "amplifier_create",
+                                "registration",
+                                &item.command,
+                            )
+                            .await;
+                        }
                         send_tracked_command(
                             &mut writer,
                             &mut session,
@@ -210,6 +235,14 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         settings,
                         &state,
                         session.amplifier_handle.as_deref(),
+                    )
+                    .await;
+                    trace_amplifier_advertisement(
+                        settings,
+                        &state,
+                        "amplifier_status",
+                        "periodic_reannounce",
+                        &line,
                     )
                     .await;
                     append_flex_log_line("amplifier-status-lines.log", &line);
@@ -499,12 +532,8 @@ async fn record_amplifier_pairing_status(
     line: String,
     candidate_fields: Vec<String>,
 ) {
-    let advertised_state = extract_key_value(&line, "state").map(str::to_string);
     let mut guard = state.write().await;
     guard.flex_injection.last_amplifier_status_line = Some(line);
-    if let Some(advertised_state) = advertised_state {
-        guard.flex_injection.last_advertised_flex_amp_state = Some(advertised_state);
-    }
     guard.flex_injection.amplifier_pairing_candidate_fields = candidate_fields;
     guard
         .flex_injection
@@ -849,6 +878,43 @@ fn append_flex_log_line(file_name: &str, line: &str) {
     }
 }
 
+async fn trace_amplifier_advertisement(
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+    kind: &str,
+    reason: &str,
+    line: &str,
+) {
+    let (source_kpa_state, source_kpa_fault, advertised_state) = {
+        let guard = state.read().await;
+        (
+            guard.amp.state.pgxl_state().to_string(),
+            guard.amp.fault.clone(),
+            advertised_amp_state(&guard.amp).to_string(),
+        )
+    };
+    let record = serde_json::json!({
+        "timestamp_ms": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "kind": kind,
+        "reason": reason,
+        "profile": settings.amplifier_status_profile,
+        "source_kpa_state": source_kpa_state,
+        "source_kpa_fault": source_kpa_fault,
+        "advertised_state": advertised_state,
+        "line": line,
+    });
+    if let Ok(json) = serde_json::to_string(&record) {
+        if settings.trace_amplifier_advertisements {
+            append_flex_log_line("amplifier-advertisements.jsonl", &json);
+        }
+        append_evidence_line("amplifier-advertisements.jsonl", json);
+    }
+    if matches!(kind, "amplifier_create" | "amplifier_status") {
+        let mut guard = state.write().await;
+        guard.flex_injection.last_advertised_flex_amp_state = Some(advertised_state);
+    }
+}
+
 pub fn amplifier_create_command(
     amplifier_ip: IpAddr,
     amplifier_port: u16,
@@ -856,6 +922,26 @@ pub fn amplifier_create_command(
     serial: &str,
     ant_map: &str,
     profile: &str,
+) -> String {
+    amplifier_create_command_with_state(
+        amplifier_ip,
+        amplifier_port,
+        model,
+        serial,
+        ant_map,
+        profile,
+        None,
+    )
+}
+
+pub fn amplifier_create_command_with_state(
+    amplifier_ip: IpAddr,
+    amplifier_port: u16,
+    model: &str,
+    serial: &str,
+    ant_map: &str,
+    profile: &str,
+    state_value: Option<&str>,
 ) -> String {
     let mut command = format!(
         "amplifier create ip={amplifier_ip} port={amplifier_port} model={} serial_num={} ant={}",
@@ -865,9 +951,15 @@ pub fn amplifier_create_command(
     );
     match profile {
         "pgxl_verbose" | "old_good_pgxl" => {
+            if let Some(state_value) = state_value {
+                command.push_str(&format!(" state={}", sanitize_token(state_value)));
+            }
             command.push_str(" connected=1 configured=1 enabled=1");
         }
         "aethersdr_force_direct" => {
+            if let Some(state_value) = state_value {
+                command.push_str(&format!(" state={}", sanitize_token(state_value)));
+            }
             command.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1");
         }
         "strict_real_pgxl" => {}
@@ -965,11 +1057,31 @@ pub fn registration_command_lines(settings: &FlexInjectionSettings) -> Vec<Strin
         .collect()
 }
 
+async fn registration_commands_with_state(
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+) -> Vec<PendingCommand> {
+    let state_value = {
+        let guard = state.read().await;
+        advertised_amp_state(&guard.amp).to_string()
+    };
+    registration_commands_inner(settings, Some(&state_value))
+}
+
 fn registration_commands(settings: &FlexInjectionSettings) -> Vec<PendingCommand> {
+    registration_commands_inner(settings, None)
+}
+
+fn registration_commands_inner(
+    settings: &FlexInjectionSettings,
+    state_value: Option<&str>,
+) -> Vec<PendingCommand> {
     let mut commands = Vec::new();
     commands.push(PendingCommand::new(
         "amplifier_create",
-        settings.amplifier_create_command(),
+        state_value
+            .map(|value| settings.amplifier_create_command_with_state(value))
+            .unwrap_or_else(|| settings.amplifier_create_command()),
         PendingKind::AmplifierCreate,
     ));
     if settings.full_pgxl_registration && settings.create_meters {
@@ -1046,12 +1158,6 @@ fn sanitize_token(value: &str) -> String {
         .chars()
         .filter(|ch| !ch.is_whitespace() && *ch != '|')
         .collect()
-}
-
-fn extract_key_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let prefix = format!("{key}=");
-    line.split_whitespace()
-        .find_map(|part| part.strip_prefix(&prefix))
 }
 
 pub fn parse_response(line: &str) -> Option<(u32, String, String)> {
@@ -1185,6 +1291,7 @@ mod tests {
             handle_label: "amp_1".to_string(),
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "strict_real_pgxl".to_string(),
+            trace_amplifier_advertisements: false,
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1229,6 +1336,7 @@ mod tests {
             handle_label: "amp_1".to_string(),
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            trace_amplifier_advertisements: false,
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1270,6 +1378,7 @@ mod tests {
             handle_label: "amp_1".to_string(),
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            trace_amplifier_advertisements: false,
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
@@ -1313,6 +1422,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn registration_create_uses_live_state_for_direct_profile() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            trace_amplifier_advertisements: false,
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.connection_state = bridge_core::ConnectionState::Connected;
+            guard.amp.connected = true;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+        }
+        let commands = registration_commands_with_state(&settings, &state).await;
+        assert!(commands[0].command.contains("state=OPERATE"));
+        assert!(commands[0].command.contains("direct=1"));
+    }
+
     #[test]
     fn full_pgxl_registration_sequence_matches_reference_order() {
         let settings = FlexInjectionSettings {
@@ -1324,6 +1469,7 @@ mod tests {
             handle_label: "amp_1".to_string(),
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
             amplifier_status_profile: "pgxl_paired".to_string(),
+            trace_amplifier_advertisements: false,
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,

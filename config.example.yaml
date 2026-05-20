@@ -77,6 +77,7 @@ flex_injection:
   create_meters: true
   create_interlock: true
   amplifier_status_profile: pgxl_paired
+  trace_amplifier_advertisements: false
   amplifier_reannounce_interval_ms: 5000
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000

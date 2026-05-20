@@ -834,6 +834,15 @@ impl GuiApp {
                 );
                 field(
                     ui,
+                    "PGXL direct attempted",
+                    bool_text(Some(
+                        status
+                            .flex_injection
+                            .amplifier_pgxl_tcp_attempted_after_status,
+                    )),
+                );
+                field(
+                    ui,
                     "PGXL no socket",
                     format!(
                         "{} {}",
@@ -845,6 +854,16 @@ impl GuiApp {
                             .unwrap_or("")
                     ),
                 );
+                field(
+                    ui,
+                    "Last amplifier ad",
+                    status
+                        .flex_injection
+                        .last_amplifier_status_line
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(ui, "State lag", format_ms_age(status.amp.stale_duration_ms));
                 field(
                     ui,
                     "Button command seen",
@@ -1164,6 +1183,7 @@ impl GuiApp {
             checkbox(ui, "Full PGXL registration", &mut self.config.flex_injection.full_pgxl_registration);
             checkbox(ui, "Create AMP meters", &mut self.config.flex_injection.create_meters);
             checkbox(ui, "Create AMP interlock", &mut self.config.flex_injection.create_interlock);
+            checkbox(ui, "Trace amplifier advertisements", &mut self.config.flex_injection.trace_amplifier_advertisements);
             u64_field(
                 ui,
                 "Amplifier reannounce interval ms",
@@ -1931,6 +1951,10 @@ struct FlexStatus {
     tuner_disappeared_count: u64,
     #[serde(default)]
     last_tuner_disappearance_reason: Option<String>,
+    #[serde(default)]
+    amplifier_pgxl_tcp_attempted_after_status: bool,
+    #[serde(default)]
+    last_amplifier_status_line: Option<String>,
     #[serde(default)]
     last_advertised_flex_amp_state: Option<String>,
     #[serde(default)]
