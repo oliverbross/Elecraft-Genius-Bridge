@@ -1564,6 +1564,16 @@ impl GuiApp {
                     );
                     field(
                         ui,
+                        "API compliance",
+                        format!(
+                            "TGXL {}% / PGXL {}% / partial-or-unsupported {}",
+                            status.protocol_audit.tgxl_compliance_percent,
+                            status.protocol_audit.pgxl_compliance_percent,
+                            status.protocol_audit.unsupported_or_partial_count
+                        ),
+                    );
+                    field(
+                        ui,
                         "SmartSDR PGXL",
                         if status.flex_injection.amplifier_handle.is_some() {
                             "supported / seen"
@@ -3336,6 +3346,18 @@ struct StatusSnapshot {
     lifecycle: LifecycleDiagnosticsStatus,
     #[serde(default)]
     flex_diagnostics: FlexDiagnostics,
+    #[serde(default)]
+    protocol_audit: ProtocolAuditStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct ProtocolAuditStatus {
+    #[serde(default)]
+    tgxl_compliance_percent: u32,
+    #[serde(default)]
+    pgxl_compliance_percent: u32,
+    #[serde(default)]
+    unsupported_or_partial_count: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

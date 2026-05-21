@@ -353,6 +353,13 @@ async fn handle_command(
     control_profile: &str,
 ) -> CommandOutcome {
     match command {
+        _ if command.starts_with("auth ") => CommandOutcome::ok(response_line(seq, 0, "auth OK")),
+        "btl" => CommandOutcome {
+            response: response_line(seq, 5, "error=bootloader_unsupported_by_bridge"),
+            pushes: Vec::new(),
+            unknown: false,
+            unsupported: true,
+        },
         "info" => CommandOutcome::ok(response_line(seq, 0, info_body(aethersdr_compat))),
         "status" => {
             CommandOutcome::ok(status_line(seq, state, aethersdr_compat, control_profile).await)
@@ -360,7 +367,9 @@ async fn handle_command(
         "ifconf read" | "network" | "network read" => {
             CommandOutcome::ok(response_line(seq, 0, network_body()))
         }
+        _ if command.starts_with("ifconf set ") => CommandOutcome::ok(response_line(seq, 0, "0")),
         "setup read" => CommandOutcome::ok(response_line(seq, 0, setup_body())),
+        _ if command.starts_with("setup set ") => CommandOutcome::ok(response_line(seq, 0, "")),
         "catradio read" => CommandOutcome::with_pushes(
             response_line(seq, 0, catradio_body(1)),
             vec![response_line(seq, 0, catradio_body(2))],
@@ -386,6 +395,7 @@ async fn handle_command(
             record_flexradio_set(command, state).await;
             CommandOutcome::ok(response_line(seq, 0, ""))
         }
+        "save" => CommandOutcome::ok(response_line(seq, 0, "")),
         _ if command.starts_with("operate set=") => {
             let requested = command_bool(command, "set");
             if let Some(operate) = requested {
@@ -520,6 +530,41 @@ async fn handle_command(
             } else {
                 CommandOutcome {
                     response: response_line(seq, 2, "error=invalid_antenna"),
+                    pushes: Vec::new(),
+                    unknown: false,
+                    unsupported: true,
+                }
+            }
+        }
+        _ if command.starts_with("activate ch=") => {
+            let ch = command
+                .trim_start_matches("activate ch=")
+                .parse::<u8>()
+                .ok()
+                .filter(|n| (1..=2).contains(n));
+            if let Some(ch) = ch {
+                let mut guard = state.write().await;
+                guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.control_requested_count =
+                    guard.controls.control_requested_count.saturating_add(1);
+                guard.controls.last_tgxl_control_command = Some(command.to_string());
+                guard.controls.last_mapped_elecraft_action =
+                    Some(format!("TGXL active channel set to {ch}"));
+                guard.controls.last_safety_decision =
+                    Some("tgxl_active_channel_requested".to_string());
+                append_evidence_json(
+                    "control-events.jsonl",
+                    &serde_json::json!({
+                        "protocol": "TGXL",
+                        "raw": command,
+                        "mapped_action": format!("TGXL active channel set to {ch}"),
+                        "safety_decision": "tgxl_active_channel_requested",
+                    }),
+                );
+                CommandOutcome::ok(response_line(seq, 0, ""))
+            } else {
+                CommandOutcome {
+                    response: response_line(seq, 2, "error=invalid_channel"),
                     pushes: Vec::new(),
                     unknown: false,
                     unsupported: true,
@@ -690,8 +735,15 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
 
     let relay = relay.ok_or("missing_relay")?;
     let movement = movement.ok_or("missing_move")?;
-    if relay > 2 {
-        return Err("invalid_relay");
+    let internal_relay = match relay {
+        // Compatibility with older AetherSDR traces that used zero-based relay ids.
+        0 => 0,
+        // Official TGXL API: 1=C1, 2=L, 3=C2.
+        1..=3 => relay - 1,
+        _ => return Err("invalid_relay"),
+    };
+    if !matches!(movement, -1 | 1) {
+        return Err("invalid_move");
     }
 
     let mut guard = state.write().await;
@@ -701,22 +753,25 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
     guard.controls.last_tgxl_control_command = Some(command.to_string());
     guard.controls.last_mapped_elecraft_action = Some(format!(
         "KAT500 manual relay={} move={} (unverified)",
-        relay, movement
+        internal_relay, movement
     ));
     guard.controls.last_safety_decision = Some("desired_manual_tune_requested".to_string());
-    guard.desired.tuner_manual_tune = Some(ManualTuneRequest { relay, movement });
+    guard.desired.tuner_manual_tune = Some(ManualTuneRequest {
+        relay: internal_relay,
+        movement,
+    });
     append_evidence_json(
         "control-events.jsonl",
         &serde_json::json!({
             "protocol": "TGXL",
             "raw": command,
-            "mapped_action": format!("KAT500 manual relay={relay} move={movement}"),
+            "mapped_action": format!("KAT500 manual relay={internal_relay} move={movement}"),
             "safety_decision": "desired_manual_tune_requested",
         }),
     );
     append_evidence_line(
         "tgxl-control-commands.log",
-        format!("RX {command} -> KAT500 manual relay={relay} move={movement} desired_manual_tune_requested"),
+        format!("RX {command} -> KAT500 manual relay={internal_relay} move={movement} desired_manual_tune_requested"),
     );
     Ok(())
 }
@@ -1317,6 +1372,51 @@ mod tests {
         assert_eq!(
             line,
             "R7|0|flexradio ch=1 active=1 serial=4315-5050-6700-6206 antenna=ANT2 source=LAN\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn official_safe_tgxl_commands_have_stable_responses() {
+        let state = shared_mock_state();
+        assert_eq!(
+            replay_line("C1|auth test", &state).await.unwrap(),
+            vec!["R1|0|auth OK\n"]
+        );
+        assert_eq!(
+            replay_line("C2|ifconf set ip=192.168.1.10", &state)
+                .await
+                .unwrap(),
+            vec!["R2|0|0\n"]
+        );
+        assert_eq!(
+            replay_line("C3|setup set nickname=Tuner_Genius_XL", &state)
+                .await
+                .unwrap(),
+            vec!["R3|0|\n"]
+        );
+        assert_eq!(
+            replay_line("C4|save", &state).await.unwrap(),
+            vec!["R4|0|\n"]
+        );
+        assert_eq!(
+            replay_line("C5|btl", &state).await.unwrap(),
+            vec!["R5|5|error=bootloader_unsupported_by_bridge\n"]
+        );
+    }
+
+    #[tokio::test]
+    async fn official_one_based_relay_ids_are_accepted() {
+        let state = shared_mock_state();
+        replay_line("C6|tune relay=3 move=-1", &state)
+            .await
+            .unwrap();
+        let guard = state.read().await;
+        assert_eq!(
+            guard.desired.tuner_manual_tune,
+            Some(ManualTuneRequest {
+                relay: 2,
+                movement: -1,
+            })
         );
     }
 }

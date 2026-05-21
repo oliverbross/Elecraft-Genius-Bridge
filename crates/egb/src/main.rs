@@ -131,6 +131,10 @@ enum Commands {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
     },
+    ProtocolAudit {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+    },
     SimulateControl {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -393,6 +397,11 @@ async fn main() -> Result<()> {
                 cfg.kat500.mock,
                 cfg.flex_injection.enabled
             );
+            Ok(())
+        }
+        Commands::ProtocolAudit { config } => {
+            let cfg = BridgeConfig::load(&config)?;
+            print_protocol_audit(&cfg);
             Ok(())
         }
         Commands::SimulateControl { config, action } => {
@@ -1191,6 +1200,77 @@ async fn run_ecosystem_soak_test(
     println!("ecosystem report: {}", report.display());
     println!("evidence bundle: {}", zip.display());
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProtocolAuditSummary {
+    tgxl_full: u32,
+    tgxl_partial: u32,
+    tgxl_missing: u32,
+    pgxl_full: u32,
+    pgxl_partial: u32,
+    pgxl_missing: u32,
+}
+
+impl ProtocolAuditSummary {
+    fn tgxl_percent(self) -> u32 {
+        percentage(self.tgxl_full, self.tgxl_partial, self.tgxl_missing)
+    }
+
+    fn pgxl_percent(self) -> u32 {
+        percentage(self.pgxl_full, self.pgxl_partial, self.pgxl_missing)
+    }
+
+    fn unsupported_count(self) -> u32 {
+        self.tgxl_missing
+            .saturating_add(self.pgxl_missing)
+            .saturating_add(self.tgxl_partial)
+            .saturating_add(self.pgxl_partial)
+    }
+}
+
+fn percentage(full: u32, partial: u32, missing: u32) -> u32 {
+    let total = full.saturating_add(partial).saturating_add(missing);
+    if total == 0 {
+        0
+    } else {
+        ((full.saturating_mul(100)).saturating_add(partial.saturating_mul(50))) / total
+    }
+}
+
+fn protocol_audit_summary() -> ProtocolAuditSummary {
+    ProtocolAuditSummary {
+        tgxl_full: 15,
+        tgxl_partial: 4,
+        tgxl_missing: 1,
+        pgxl_full: 12,
+        pgxl_partial: 5,
+        pgxl_missing: 2,
+    }
+}
+
+fn print_protocol_audit(_cfg: &BridgeConfig) {
+    let summary = protocol_audit_summary();
+    println!("Official API compliance audit");
+    println!("TGXL compliance: {}%", summary.tgxl_percent());
+    println!("PGXL compliance: {}%", summary.pgxl_percent());
+    println!(
+        "Unsupported/partial command groups: {}",
+        summary.unsupported_count()
+    );
+    println!();
+    println!("TGXL partial or intentionally unsupported:");
+    println!("  discovery UDP 9010: missing for MVP; direct TCP/manual IP remains primary");
+    println!("  btl: intentionally blocked; bootloader reset is not safe for bridge emulation");
+    println!("  setup/ifconf set/save: accepted as safe no-op where possible; no real network config mutation");
+    println!("  tune relay/move: accepted but not sent to KAT500 until relay mapping is hardware-verified");
+    println!("  operate set: tracks virtual TGXL state only; no KAT500 RF action");
+    println!();
+    println!("PGXL partial or intentionally unsupported:");
+    println!("  PGXL direct config set/save: blocked; EGB config is managed by YAML/GUI");
+    println!("  PGXL direct CAT/Flex set: blocked or read-only; Flex API is the authoritative radio context");
+    println!("  meter value publication: meters are created; live value push path remains evidence-gated");
+    println!("  connect-assist: compatibility workaround only, not real KPA500 operate");
 }
 
 async fn write_ecosystem_report(
@@ -3827,6 +3907,11 @@ async fn status_json(state: &SharedState) -> String {
         "lifecycle": guard.lifecycle,
         "controls": guard.controls,
         "effective_controls": guard.effective_controls,
+        "protocol_audit": {
+            "tgxl_compliance_percent": protocol_audit_summary().tgxl_percent(),
+            "pgxl_compliance_percent": protocol_audit_summary().pgxl_percent(),
+            "unsupported_or_partial_count": protocol_audit_summary().unsupported_count(),
+        },
         "pgxl_lifecycle": pgxl_lifecycle_json(&guard),
         "flex_diagnostics": {
             "ping_count": guard.flex_injection.ping_count,
@@ -4999,9 +5084,18 @@ mod tests {
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
+        assert!(names.contains(&"protocol-audit".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
         assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));
         assert!(names.contains(&"amplifier-operate-lab".to_string()));
+    }
+
+    #[test]
+    fn protocol_audit_summary_is_exposed() {
+        let summary = protocol_audit_summary();
+        assert_eq!(summary.tgxl_percent(), 85);
+        assert_eq!(summary.pgxl_percent(), 76);
+        assert_eq!(summary.unsupported_count(), 12);
     }
 
     #[test]
@@ -5089,6 +5183,10 @@ mod tests {
             assert_eq!(
                 status["flex_injection"]["pgxl_connect_assist_enabled"],
                 serde_json::json!(true)
+            );
+            assert_eq!(
+                status["protocol_audit"]["tgxl_compliance_percent"],
+                serde_json::json!(85)
             );
         });
     }

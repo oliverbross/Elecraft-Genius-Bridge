@@ -330,6 +330,48 @@ async fn handle_command(
             0,
             status_body(state, aethersdr_compat).await,
         )),
+        "setup read" | "setup" => CommandOutcome::ok(response_line(seq, 0, setup_body())),
+        "ifconf read" | "network" | "network read" => {
+            CommandOutcome::ok(response_line(seq, 0, ifconf_body()))
+        }
+        _ if command.starts_with("ifconf ") && command != "ifconf read" => CommandOutcome {
+            response: response_line(seq, 5, "error=network_config_unsupported_by_bridge"),
+            unknown: false,
+            unsupported: true,
+        },
+        _ if command.starts_with("catradio read=") => {
+            let slice = command
+                .strip_prefix("catradio read=")
+                .unwrap_or("A")
+                .chars()
+                .next()
+                .unwrap_or('A');
+            CommandOutcome::ok(response_line(seq, 0, catradio_body(slice)))
+        }
+        _ if command.starts_with("catradio ") => CommandOutcome {
+            response: response_line(seq, 5, "error=catradio_config_unsupported_by_bridge"),
+            unknown: false,
+            unsupported: true,
+        },
+        _ if command.starts_with("flexradio read=") => {
+            let slice = command
+                .strip_prefix("flexradio read=")
+                .unwrap_or("A")
+                .chars()
+                .next()
+                .unwrap_or('A');
+            CommandOutcome::ok(response_line(seq, 0, flexradio_body(slice, state).await))
+        }
+        _ if command.starts_with("flexradio ") => CommandOutcome {
+            response: response_line(seq, 5, "error=flexradio_config_unsupported_by_bridge"),
+            unknown: false,
+            unsupported: true,
+        },
+        "save" => CommandOutcome {
+            response: response_line(seq, 5, "error=save_reboot_unsupported_by_bridge"),
+            unknown: false,
+            unsupported: true,
+        },
         // AetherSDR currently routes PGXL operate/standby through the Flex radio
         // amplifier API, not direct TCP. These direct commands are accepted only
         // as desired-state requests for manual harness testing.
@@ -441,6 +483,38 @@ fn info_body(aethersdr_compat: bool) -> String {
         format!(
             "model=PowerGeniusXL serial_num=EGB-PGXL version={VERSION} firmware={VERSION} capabilities=direct_tcp,status"
         )
+    }
+}
+
+fn setup_body() -> &'static str {
+    "nickname=Elecraft_Genius_Bridge fan=auto meffa=OK led=128"
+}
+
+fn ifconf_body() -> &'static str {
+    "address=0.0.0.0 netmask=255.255.255.0 gateway=0.0.0.0 dhcp=true gateway-status=0.0.0.0"
+}
+
+fn catradio_body(slice: char) -> String {
+    let slice = normalized_amp_slice(slice);
+    format!("ampslice={slice} active=0 type=None baud=0 parity=N stopbits=1 civ=0")
+}
+
+async fn flexradio_body(slice: char, state: &SharedState) -> String {
+    let slice = normalized_amp_slice(slice);
+    let guard = state.read().await;
+    let serial = guard
+        .radio_context
+        .radio_serial
+        .as_deref()
+        .unwrap_or("EGB-FLEX");
+    let antenna = guard.radio_context.tx_antenna.as_deref().unwrap_or("ANT1");
+    format!("ampslice={slice} serial={serial} txant={antenna} ptt=LAN active=1")
+}
+
+fn normalized_amp_slice(slice: char) -> char {
+    match slice.to_ascii_uppercase() {
+        'B' => 'B',
+        _ => 'A',
     }
 }
 
@@ -1000,6 +1074,31 @@ mod tests {
         assert_eq!(
             response_line(1, 0, info_body(true)),
             "R1|0|model=PowerGeniusXL serial_num=EGB-PGXL version=0.1.0-egb-pgxl\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pgxl_readonly_config_paths_have_stable_responses() {
+        let state = shared_mock_state();
+        assert!(replay_line("C10|setup read", &state)
+            .await
+            .unwrap()
+            .contains("nickname=Elecraft_Genius_Bridge"));
+        assert!(replay_line("C11|ifconf read", &state)
+            .await
+            .unwrap()
+            .contains("dhcp=true"));
+        assert!(replay_line("C12|catradio read=A", &state)
+            .await
+            .unwrap()
+            .contains("ampslice=A"));
+        assert!(replay_line("C13|flexradio read=B", &state)
+            .await
+            .unwrap()
+            .contains("ampslice=B"));
+        assert_eq!(
+            replay_line("C14|save", &state).await.unwrap(),
+            "R14|5|error=save_reboot_unsupported_by_bridge\n"
         );
     }
 }
