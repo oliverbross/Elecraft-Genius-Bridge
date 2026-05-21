@@ -1,7 +1,7 @@
 use anyhow::Context;
 use bridge_core::{
     append_evidence_json, append_evidence_line, parse_client_command, response_line,
-    AmpOperatingState, ConnectionState, ProtocolClientSession, SharedState,
+    AmpOperatingState, ConnectionState, LifecycleState, ProtocolClientSession, SharedState,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -92,6 +92,14 @@ async fn handle_client(
             peer,
             timestamp_millis(),
         ));
+        guard.lifecycle.pgxl.transition(
+            LifecycleState::TcpConnected,
+            format!("PGXL TCP client connected: {peer}"),
+        );
+        guard.lifecycle.aether_client.transition(
+            LifecycleState::TcpConnected,
+            format!("Aether client connected to PGXL: {peer}"),
+        );
         id
     };
     append_evidence_json(
@@ -267,6 +275,17 @@ async fn handle_client(
             Ok(()) => "client_closed".to_string(),
             Err(err) => err.to_string(),
         });
+        let reason = guard
+            .clients
+            .pgxl_last_disconnect_reason
+            .clone()
+            .unwrap_or_else(|| "client_closed".to_string());
+        if guard.clients.pgxl_client_count == 0 {
+            guard.lifecycle.pgxl.transition(
+                LifecycleState::Degraded,
+                format!("PGXL client disconnected: {reason}"),
+            );
+        }
     }
     append_evidence_json(
         "disconnect-events.jsonl",

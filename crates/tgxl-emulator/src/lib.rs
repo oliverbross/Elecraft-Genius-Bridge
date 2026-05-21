@@ -1,7 +1,7 @@
 use anyhow::Context;
 use bridge_core::{
     append_evidence_json, append_evidence_line, parse_client_command, response_line,
-    ConnectionState, ManualTuneRequest, ProtocolClientSession, SharedState,
+    ConnectionState, LifecycleState, ManualTuneRequest, ProtocolClientSession, SharedState,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -83,6 +83,14 @@ async fn handle_client(
             peer,
             timestamp_millis(),
         ));
+        guard.lifecycle.tgxl.transition(
+            LifecycleState::TcpConnected,
+            format!("TGXL TCP client connected: {peer}"),
+        );
+        guard.lifecycle.aether_client.transition(
+            LifecycleState::TcpConnected,
+            format!("Aether client connected to TGXL: {peer}"),
+        );
         id
     };
     append_evidence_json(
@@ -256,6 +264,17 @@ async fn handle_client(
             Ok(()) => "client_closed".to_string(),
             Err(err) => err.to_string(),
         });
+        let reason = guard
+            .clients
+            .tgxl_last_disconnect_reason
+            .clone()
+            .unwrap_or_else(|| "client_closed".to_string());
+        if guard.clients.tgxl_client_count == 0 {
+            guard.lifecycle.tgxl.transition(
+                LifecycleState::Degraded,
+                format!("TGXL client disconnected: {reason}"),
+            );
+        }
     }
     append_evidence_json(
         "disconnect-events.jsonl",
@@ -435,6 +454,12 @@ async fn handle_command(
                 guard.controls.last_mapped_elecraft_action = Some("KAT500 T;".to_string());
                 guard.controls.last_safety_decision =
                     Some("desired_autotune_requested".to_string());
+                guard.controls.tune_requested_count =
+                    guard.controls.tune_requested_count.saturating_add(1);
+                guard.lifecycle.tune.transition(
+                    bridge_core::state::TuneLifecycleState::TuneRequested,
+                    "TGXL autotune command received",
+                );
                 guard.desired.tuner_autotune_requested = true;
             }
             append_evidence_json(

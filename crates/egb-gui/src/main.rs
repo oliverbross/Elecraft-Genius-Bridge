@@ -1512,6 +1512,48 @@ impl GuiApp {
                     field(ui, "PGXL reason", &status.pgxl_lifecycle.reason);
                     field(
                         ui,
+                        "Flex lifecycle",
+                        format!(
+                            "{} ({})",
+                            status.lifecycle.flex_session.state,
+                            status
+                                .lifecycle
+                                .flex_session
+                                .last_transition_reason
+                                .as_deref()
+                                .unwrap_or("-")
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Amp lifecycle",
+                        format!(
+                            "{} ({})",
+                            status.lifecycle.amplifier.state,
+                            status
+                                .lifecycle
+                                .amplifier
+                                .last_transition_reason
+                                .as_deref()
+                                .unwrap_or("-")
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Tune lifecycle",
+                        format!(
+                            "{} ({})",
+                            status.lifecycle.tune.state,
+                            status
+                                .lifecycle
+                                .tune
+                                .last_transition_reason
+                                .as_deref()
+                                .unwrap_or("-")
+                        ),
+                    );
+                    field(
+                        ui,
                         "PGXL transitions",
                         status.pgxl_lifecycle.transition_count.to_string(),
                     );
@@ -3291,6 +3333,8 @@ struct StatusSnapshot {
     #[serde(default)]
     pgxl_lifecycle: PgxlLifecycleStatus,
     #[serde(default)]
+    lifecycle: LifecycleDiagnosticsStatus,
+    #[serde(default)]
     flex_diagnostics: FlexDiagnostics,
 }
 
@@ -3667,6 +3711,50 @@ struct PgxlLifecycleStatus {
     transition_count: u64,
     #[serde(default)]
     last_transition_at_ms: Option<u128>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct LifecycleDiagnosticsStatus {
+    #[serde(default)]
+    flex_session: LifecycleStatus,
+    #[serde(default)]
+    amplifier: LifecycleStatus,
+    #[serde(default)]
+    tgxl: LifecycleStatus,
+    #[serde(default)]
+    pgxl: LifecycleStatus,
+    #[serde(default)]
+    aether_client: LifecycleStatus,
+    #[serde(default)]
+    tune: TuneLifecycleStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct LifecycleStatus {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    transition_count: u64,
+    #[serde(default)]
+    last_transition_reason: Option<String>,
+    #[serde(default)]
+    entered_at_ms: Option<u128>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct TuneLifecycleStatus {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    transition_count: u64,
+    #[serde(default)]
+    last_transition_reason: Option<String>,
+    #[serde(default)]
+    entered_at_ms: Option<u128>,
+    #[serde(default)]
+    last_successful_tune_ms: Option<u128>,
+    #[serde(default)]
+    last_failed_tune_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

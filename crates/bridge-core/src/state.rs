@@ -137,6 +137,7 @@ pub struct BridgeState {
     pub desired: DesiredState,
     pub protocol: ProtocolCounters,
     pub controls: ControlDiagnostics,
+    pub lifecycle: LifecycleDiagnostics,
     pub effective_controls: EffectiveControlPolicy,
     pub config_identity: RuntimeConfigIdentity,
 }
@@ -159,10 +160,169 @@ impl Default for BridgeState {
             desired: DesiredState::default(),
             protocol: ProtocolCounters::default(),
             controls: ControlDiagnostics::default(),
+            lifecycle: LifecycleDiagnostics::default(),
             effective_controls: EffectiveControlPolicy::default(),
             config_identity: RuntimeConfigIdentity::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleState {
+    Disconnected,
+    Connecting,
+    Subscribed,
+    ObjectCreated,
+    ObjectAdvertised,
+    ObjectAccepted,
+    TcpConnected,
+    Active,
+    Degraded,
+    Removed,
+    Reconnecting,
+    NotStarted,
+}
+
+impl LifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+            Self::Subscribed => "subscribed",
+            Self::ObjectCreated => "object-created",
+            Self::ObjectAdvertised => "object-advertised",
+            Self::ObjectAccepted => "object-accepted",
+            Self::TcpConnected => "tcp-connected",
+            Self::Active => "active",
+            Self::Degraded => "degraded",
+            Self::Removed => "removed",
+            Self::Reconnecting => "reconnecting",
+            Self::NotStarted => "not-started",
+        }
+    }
+}
+
+impl Default for LifecycleState {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TuneLifecycleState {
+    Idle,
+    TuneRequested,
+    Tuning,
+    TuneComplete,
+    TuneFailed,
+    Cooldown,
+}
+
+impl TuneLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::TuneRequested => "tune-requested",
+            Self::Tuning => "tuning",
+            Self::TuneComplete => "tune-complete",
+            Self::TuneFailed => "tune-failed",
+            Self::Cooldown => "cooldown",
+        }
+    }
+}
+
+impl Default for TuneLifecycleState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleStatus {
+    pub state: LifecycleState,
+    pub transition_count: u64,
+    pub last_transition_reason: Option<String>,
+    pub entered_at_ms: Option<u128>,
+}
+
+impl Default for LifecycleStatus {
+    fn default() -> Self {
+        Self {
+            state: LifecycleState::NotStarted,
+            transition_count: 0,
+            last_transition_reason: None,
+            entered_at_ms: None,
+        }
+    }
+}
+
+impl LifecycleStatus {
+    pub fn transition(&mut self, state: LifecycleState, reason: impl Into<String>) {
+        let reason = reason.into();
+        if self.state != state || self.last_transition_reason.as_deref() != Some(reason.as_str()) {
+            self.state = state;
+            self.transition_count = self.transition_count.saturating_add(1);
+            self.last_transition_reason = Some(reason);
+            self.entered_at_ms = Some(timestamp_millis());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuneLifecycleStatus {
+    pub state: TuneLifecycleState,
+    pub transition_count: u64,
+    pub last_transition_reason: Option<String>,
+    pub entered_at_ms: Option<u128>,
+    pub last_successful_tune_ms: Option<u128>,
+    pub last_failed_tune_ms: Option<u128>,
+}
+
+impl Default for TuneLifecycleStatus {
+    fn default() -> Self {
+        Self {
+            state: TuneLifecycleState::Idle,
+            transition_count: 0,
+            last_transition_reason: None,
+            entered_at_ms: None,
+            last_successful_tune_ms: None,
+            last_failed_tune_ms: None,
+        }
+    }
+}
+
+impl TuneLifecycleStatus {
+    pub fn transition(&mut self, state: TuneLifecycleState, reason: impl Into<String>) {
+        let reason = reason.into();
+        if self.state != state || self.last_transition_reason.as_deref() != Some(reason.as_str()) {
+            self.state = state;
+            self.transition_count = self.transition_count.saturating_add(1);
+            self.last_transition_reason = Some(reason);
+            self.entered_at_ms = Some(timestamp_millis());
+        }
+    }
+
+    pub fn mark_success(&mut self, reason: impl Into<String>) {
+        self.last_successful_tune_ms = Some(timestamp_millis());
+        self.transition(TuneLifecycleState::TuneComplete, reason);
+    }
+
+    pub fn mark_failure(&mut self, reason: impl Into<String>) {
+        self.last_failed_tune_ms = Some(timestamp_millis());
+        self.transition(TuneLifecycleState::TuneFailed, reason);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LifecycleDiagnostics {
+    pub flex_session: LifecycleStatus,
+    pub amplifier: LifecycleStatus,
+    pub tgxl: LifecycleStatus,
+    pub pgxl: LifecycleStatus,
+    pub aether_client: LifecycleStatus,
+    pub tune: TuneLifecycleStatus,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -423,6 +583,11 @@ pub struct FlexInjectionState {
     pub amplifier_reannounce_count: u64,
     pub amplifier_handle_change_count: u64,
     pub amplifier_removed_count: u64,
+    pub amplifier_create_count: u64,
+    pub duplicate_amplifier_create_count: u64,
+    pub duplicate_subscription_count: u64,
+    pub duplicate_meter_create_count: u64,
+    pub duplicate_interlock_create_count: u64,
     pub amp_widget_visibility_risk: Option<String>,
     pub amplifier_direct_connect_expected: Option<bool>,
     pub last_amplifier_status_line: Option<String>,
@@ -432,6 +597,9 @@ pub struct FlexInjectionState {
     pub amplifier_pgxl_tcp_attempted_after_status: bool,
     pub last_amplifier_reannounce_reason: Option<String>,
     pub last_amplifier_removed_reason: Option<String>,
+    pub amplifier_recreate_reason: Option<String>,
+    pub last_lifecycle_event: Option<String>,
+    pub last_lifecycle_event_at_ms: Option<u128>,
     pub last_advertised_flex_amp_state: Option<String>,
     pub last_advertised_pgxl_state: Option<String>,
     pub last_advertised_tgxl_operate: Option<bool>,
@@ -582,6 +750,10 @@ pub struct ControlDiagnostics {
     pub duplicate_autotune_suppressed_count: u64,
     pub last_tune_frequency_hz: Option<u64>,
     pub last_tune_band: Option<String>,
+    pub tune_requested_count: u64,
+    pub tune_executed_count: u64,
+    pub tune_failed_count: u64,
+    pub last_tune_result: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -641,6 +813,13 @@ pub fn shared_mock_state() -> SharedState {
 
 pub fn shared_default_state() -> SharedState {
     Arc::new(RwLock::new(BridgeState::default()))
+}
+
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ pub use protocol::{parse_client_command, response_line, ClientCommand, ProtocolE
 pub use state::{
     push_capability, AmpOperatingState, AmpState, Band, BridgeState, ClientState, ConnectionState,
     ControlDiagnostics, DesiredState, EffectiveControlPolicy, FlexInjectionState, FlexMeterHandle,
-    ManualTuneRequest, ProtocolClientSession, ProtocolCounterSet, ProtocolCounters,
-    RuntimeConfigIdentity, SharedState, TunerState,
+    LifecycleDiagnostics, LifecycleState, LifecycleStatus, ManualTuneRequest,
+    ProtocolClientSession, ProtocolCounterSet, ProtocolCounters, RuntimeConfigIdentity,
+    SharedState, TuneLifecycleState, TuneLifecycleStatus, TunerState,
 };

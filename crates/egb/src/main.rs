@@ -81,6 +81,16 @@ enum Commands {
         #[arg(long, default_value_t = 600.0)]
         duration_seconds: f64,
     },
+    EcosystemSoakTest {
+        #[arg(long, default_value = "config.aethersdr-operational.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 30.0)]
+        duration_minutes: f64,
+    },
+    ReplaySession {
+        #[arg(long)]
+        bundle: PathBuf,
+    },
     AethersdrOperationalTest {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -310,6 +320,18 @@ async fn main() -> Result<()> {
                 duration_seconds / 60.0,
             )
             .await
+        }
+        Commands::EcosystemSoakTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_ecosystem_soak_test(cfg, config, duration_minutes).await
+        }
+        Commands::ReplaySession { bundle } => {
+            init_logging("info");
+            replay_session_bundle(&bundle).await
         }
         Commands::AethersdrOperationalTest {
             config,
@@ -1118,6 +1140,226 @@ async fn run_evidence_test(
     println!("stability report: {}", path.display());
     println!("evidence bundle: {}", zip.display());
     Ok(())
+}
+
+async fn run_ecosystem_soak_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start("ecosystem-soak-test", &config_path, &cfg, std::env::args())?;
+    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let duration = Duration::from_secs_f64(duration_minutes * 60.0);
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await;
+    info!(
+        event_id = "ecosystem_soak_started",
+        duration_minutes, "ecosystem soak test started"
+    );
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = interval.tick() => {
+                print_soak_summary(&state, started.elapsed()).await;
+            }
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for Ctrl+C")?;
+                info!("ecosystem soak interrupted by Ctrl+C");
+                break;
+            }
+        }
+    }
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let report = write_ecosystem_report(&state, started.elapsed(), evidence.dir()).await?;
+    let stability = write_stability_report(&state, started.elapsed(), Some(evidence.dir())).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    info!(
+        event_id = "ecosystem_soak_completed",
+        report = %report.display(),
+        stability_report = %stability.display(),
+        zip = %zip.display(),
+        "ecosystem soak test completed"
+    );
+    println!("ecosystem report: {}", report.display());
+    println!("evidence bundle: {}", zip.display());
+    Ok(())
+}
+
+async fn write_ecosystem_report(
+    state: &SharedState,
+    elapsed: Duration,
+    dir: &Path,
+) -> Result<PathBuf> {
+    let guard = state.read().await;
+    let path = dir.join("ecosystem-soak-report.md");
+    let body = format!(
+        "# Ecosystem Soak Report\n\nElapsed: {} seconds\n\n\
+## Stability Checks\n\n\
+- Flex lifecycle: `{}` ({})\n\
+- Amplifier lifecycle: `{}` ({})\n\
+- PGXL lifecycle: `{}` ({})\n\
+- TGXL lifecycle: `{}` ({})\n\
+- Tune lifecycle: `{}` ({})\n\n\
+## Counts\n\n\
+- Amplifier create count: {}\n\
+- Amplifier remove count: {}\n\
+- Amplifier handle changes: {}\n\
+- Duplicate amplifier creates: {}\n\
+- Duplicate subscriptions: {}\n\
+- PGXL sessions started: {}\n\
+- TGXL sessions started: {}\n\
+- Flex ping sent/ack/fail: {}/{}/{}\n\
+- Tune requested/executed/failed/suppressed: {}/{}/{}/{}\n\n\
+## Last Reasons\n\n\
+- Last amplifier remove reason: {}\n\
+- Last PGXL disconnect: {}\n\
+- Last TGXL disconnect: {}\n\
+- Last tune result: {}\n",
+        elapsed.as_secs(),
+        guard.lifecycle.flex_session.state.as_str(),
+        guard
+            .lifecycle
+            .flex_session
+            .last_transition_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.lifecycle.amplifier.state.as_str(),
+        guard
+            .lifecycle
+            .amplifier
+            .last_transition_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.lifecycle.pgxl.state.as_str(),
+        guard
+            .lifecycle
+            .pgxl
+            .last_transition_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.lifecycle.tgxl.state.as_str(),
+        guard
+            .lifecycle
+            .tgxl
+            .last_transition_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.lifecycle.tune.state.as_str(),
+        guard
+            .lifecycle
+            .tune
+            .last_transition_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.amplifier_create_count,
+        guard.flex_injection.amplifier_removed_count,
+        guard.flex_injection.amplifier_handle_change_count,
+        guard.flex_injection.duplicate_amplifier_create_count,
+        guard.flex_injection.duplicate_subscription_count,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.flex_injection.ping_count,
+        guard.flex_injection.ping_ack_count,
+        guard.flex_injection.ping_failure_count,
+        guard.controls.tune_requested_count,
+        guard.controls.tune_executed_count,
+        guard.controls.tune_failed_count,
+        guard.controls.duplicate_autotune_suppressed_count,
+        guard
+            .flex_injection
+            .last_amplifier_removed_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .clients
+            .pgxl_last_disconnect_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .clients
+            .tgxl_last_disconnect_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.controls.last_tune_result.as_deref().unwrap_or("none"),
+    );
+    drop(guard);
+    tokio::fs::write(&path, body).await?;
+    Ok(path)
+}
+
+async fn replay_session_bundle(bundle: &Path) -> Result<()> {
+    let summary = if bundle.is_dir() {
+        replay_summary_from_dir(bundle)?
+    } else {
+        replay_summary_from_zip(bundle)?
+    };
+    println!("{summary}");
+    Ok(())
+}
+
+fn replay_summary_from_dir(dir: &Path) -> Result<String> {
+    let files = [
+        "flex-rx.log",
+        "flex-tx.log",
+        "pgxl-protocol.log",
+        "tgxl-protocol.log",
+        "disconnect-events.jsonl",
+        "lifecycle-events.jsonl",
+    ];
+    let mut out = String::from("# Replay Session Summary\n\n");
+    for file in files {
+        let path = dir.join(file);
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        out.push_str(&format!(
+            "- `{file}`: {} lines, {} amplifier removals, {} PGXL RX/TX lines, {} TGXL RX/TX lines\n",
+            text.lines().count(),
+            text.matches("amplifier_removed").count() + text.matches("removed").count(),
+            text.matches("PGXL").count(),
+            text.matches("TGXL").count(),
+        ));
+    }
+    Ok(out)
+}
+
+fn replay_summary_from_zip(path: &Path) -> Result<String> {
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read ZIP {}", path.display()))?;
+    let mut out = String::from("# Replay Session Summary\n\n");
+    for name in [
+        "flex-rx.log",
+        "flex-tx.log",
+        "pgxl-protocol.log",
+        "tgxl-protocol.log",
+        "disconnect-events.jsonl",
+        "lifecycle-events.jsonl",
+    ] {
+        let mut count = 0usize;
+        let mut removals = 0usize;
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index)?;
+            if !file.name().ends_with(name) {
+                continue;
+            }
+            let mut text = String::new();
+            use std::io::Read;
+            file.read_to_string(&mut text)?;
+            count += text.lines().count();
+            removals += text.matches("amplifier_removed").count() + text.matches("removed").count();
+        }
+        out.push_str(&format!(
+            "- `{name}`: {count} lines, {removals} removal markers\n"
+        ));
+    }
+    Ok(out)
 }
 
 async fn run_pgxl_pairing_lab(
@@ -3582,6 +3824,7 @@ async fn status_json(state: &SharedState) -> String {
             "pgxl_last_no_socket_attempt_warning": guard.clients.pgxl_last_no_socket_attempt_warning,
         },
         "flex_injection": guard.flex_injection,
+        "lifecycle": guard.lifecycle,
         "controls": guard.controls,
         "effective_controls": guard.effective_controls,
         "pgxl_lifecycle": pgxl_lifecycle_json(&guard),
@@ -4751,7 +4994,9 @@ mod tests {
         assert!(names.contains(&"evidence-test".to_string()));
         assert!(names.contains(&"aethersdr-smoke-test".to_string()));
         assert!(names.contains(&"aethersdr-operational-test".to_string()));
+        assert!(names.contains(&"ecosystem-soak-test".to_string()));
         assert!(names.contains(&"full-operational-test".to_string()));
+        assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));

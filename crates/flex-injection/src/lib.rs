@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use bridge_core::{
-    append_evidence_json, append_evidence_line, Band, ConnectionState, FlexMeterHandle, SharedState,
+    append_evidence_json, append_evidence_line, Band, ConnectionState, FlexMeterHandle,
+    LifecycleState, SharedState,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -79,6 +80,10 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
         guard.flex_injection.radio_addr = Some(settings.radio_addr.to_string());
         guard.flex_injection.pgxl_connect_assist_enabled = settings.pgxl_connect_assist;
         guard.flex_injection.flex_force_operate_via_radio = settings.flex_force_operate_via_radio;
+        guard
+            .lifecycle
+            .flex_session
+            .transition(LifecycleState::Connecting, "Flex injection task started");
     }
     loop {
         match run_session(&settings, state.clone()).await {
@@ -105,6 +110,14 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
             guard.flex_injection.degraded_reason =
                 Some("session ended; reconnect pending".to_string());
             guard.flex_injection.amplifier_handle = None;
+            guard.lifecycle.flex_session.transition(
+                LifecycleState::Reconnecting,
+                "Flex session ended; reconnect pending",
+            );
+            guard
+                .lifecycle
+                .amplifier
+                .transition(LifecycleState::Degraded, "Flex session ended");
         }
         sleep(backoff).await;
         backoff = (backoff * 2).min(settings.reconnect_max.max(settings.reconnect_initial));
@@ -144,6 +157,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         guard.flex_injection.amplifier_create_sent = false;
         guard.flex_injection.amplifier_create_accepted = false;
         guard.flex_injection.sub_amplifier_all_accepted = false;
+        guard.lifecycle.flex_session.transition(
+            LifecycleState::Connecting,
+            "Flex TCP connected; waiting for handle",
+        );
     }
 
     let mut registration: Option<Vec<PendingCommand>> = None;
@@ -168,6 +185,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     let mut guard = state.write().await;
                     guard.flex_injection.client_handle = Some(handle);
                     guard.flex_injection.client_handle_received = true;
+                    guard
+                        .lifecycle
+                        .flex_session
+                        .transition(LifecycleState::Active, "Flex client handle received");
                 }
                 trace_flex_rx(&line);
                 {
@@ -188,6 +209,13 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     wait_for_kpa_first_poll_if_needed(settings, &state).await;
                     let items = registration
                         .get_or_insert(registration_commands_with_state(settings, &state).await);
+                    {
+                        let mut guard = state.write().await;
+                        guard
+                            .lifecycle
+                            .amplifier
+                            .transition(LifecycleState::ObjectCreated, "sending one-shot Flex amplifier registration");
+                    }
                     for item in items.iter() {
                         if item.label == "amplifier_create" {
                             trace_amplifier_advertisement(
@@ -209,6 +237,17 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         .await?;
                     }
                     registration_sent = true;
+                    {
+                        let mut guard = state.write().await;
+                        guard
+                            .lifecycle
+                            .flex_session
+                            .transition(LifecycleState::Subscribed, "registration commands sent once for this Flex session");
+                        guard
+                            .lifecycle
+                            .amplifier
+                            .transition(LifecycleState::ObjectAdvertised, "amplifier create sent");
+                    }
                 }
 
                 if let Some((seq, code, body)) = parse_response(&line) {
@@ -506,6 +545,47 @@ async fn send_tracked_command(
             .saturating_add(expired);
     }
     let seq = *next_seq;
+    let duplicate_label = !session.sent_labels.insert(pending.label.clone());
+    if duplicate_label {
+        let mut guard = state.write().await;
+        match &pending.kind {
+            PendingKind::AmplifierCreate => {
+                guard.flex_injection.duplicate_amplifier_create_count = guard
+                    .flex_injection
+                    .duplicate_amplifier_create_count
+                    .saturating_add(1);
+                guard.flex_injection.amplifier_recreate_reason =
+                    Some("duplicate amplifier create attempted in one Flex session".to_string());
+            }
+            PendingKind::MeterCreate { .. } => {
+                guard.flex_injection.duplicate_meter_create_count = guard
+                    .flex_injection
+                    .duplicate_meter_create_count
+                    .saturating_add(1);
+            }
+            PendingKind::InterlockCreate => {
+                guard.flex_injection.duplicate_interlock_create_count = guard
+                    .flex_injection
+                    .duplicate_interlock_create_count
+                    .saturating_add(1);
+            }
+            PendingKind::Subscription => {
+                guard.flex_injection.duplicate_subscription_count = guard
+                    .flex_injection
+                    .duplicate_subscription_count
+                    .saturating_add(1);
+            }
+            _ => {}
+        }
+        append_evidence_json(
+            "lifecycle-events.jsonl",
+            &serde_json::json!({
+                "event": "duplicate_flex_command_label",
+                "label": pending.label,
+                "command": pending.command,
+            }),
+        );
+    }
     send_command(writer, seq, &pending.command).await?;
     if pending.kind == PendingKind::AmplifierCreate {
         append_flex_log_line(
@@ -530,6 +610,10 @@ async fn send_tracked_command(
         guard.flex_injection.last_tx_line = Some(format!("C{seq}|{}", pending.command));
         if pending.kind == PendingKind::AmplifierCreate {
             guard.flex_injection.amplifier_create_sent = true;
+            guard.flex_injection.amplifier_create_count = guard
+                .flex_injection
+                .amplifier_create_count
+                .saturating_add(1);
         }
         guard.flex_injection.pending_count = session.pending.len();
     }
@@ -622,6 +706,7 @@ struct FlexSession {
     operate_lab_sent: bool,
     assist_sent_handle: Option<String>,
     pending: HashMap<u32, PendingCommand>,
+    sent_labels: HashSet<String>,
 }
 
 impl FlexSession {
@@ -712,6 +797,10 @@ impl FlexSession {
                 {
                     let mut guard = state.write().await;
                     guard.flex_injection.amplifier_create_accepted = true;
+                    guard.lifecycle.amplifier.transition(
+                        LifecycleState::ObjectAccepted,
+                        "Flex accepted amplifier create",
+                    );
                 }
                 if let Some(handle) = response_object_id(body) {
                     set_amplifier_handle(state, handle).await;
@@ -745,6 +834,10 @@ impl FlexSession {
                 if pending.command.contains("sub amplifier all") {
                     let mut guard = state.write().await;
                     guard.flex_injection.sub_amplifier_all_accepted = true;
+                    guard
+                        .lifecycle
+                        .flex_session
+                        .transition(LifecycleState::Subscribed, "sub amplifier all accepted");
                 }
             }
             PendingKind::KeepaliveEnable
@@ -823,6 +916,17 @@ async fn set_amplifier_handle(state: &SharedState, handle: &str) {
     }
     guard.flex_injection.amplifier_handle = Some(handle.to_string());
     guard.flex_injection.amplifier_last_seen_at = Some(SystemTime::now());
+    guard.lifecycle.amplifier.transition(
+        LifecycleState::Active,
+        format!("Flex amplifier handle observed: {handle}"),
+    );
+    append_evidence_json(
+        "lifecycle-events.jsonl",
+        &serde_json::json!({
+            "event": "amplifier_handle_observed",
+            "handle": handle,
+        }),
+    );
 }
 
 async fn record_amplifier_pairing_status(
@@ -880,6 +984,11 @@ async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
 
 async fn record_amplifier_removed(state: &SharedState, handle: &str) {
     let mut guard = state.write().await;
+    let previous_state = guard.flex_injection.last_advertised_flex_amp_state.clone();
+    let pgxl_client_count = guard.clients.pgxl_client_count;
+    let pgxl_started = guard.clients.pgxl_session_started_count;
+    let last_command = guard.flex_injection.last_command.clone();
+    let last_response = guard.flex_injection.last_response.clone();
     guard.flex_injection.amplifier_removed_count = guard
         .flex_injection
         .amplifier_removed_count
@@ -891,13 +1000,33 @@ async fn record_amplifier_removed(state: &SharedState, handle: &str) {
     }
     guard.flex_injection.amp_widget_visibility_risk =
         Some(format!("Flex removed amplifier handle {handle}"));
+    guard.lifecycle.amplifier.transition(
+        LifecycleState::Removed,
+        format!("Flex reported amplifier {handle} removed"),
+    );
+    guard.lifecycle.pgxl.transition(
+        LifecycleState::Degraded,
+        "Flex amplifier object was removed",
+    );
     append_evidence_json(
         "disconnect-events.jsonl",
         &serde_json::json!({
             "event": "flex_amplifier_removed",
             "handle": handle,
             "count": guard.flex_injection.amplifier_removed_count,
+            "previous_advertised_state": previous_state,
+            "pgxl_client_count": pgxl_client_count,
+            "pgxl_session_started_count": pgxl_started,
+            "last_flex_command": last_command,
+            "last_flex_response": last_response,
         }),
+    );
+    append_evidence_line(
+        "amplifier-removal-timeline.md",
+        format!(
+            "- Flex reported amplifier `{handle}` removed. previous_state={:?} pgxl_clients={} pgxl_sessions={} last_command={:?} last_response={:?}",
+            previous_state, pgxl_client_count, pgxl_started, last_command, last_response
+        ),
     );
 }
 
@@ -1283,6 +1412,10 @@ async fn update_radio_context_from_slice(state: &SharedState, status: &KeyValueS
         guard.band = band;
         guard.radio_context.frequency_hz = Some(frequency_hz);
         guard.radio_context.band = band;
+        guard.lifecycle.tgxl.transition(
+            LifecycleState::Active,
+            format!("Flex TX slice frequency updated to {frequency_hz} Hz"),
+        );
     }
     if let Some(mode) = status.value("mode") {
         guard.radio_context.mode = Some(mode.to_string());
@@ -1308,6 +1441,13 @@ async fn update_radio_context_from_slice(state: &SharedState, status: &KeyValueS
     });
     drop(guard);
     append_evidence_json("radio-context.json", &record);
+    append_evidence_line(
+        "tgxl_state_transition.log",
+        format!(
+            "Flex slice update propagated to TGXL context: frequency_hz={:?} band={} mode={:?}",
+            record["frequency_hz"], record["band"], record["mode"]
+        ),
+    );
 }
 
 async fn update_radio_context_from_transmit(state: &SharedState, status: &KeyValueStatus) {

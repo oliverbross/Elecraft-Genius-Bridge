@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bridge_core::{
     append_evidence_json, append_evidence_line, push_capability, ConnectionState, SharedState,
+    TuneLifecycleState,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -461,12 +462,20 @@ impl Kat500Driver {
                         .saturating_add(1);
                     guard.controls.last_safety_decision =
                         Some("duplicate_autotune_suppressed".to_string());
+                    guard.lifecycle.tune.transition(
+                        TuneLifecycleState::Cooldown,
+                        "duplicate autotune suppressed inside cooldown window",
+                    );
                 } else {
                     guard.radio_context.last_tune_at = Some(now);
                     guard.radio_context.last_tune_frequency_hz = frequency_hz;
                     guard.radio_context.last_tune_band = Some(band);
                     guard.controls.last_tune_frequency_hz = frequency_hz;
                     guard.controls.last_tune_band = Some(band_label.clone());
+                    guard.lifecycle.tune.transition(
+                        TuneLifecycleState::Tuning,
+                        "KAT500 T; accepted for execution",
+                    );
                 }
                 (suppress_duplicate, frequency_hz, band_label)
             };
@@ -504,13 +513,36 @@ impl Kat500Driver {
                     frequency_hz, band_label
                 ),
             );
-            self.apply_desired_command(
-                port,
-                transcript,
-                CMD_AUTOTUNE,
-                "TGXL autotune -> KAT500 T;",
-            )
-            .await?;
+            let tune_result = self
+                .apply_desired_command(port, transcript, CMD_AUTOTUNE, "TGXL autotune -> KAT500 T;")
+                .await;
+            match tune_result {
+                Ok(()) => {
+                    let mut guard = self.state.write().await;
+                    guard.controls.tune_executed_count =
+                        guard.controls.tune_executed_count.saturating_add(1);
+                    guard.controls.last_tune_result = Some("executed".to_string());
+                    guard
+                        .lifecycle
+                        .tune
+                        .mark_success("KAT500 tune command completed");
+                    guard.lifecycle.tune.transition(
+                        TuneLifecycleState::Idle,
+                        "tune lifecycle reset after completion",
+                    );
+                }
+                Err(err) => {
+                    let mut guard = self.state.write().await;
+                    guard.controls.tune_failed_count =
+                        guard.controls.tune_failed_count.saturating_add(1);
+                    guard.controls.last_tune_result = Some(err.to_string());
+                    guard
+                        .lifecycle
+                        .tune
+                        .mark_failure(format!("KAT500 tune failed: {err}"));
+                    return Err(err);
+                }
+            }
         }
         if let Some(antenna) = antenna {
             let command = antenna_command(antenna);

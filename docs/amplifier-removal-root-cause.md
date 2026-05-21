@@ -11,6 +11,8 @@ Phase 45 adds explicit detection for this condition:
 - `flex_diagnostics.amplifier_removed_count`
 - `flex_diagnostics.last_amplifier_removed_reason`
 - `disconnect-events.jsonl` event: `flex_amplifier_removed`
+- `amplifier-removal-timeline.md` with previous advertised state, PGXL TCP state, and last Flex command/response
+- `/status.lifecycle.amplifier` transition to `removed`
 
 ## Most Likely Causes To Validate
 
@@ -35,6 +37,14 @@ Phase 45 adds explicit detection for this condition:
 - Flex radio context is subscribed and used for TGXL `freqA`, `bandA`, `modeA`, and `flexA`.
 - Amplifier removal is now counted and exported instead of being treated as an ordinary amplifier status.
 - PGXL/TGXL evidence includes protocol/status sample files for replay and comparison.
+
+## Phase 46 Stability Rules
+
+- `amplifier create` is sent once per Flex TCP session.
+- Meter, interlock, and subscription duplicate attempts are counted separately.
+- Telemetry changes and PGXL TCP reconnects must not recreate the amplifier.
+- The amplifier handle is cleared only when Flex reports removal or the Flex session ends.
+- `ecosystem-soak-test` is the preferred command for proving that handle and object state remain stable over time.
 
 ## Validation Needed
 
