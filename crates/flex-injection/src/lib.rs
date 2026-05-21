@@ -180,6 +180,9 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 if let Some(status) = parse_transmit_status(&line) {
                     update_radio_context_from_transmit(&state, &status).await;
                 }
+                if let Some(status) = parse_radio_status(&line) {
+                    update_radio_context_from_radio(&state, &status).await;
+                }
 
                 if session.has_handle && !registration_sent {
                     wait_for_kpa_first_poll_if_needed(settings, &state).await;
@@ -226,6 +229,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                             status.kvs.iter().map(|(key, _)| key.clone()).collect(),
                         )
                         .await;
+                        if status.is_removed() {
+                            record_amplifier_removed(&state, &status.handle).await;
+                            continue;
+                        }
                         set_amplifier_handle(&state, &status.handle).await;
                         if settings.flex_force_operate_via_radio {
                             append_flex_operate_lab_line(format!("RX_STATUS {}", status.raw));
@@ -775,6 +782,20 @@ impl FlexSession {
             .is_some_and(|serial| serial == settings.serial);
         let known_handle = self.amplifier_handle.as_deref() == Some(status.handle.as_str());
         if model_match || serial_match || known_handle {
+            if status.is_removed() {
+                append_flex_log_line(
+                    "amplifier-status-lines.log",
+                    &format!("REMOVED {}", status.raw),
+                );
+                if self.amplifier_handle.as_deref() == Some(status.handle.as_str()) {
+                    self.amplifier_handle = None;
+                    info!(
+                        amplifier_handle = %status.handle,
+                        "Flex amplifier object removal observed"
+                    );
+                }
+                return true;
+            }
             if self.amplifier_handle.as_deref() != Some(status.handle.as_str()) {
                 self.amplifier_handle = Some(status.handle.clone());
                 info!(
@@ -855,6 +876,29 @@ async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
             handle: handle.to_string(),
         });
     }
+}
+
+async fn record_amplifier_removed(state: &SharedState, handle: &str) {
+    let mut guard = state.write().await;
+    guard.flex_injection.amplifier_removed_count = guard
+        .flex_injection
+        .amplifier_removed_count
+        .saturating_add(1);
+    guard.flex_injection.last_amplifier_removed_reason =
+        Some(format!("Flex status reported amplifier {handle} removed"));
+    if guard.flex_injection.amplifier_handle.as_deref() == Some(handle) {
+        guard.flex_injection.amplifier_handle = None;
+    }
+    guard.flex_injection.amp_widget_visibility_risk =
+        Some(format!("Flex removed amplifier handle {handle}"));
+    append_evidence_json(
+        "disconnect-events.jsonl",
+        &serde_json::json!({
+            "event": "flex_amplifier_removed",
+            "handle": handle,
+            "count": guard.flex_injection.amplifier_removed_count,
+        }),
+    );
 }
 
 async fn observe_tuner_presence(state: &SharedState, status: &AmplifierStatus) {
@@ -1078,6 +1122,13 @@ impl AmplifierStatus {
             .map(|(_, value)| value.as_str())
     }
 
+    fn is_removed(&self) -> bool {
+        self.raw
+            .split('|')
+            .nth(1)
+            .is_some_and(|body| body.split_whitespace().any(|token| token == "removed"))
+    }
+
     fn requested_operate(&self) -> Option<bool> {
         if let Some(value) = self.value("operate") {
             return match value {
@@ -1199,6 +1250,10 @@ fn parse_transmit_status(line: &str) -> Option<KeyValueStatus> {
     parse_kv_status(line, "transmit ")
 }
 
+fn parse_radio_status(line: &str) -> Option<KeyValueStatus> {
+    parse_kv_status(line, "radio ")
+}
+
 async fn update_radio_context_from_slice(state: &SharedState, status: &KeyValueStatus) {
     let frequency_hz = status
         .value("RF_frequency")
@@ -1276,6 +1331,41 @@ async fn update_radio_context_from_transmit(state: &SharedState, status: &KeyVal
             "band": guard.radio_context.band.as_str(),
             "tx_antenna": guard.radio_context.tx_antenna,
             "rx_antenna": guard.radio_context.rx_antenna,
+            "raw": status.raw,
+        });
+        drop(guard);
+        append_evidence_json("radio-context.json", &record);
+    }
+}
+
+async fn update_radio_context_from_radio(state: &SharedState, status: &KeyValueStatus) {
+    let mut guard = state.write().await;
+    let mut changed = false;
+    if let Some(serial) = status
+        .value("serial")
+        .or_else(|| status.value("serial_num"))
+        .or_else(|| status.value("serial_number"))
+    {
+        guard.radio_context.radio_serial = Some(serial.to_string());
+        changed = true;
+    }
+    if let Some(nickname) = status.value("nickname").or_else(|| status.value("name")) {
+        guard.radio_context.radio_nickname = Some(nickname.to_string());
+        changed = true;
+    }
+    if let Some(callsign) = status.value("callsign").or_else(|| status.value("call")) {
+        guard.radio_context.radio_callsign = Some(callsign.to_string());
+        changed = true;
+    }
+    if changed {
+        guard.radio_context.source = Some("flex_radio".to_string());
+        guard.radio_context.updated_at = Some(SystemTime::now());
+        let record = serde_json::json!({
+            "event": "radio_context_updated",
+            "source": "flex_radio",
+            "radio_serial": guard.radio_context.radio_serial,
+            "radio_nickname": guard.radio_context.radio_nickname,
+            "radio_callsign": guard.radio_context.radio_callsign,
             "raw": status.raw,
         });
         drop(guard);

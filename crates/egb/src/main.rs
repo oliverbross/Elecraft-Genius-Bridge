@@ -75,6 +75,12 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    AethersdrProtocolTest {
+        #[arg(long, default_value = "config.aethersdr-operational.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 600.0)]
+        duration_seconds: f64,
+    },
     AethersdrOperationalTest {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -290,6 +296,20 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("aethersdr-smoke-test", cfg, config, duration_minutes).await
+        }
+        Commands::AethersdrProtocolTest {
+            config,
+            duration_seconds,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test(
+                "aethersdr-protocol-test",
+                cfg,
+                config,
+                duration_seconds / 60.0,
+            )
+            .await
         }
         Commands::AethersdrOperationalTest {
             config,
@@ -3538,6 +3558,9 @@ async fn status_json(state: &SharedState) -> String {
             "mode": guard.radio_context.mode,
             "tx_antenna": guard.radio_context.tx_antenna,
             "rx_antenna": guard.radio_context.rx_antenna,
+            "radio_serial": guard.radio_context.radio_serial,
+            "radio_nickname": guard.radio_context.radio_nickname,
+            "radio_callsign": guard.radio_context.radio_callsign,
             "source": guard.radio_context.source,
             "last_tune_frequency_hz": guard.radio_context.last_tune_frequency_hz,
             "last_tune_band": guard.radio_context.last_tune_band.map(|band| band.as_str()),
@@ -3579,8 +3602,10 @@ async fn status_json(state: &SharedState) -> String {
             "tuner_reannounce_count": guard.flex_injection.tuner_reannounce_count,
             "amplifier_reannounce_count": guard.flex_injection.amplifier_reannounce_count,
             "amplifier_handle_change_count": guard.flex_injection.amplifier_handle_change_count,
+            "amplifier_removed_count": guard.flex_injection.amplifier_removed_count,
             "amp_widget_visibility_risk": amp_widget_visibility_risk(&guard),
             "amplifier_direct_connect_expected": guard.flex_injection.amplifier_direct_connect_expected,
+            "last_amplifier_removed_reason": guard.flex_injection.last_amplifier_removed_reason,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
         },

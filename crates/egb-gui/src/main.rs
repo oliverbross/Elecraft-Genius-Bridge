@@ -1630,6 +1630,19 @@ impl GuiApp {
                     );
                     field(
                         ui,
+                        "Amp removals",
+                        format!(
+                            "{} {}",
+                            status.flex_diagnostics.amplifier_removed_count,
+                            status
+                                .flex_diagnostics
+                                .last_amplifier_removed_reason
+                                .as_deref()
+                                .unwrap_or("")
+                        ),
+                    );
+                    field(
+                        ui,
                         "Flex operate lab",
                         format!(
                             "sent={} accepted={}",
@@ -3296,6 +3309,12 @@ struct RadioContextStatus {
     #[serde(default)]
     rx_antenna: Option<String>,
     #[serde(default)]
+    radio_serial: Option<String>,
+    #[serde(default)]
+    radio_nickname: Option<String>,
+    #[serde(default)]
+    radio_callsign: Option<String>,
+    #[serde(default)]
     source: Option<String>,
     #[serde(default)]
     last_tune_frequency_hz: Option<u64>,
@@ -3523,6 +3542,10 @@ struct FlexStatus {
     #[serde(default)]
     amplifier_handle_change_count: u64,
     #[serde(default)]
+    amplifier_removed_count: u64,
+    #[serde(default)]
+    last_amplifier_removed_reason: Option<String>,
+    #[serde(default)]
     amp_widget_visibility_risk: Option<String>,
 }
 
@@ -3550,6 +3573,10 @@ struct FlexDiagnostics {
     amplifier_direct_connect_expected: Option<bool>,
     #[serde(default)]
     amplifier_handle_change_count: u64,
+    #[serde(default)]
+    amplifier_removed_count: u64,
+    #[serde(default)]
+    last_amplifier_removed_reason: Option<String>,
     #[serde(default)]
     amp_widget_visibility_risk: Option<String>,
 }

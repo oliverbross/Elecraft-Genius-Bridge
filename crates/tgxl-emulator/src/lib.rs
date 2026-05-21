@@ -335,11 +335,96 @@ async fn handle_command(
 ) -> CommandOutcome {
     match command {
         "info" => CommandOutcome::ok(response_line(seq, 0, info_body(aethersdr_compat))),
-        "status" => CommandOutcome::ok(response_line(
-            seq,
-            0,
-            status_body(state, aethersdr_compat, control_profile).await,
-        )),
+        "status" => {
+            CommandOutcome::ok(status_line(seq, state, aethersdr_compat, control_profile).await)
+        }
+        "ifconf read" | "network" | "network read" => {
+            CommandOutcome::ok(response_line(seq, 0, network_body()))
+        }
+        "setup read" => CommandOutcome::ok(response_line(seq, 0, setup_body())),
+        "catradio read" => CommandOutcome::with_pushes(
+            response_line(seq, 0, catradio_body(1)),
+            vec![response_line(seq, 0, catradio_body(2))],
+        ),
+        _ if command.starts_with("catradio get ") => {
+            let ch = command_channel(command).unwrap_or(1).clamp(1, 2);
+            CommandOutcome::ok(response_line(seq, 0, catradio_body(ch)))
+        }
+        _ if command.starts_with("catradio set ") => CommandOutcome::ok(response_line(seq, 0, "")),
+        "flexradio list" => {
+            let (radio, final_response) = flexradio_list_lines(seq, state).await;
+            CommandOutcome::with_pushes(radio, vec![final_response])
+        }
+        "flexradio read" => {
+            let (ch1, ch2) = flexradio_read_lines(seq, state).await;
+            CommandOutcome::with_pushes(ch1, vec![ch2])
+        }
+        _ if command.starts_with("flexradio get ") => {
+            let ch = command_channel(command).unwrap_or(1).clamp(1, 2);
+            CommandOutcome::ok(flexradio_get_line(seq, state, ch).await)
+        }
+        _ if command.starts_with("flexradio set ") => {
+            record_flexradio_set(command, state).await;
+            CommandOutcome::ok(response_line(seq, 0, ""))
+        }
+        _ if command.starts_with("operate set=") => {
+            let requested = command_bool(command, "set");
+            if let Some(operate) = requested {
+                let mut guard = state.write().await;
+                guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.control_requested_count =
+                    guard.controls.control_requested_count.saturating_add(1);
+                guard.controls.last_tgxl_control_command = Some(command.to_string());
+                guard.controls.last_mapped_elecraft_action =
+                    Some(format!("TGXL operate set={}", bool_int(operate)));
+                guard.controls.last_safety_decision =
+                    Some("tgxl_operate_state_requested".to_string());
+                guard.tuner.operate = operate;
+                CommandOutcome::ok(response_line(seq, 0, ""))
+            } else {
+                CommandOutcome {
+                    response: response_line(seq, 2, "error=invalid_operate"),
+                    pushes: Vec::new(),
+                    unknown: false,
+                    unsupported: true,
+                }
+            }
+        }
+        _ if command.starts_with("bypass set=") => {
+            let requested = command_bool(command, "set");
+            if let Some(bypass) = requested {
+                let mut guard = state.write().await;
+                guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.control_requested_count =
+                    guard.controls.control_requested_count.saturating_add(1);
+                guard.controls.last_tgxl_control_command = Some(command.to_string());
+                guard.controls.last_mapped_elecraft_action = Some(if bypass {
+                    "KAT500 BYP;".to_string()
+                } else {
+                    "KAT500 BYPN;".to_string()
+                });
+                guard.controls.last_safety_decision = Some("desired_bypass_requested".to_string());
+                guard.desired.tuner_bypass = Some(bypass);
+                drop(guard);
+                append_evidence_json(
+                    "control-events.jsonl",
+                    &serde_json::json!({
+                        "protocol": "TGXL",
+                        "raw": command,
+                        "mapped_action": if bypass { "KAT500 BYP;" } else { "KAT500 BYPN;" },
+                        "safety_decision": "desired_bypass_requested",
+                    }),
+                );
+                CommandOutcome::ok(response_line(seq, 0, ""))
+            } else {
+                CommandOutcome {
+                    response: response_line(seq, 2, "error=invalid_bypass"),
+                    pushes: Vec::new(),
+                    unknown: false,
+                    unsupported: true,
+                }
+            }
+        }
         "autotune" => {
             {
                 let mut guard = state.write().await;
@@ -367,14 +452,7 @@ async fn handle_command(
             );
             let pushes = vec![state_push(state, aethersdr_compat, control_profile).await];
             sleep(Duration::from_millis(800)).await;
-            CommandOutcome::with_pushes(
-                response_line(
-                    seq,
-                    0,
-                    status_body(state, aethersdr_compat, control_profile).await,
-                ),
-                pushes,
-            )
+            CommandOutcome::with_pushes(response_line(seq, 0, ""), pushes)
         }
         _ if command.starts_with("activate ant=") => {
             let ant = command
@@ -405,13 +483,9 @@ async fn handle_command(
                     format!("RX {command} -> KAT500 AN{ant}; desired_antenna_requested"),
                 );
                 CommandOutcome {
-                    response: response_line(
-                        seq,
-                        0,
-                        status_body_from_tuner(&guard.tuner, aethersdr_compat, control_profile),
-                    ),
+                    response: response_line(seq, 0, ""),
                     pushes: vec![state_push_from_tuner(
-                        &guard.tuner,
+                        &guard,
                         aethersdr_compat,
                         control_profile,
                     )],
@@ -431,11 +505,7 @@ async fn handle_command(
             let result = apply_relay_command(command, state).await;
             match result {
                 Ok(()) => CommandOutcome::with_pushes(
-                    response_line(
-                        seq,
-                        0,
-                        status_body(state, aethersdr_compat, control_profile).await,
-                    ),
+                    response_line(seq, 0, ""),
                     vec![state_push(state, aethersdr_compat, control_profile).await],
                 ),
                 Err(error) => CommandOutcome {
@@ -488,12 +558,98 @@ async fn maybe_start_strict_startup(state: &SharedState, options: &EmulatorOptio
 
 fn info_body(aethersdr_compat: bool) -> String {
     if aethersdr_compat {
-        format!("model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} one_by_three=1")
+        format!(
+            "info serial=EGB-TGXL serial_num=EGB-TGXL version={VERSION} nickname=Tuner_Genius_XL 3way=1 model=TunerGeniusXL one_by_three=1"
+        )
     } else {
         format!(
-            "model=TunerGeniusXL serial_num=EGB-TGXL version={VERSION} firmware={VERSION} one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune"
+            "info serial=EGB-TGXL serial_num=EGB-TGXL version={VERSION} firmware={VERSION} nickname=Tuner_Genius_XL 3way=1 model=TunerGeniusXL one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune,flexradio,catradio,setup"
         )
     }
+}
+
+fn network_body() -> &'static str {
+    "ifconf dhcp=1 ip=0.0.0.0 netmask=255.255.255.0 gateway=0.0.0.0"
+}
+
+fn setup_body() -> &'static str {
+    "setup nickname=Tuner_Genius_XL code= backlight=128 bypass1=0 bypass2=0 tuneptt1=1 tuneptt2=1"
+}
+
+fn catradio_body(ch: u8) -> String {
+    format!("catradio ch={ch} active=0 type=KENWOOD baud=4800 control=8N2 civ=0")
+}
+
+async fn flexradio_list_lines(seq: u32, state: &SharedState) -> (String, String) {
+    let guard = state.read().await;
+    let serial = guard
+        .radio_context
+        .radio_serial
+        .as_deref()
+        .unwrap_or("EGB-FLEX");
+    let nickname = guard
+        .radio_context
+        .radio_nickname
+        .as_deref()
+        .unwrap_or("FlexRadio");
+    let callsign = guard.radio_context.radio_callsign.as_deref().unwrap_or("");
+    (
+        response_line(
+            seq,
+            0,
+            format!("radio serial={serial} nickname={nickname} callsign={callsign}"),
+        ),
+        response_line(seq, 0, ""),
+    )
+}
+
+async fn flexradio_read_lines(seq: u32, state: &SharedState) -> (String, String) {
+    (
+        flexradio_get_line(seq, state, 1).await,
+        flexradio_get_line(seq, state, 2).await,
+    )
+}
+
+async fn flexradio_get_line(seq: u32, state: &SharedState, ch: u8) -> String {
+    let guard = state.read().await;
+    let serial = guard
+        .radio_context
+        .radio_serial
+        .as_deref()
+        .unwrap_or("EGB-FLEX");
+    let antenna = if ch == 2 {
+        guard.radio_context.tx_antenna.as_deref().unwrap_or("ANT2")
+    } else {
+        guard.radio_context.tx_antenna.as_deref().unwrap_or("ANT1")
+    };
+    response_line(
+        seq,
+        0,
+        format!("flexradio ch={ch} active=1 serial={serial} antenna={antenna} source=LAN"),
+    )
+}
+
+async fn record_flexradio_set(command: &str, state: &SharedState) {
+    let mut guard = state.write().await;
+    guard.controls.aethersdr_button_command_seen = true;
+    guard.controls.control_requested_count =
+        guard.controls.control_requested_count.saturating_add(1);
+    guard.controls.last_tgxl_control_command = Some(command.to_string());
+    guard.controls.last_mapped_elecraft_action = Some("TGXL flexradio config update".to_string());
+    guard.controls.last_safety_decision = Some("tgxl_flexradio_config_accepted".to_string());
+    if let Some(serial) = command_token(command, "serial") {
+        guard.radio_context.radio_serial = Some(serial.to_string());
+    }
+    if let Some(antenna) = command_token(command, "antenna") {
+        guard.radio_context.tx_antenna = Some(antenna.to_string());
+    }
+    guard.radio_context.source = Some("tgxl_flexradio_set".to_string());
+    guard.radio_context.updated_at = Some(SystemTime::now());
+    drop(guard);
+    append_evidence_line(
+        "tgxl-flexradio-command-samples.log",
+        format!("RX {command} -> accepted"),
+    );
 }
 
 async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &'static str> {
@@ -540,11 +696,16 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
     Ok(())
 }
 
-async fn status_body(state: &SharedState, aethersdr_compat: bool, control_profile: &str) -> String {
+async fn status_line(
+    seq: u32,
+    state: &SharedState,
+    aethersdr_compat: bool,
+    control_profile: &str,
+) -> String {
     let (body, advertised_operate) = {
         let guard = state.read().await;
         (
-            status_body_from_tuner(&guard.tuner, aethersdr_compat, control_profile),
+            status_body_from_state(&guard, aethersdr_compat, control_profile),
             advertised_operate_from_tuner(&guard.tuner, aethersdr_compat, control_profile),
         )
     };
@@ -556,36 +717,61 @@ async fn status_body(state: &SharedState, aethersdr_compat: bool, control_profil
         let mut guard = state.write().await;
         guard.flex_injection.last_advertised_tgxl_operate = Some(advertised_operate);
     }
-    body
+    let line = format!("S{seq}|status {body}\n");
+    append_evidence_line("tgxl-status-samples.log", line.trim_end());
+    line
 }
 
-fn status_body_from_tuner(
-    tuner: &bridge_core::TunerState,
+fn status_body_from_state(
+    state: &bridge_core::state::BridgeState,
     aethersdr_compat: bool,
     control_profile: &str,
 ) -> String {
+    let tuner = &state.tuner;
     let fwd = watts_to_dbm(tuner.forward_power_watts);
+    let peak = fwd;
+    let max = fwd.max(0.0);
     let swr = protocol_swr_value(tuner.swr);
     let degraded = matches!(
         tuner.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
     );
     let operate = advertised_operate_from_tuner(tuner, aethersdr_compat, control_profile);
-    let native = format!(
-        "operate={} bypass={} tuning={} relayC1={} relayL={} relayC2={} antA={} one_by_three=1 fwd={fwd:.4} swr={swr:.4}",
-        bool_int(operate),
+    let frequency_mhz = state
+        .radio_context
+        .frequency_hz
+        .map(|hz| hz as f64 / 1_000_000.0)
+        .unwrap_or(0.0);
+    let band = band_number(state.radio_context.band);
+    let flex = state
+        .radio_context
+        .radio_nickname
+        .as_deref()
+        .unwrap_or("FlexRadio");
+    let mode = if state.radio_context.frequency_hz.is_some() {
+        1
+    } else {
+        0
+    };
+    let ant = tuner.selected_antenna.unwrap_or(0);
+    let status = format!(
+        "fwd={fwd:.2} peak={peak:.2} max={max:.2} swr={swr:.4} \
+pttA=0 bandA={band} modeA={mode} flexA={flex} freqA={frequency_mhz:.6} bypassA={} bypassRxA=0 antA={ant} \
+pttB=0 bandB=0 modeB=0 flexB= freqB=0.000 bypassB=0 bypassRxB=0 antB=0 \
+state={} active=1 tuning={} bypass={} ag=0 relayC1={} relayL={} relayC2={}",
         bool_int(tuner.bypass),
+        bool_int(operate),
         bool_int(tuner.tuning || degraded),
+        bool_int(tuner.bypass),
         tuner.relay_c1,
         tuner.relay_l,
-        tuner.relay_c2,
-        tuner.selected_antenna.unwrap_or(0)
+        tuner.relay_c2
     );
     if aethersdr_compat {
-        native
+        status
     } else {
         format!(
-            "{native} connection_state={} fault={}",
+            "{status} connection_state={} fault={}",
             tuner.connection_state.as_str(),
             tuner
                 .fault
@@ -615,18 +801,53 @@ fn advertised_operate_from_tuner(
 
 async fn state_push(state: &SharedState, aethersdr_compat: bool, control_profile: &str) -> String {
     let guard = state.read().await;
-    state_push_from_tuner(&guard.tuner, aethersdr_compat, control_profile)
+    state_push_from_tuner(&guard, aethersdr_compat, control_profile)
 }
 
 fn state_push_from_tuner(
-    tuner: &bridge_core::TunerState,
+    state: &bridge_core::state::BridgeState,
     aethersdr_compat: bool,
     control_profile: &str,
 ) -> String {
     format!(
-        "S0|state {}\n",
-        status_body_from_tuner(tuner, aethersdr_compat, control_profile)
+        "S0|status {}\n",
+        status_body_from_state(state, aethersdr_compat, control_profile)
     )
+}
+
+fn band_number(band: bridge_core::Band) -> u16 {
+    match band {
+        bridge_core::Band::M160 => 160,
+        bridge_core::Band::M80 => 80,
+        bridge_core::Band::M60 => 60,
+        bridge_core::Band::M40 => 40,
+        bridge_core::Band::M30 => 30,
+        bridge_core::Band::M20 => 20,
+        bridge_core::Band::M17 => 17,
+        bridge_core::Band::M15 => 15,
+        bridge_core::Band::M12 => 12,
+        bridge_core::Band::M10 => 10,
+        bridge_core::Band::M6 => 6,
+        bridge_core::Band::Unknown => 0,
+    }
+}
+
+fn command_token<'a>(command: &'a str, key: &str) -> Option<&'a str> {
+    command
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(&format!("{key}=")))
+}
+
+fn command_channel(command: &str) -> Option<u8> {
+    command_token(command, "ch")?.parse().ok()
+}
+
+fn command_bool(command: &str, key: &str) -> Option<bool> {
+    match command_token(command, key)? {
+        "1" | "true" | "True" | "TRUE" => Some(true),
+        "0" | "false" | "False" | "FALSE" => Some(false),
+        _ => None,
+    }
 }
 
 struct SessionStats {
@@ -982,10 +1203,12 @@ mod tests {
     #[tokio::test]
     async fn status_contains_aethersdr_fields() {
         let state = shared_mock_state();
-        let body = status_body(&state, false, "readonly").await;
-        assert!(body.contains("operate=0"));
-        assert!(body.contains("relayC1="));
-        assert!(body.contains("one_by_three=1"));
+        let line = status_line(2, &state, false, "readonly").await;
+        assert!(line.starts_with("S2|status "));
+        assert!(line.contains("state=0"));
+        assert!(line.contains("freqA=14.200000"));
+        assert!(line.contains("bandA=20"));
+        assert!(line.contains("relayC1="));
     }
 
     #[tokio::test]
@@ -1007,55 +1230,68 @@ mod tests {
     #[tokio::test]
     async fn golden_tgxl_mock_status_response_is_stable() {
         let state = shared_mock_state();
-        let body = status_body(&state, false, "readonly").await;
         assert_eq!(
-            response_line(2, 0, body),
-            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000 connection_state=connected fault=\n"
+            status_line(2, &state, false, "readonly").await,
+            "S2|status fwd=-120.00 peak=-120.00 max=0.00 swr=-30.0000 pttA=0 bandA=20 modeA=1 flexA=FlexRadio freqA=14.200000 bypassA=0 bypassRxA=0 antA=0 pttB=0 bandB=0 modeB=0 flexB= freqB=0.000 bypassB=0 bypassRxB=0 antB=0 state=0 active=1 tuning=0 bypass=0 ag=0 relayC1=20 relayL=35 relayC2=20 connection_state=connected fault=\n"
         );
     }
 
     #[tokio::test]
     async fn mock_status_reports_return_loss_not_swr_ratio() {
         let state = shared_mock_state();
-        let body = status_body(&state, false, "readonly").await;
-        assert!(body.contains("swr=-30.0000"));
-        assert!(!body.contains("swr=32."));
+        let line = status_line(2, &state, false, "readonly").await;
+        assert!(line.contains("swr=-30.0000"));
+        assert!(!line.contains("swr=32."));
     }
 
     #[test]
     fn golden_tgxl_info_response_is_stable() {
         assert_eq!(
             response_line(1, 0, info_body(false)),
-            "R1|0|model=TunerGeniusXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl firmware=0.1.0-egb-tgxl one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune\n"
+            "R1|0|info serial=EGB-TGXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl firmware=0.1.0-egb-tgxl nickname=Tuner_Genius_XL 3way=1 model=TunerGeniusXL one_by_three=1 capabilities=direct_tcp,status,autotune,ant,manual_tune,flexradio,catradio,setup\n"
         );
     }
 
     #[tokio::test]
     async fn aethersdr_compat_status_removes_unverified_fields() {
         let state = shared_mock_state();
-        let body = status_body(&state, true, "readonly").await;
         assert_eq!(
-            response_line(2, 0, body),
-            "R2|0|operate=0 bypass=0 tuning=0 relayC1=20 relayL=35 relayC2=20 antA=0 one_by_three=1 fwd=-120.0000 swr=-30.0000\n"
+            status_line(2, &state, true, "readonly").await,
+            "S2|status fwd=-120.00 peak=-120.00 max=0.00 swr=-30.0000 pttA=0 bandA=20 modeA=1 flexA=FlexRadio freqA=14.200000 bypassA=0 bypassRxA=0 antA=0 pttB=0 bandB=0 modeB=0 flexB= freqB=0.000 bypassB=0 bypassRxB=0 antB=0 state=0 active=1 tuning=0 bypass=0 ag=0 relayC1=20 relayL=35 relayC2=20\n"
         );
     }
 
     #[tokio::test]
     async fn control_ready_profile_advertises_operate_for_ui_enablement() {
         let state = shared_mock_state();
-        let body = status_body(&state, true, "control_ready").await;
-        assert!(body.contains("operate=1"));
-        let body = status_body(&state, true, "verbose_control").await;
-        assert!(body.contains("operate=1"));
-        let body = status_body(&state, true, "tgxl_control_ready").await;
-        assert!(body.contains("operate=1"));
+        let body = status_line(2, &state, true, "control_ready").await;
+        assert!(body.contains("state=1"));
+        let body = status_line(2, &state, true, "verbose_control").await;
+        assert!(body.contains("state=1"));
+        let body = status_line(2, &state, true, "tgxl_control_ready").await;
+        assert!(body.contains("state=1"));
     }
 
     #[test]
     fn aethersdr_compat_info_removes_capabilities() {
         assert_eq!(
             response_line(1, 0, info_body(true)),
-            "R1|0|model=TunerGeniusXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl one_by_three=1\n"
+            "R1|0|info serial=EGB-TGXL serial_num=EGB-TGXL version=0.1.0-egb-tgxl nickname=Tuner_Genius_XL 3way=1 model=TunerGeniusXL one_by_three=1\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn flexradio_read_uses_radio_context() {
+        let state = shared_mock_state();
+        {
+            let mut guard = state.write().await;
+            guard.radio_context.radio_serial = Some("4315-5050-6700-6206".to_string());
+            guard.radio_context.tx_antenna = Some("ANT2".to_string());
+        }
+        let line = flexradio_get_line(7, &state, 1).await;
+        assert_eq!(
+            line,
+            "R7|0|flexradio ch=1 active=1 serial=4315-5050-6700-6206 antenna=ANT2 source=LAN\n"
         );
     }
 }
