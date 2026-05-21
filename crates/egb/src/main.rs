@@ -115,6 +115,12 @@ enum Commands {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
     },
+    SimulateControl {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, value_enum)]
+        action: SimulatedControlAction,
+    },
     ListSerial,
     TestKpa {
         #[arg(long, default_value = "config.yaml")]
@@ -228,6 +234,14 @@ enum SerialTerminator {
     Crlf,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SimulatedControlAction {
+    Tune,
+    Standby,
+    Operate,
+    FlexOperate,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -338,6 +352,10 @@ async fn main() -> Result<()> {
                 cfg.flex_injection.enabled
             );
             Ok(())
+        }
+        Commands::SimulateControl { config, action } => {
+            let cfg = BridgeConfig::load(&config)?;
+            simulate_control(&cfg, action)
         }
         Commands::ListSerial => {
             list_serial_ports()?;
@@ -928,6 +946,40 @@ fn effective_kpa_allow_rf_risk(cfg: &BridgeConfig) -> bool {
 
 fn effective_kat_allow_rf_risk(cfg: &BridgeConfig) -> bool {
     effective_control_policy(cfg).effective_kat_allow_rf_risk
+}
+
+fn simulate_control(cfg: &BridgeConfig, action: SimulatedControlAction) -> Result<()> {
+    cfg.validate()?;
+    let policy = effective_control_policy(cfg);
+    let (source, mapped, allowed, reason) = match action {
+        SimulatedControlAction::Tune => (
+            "TGXL direct autotune",
+            "KAT500 T;",
+            policy.effective_kat_tune_enabled,
+            policy.kat_tune_reason.as_str(),
+        ),
+        SimulatedControlAction::Standby => (
+            "PGXL/Flex standby",
+            "KPA500 ^OS0;",
+            policy.effective_kpa_standby_enabled,
+            policy.kpa_standby_reason.as_str(),
+        ),
+        SimulatedControlAction::Operate | SimulatedControlAction::FlexOperate => (
+            "Flex amplifier set operate=1",
+            "KPA500 ^OS1;",
+            policy.effective_kpa_operate_enabled,
+            policy.kpa_operate_reason.as_str(),
+        ),
+    };
+    println!("simulation_source={source}");
+    println!("mapped_elecraft_command={mapped}");
+    println!("allowed={allowed}");
+    println!("decision={}", if allowed { "would_execute" } else { "blocked" });
+    println!("reason={reason}");
+    println!("operational_override_active={}", policy.operational_override_active);
+    println!("raw_kpa_dry_run={}", policy.raw_kpa_dry_run);
+    println!("raw_kat_dry_run={}", policy.raw_kat_dry_run);
+    Ok(())
 }
 
 async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
@@ -3528,33 +3580,33 @@ fn tuner_mode_label(tuner: &bridge_core::TunerState) -> &'static str {
 
 fn pgxl_lifecycle_json(guard: &bridge_core::state::BridgeState) -> serde_json::Value {
     let (state, reason) = if !guard.flex_injection.enabled {
-        ("not_advertised", "Flex amplifier injection is disabled")
+        ("NOT_STARTED", "Flex amplifier injection is disabled")
     } else if guard.flex_injection.amplifier_handle.is_none() {
         if guard.flex_injection.amplifier_create_accepted {
             (
-                "flex_accepted",
+                "FLEX_ACCEPTED",
                 "Flex accepted amplifier create; waiting for amplifier handle/status",
             )
         } else if guard.flex_injection.amplifier_create_sent {
             (
-                "advertised_to_flex",
+                "AMP_ADVERTISED",
                 "Amplifier create sent; waiting for Flex response",
             )
         } else {
-            ("not_advertised", "Waiting to advertise amplifier to Flex")
+            ("FLEX_CONNECTED", "Waiting to advertise amplifier to Flex")
         }
     } else if guard.clients.pgxl_client_count > 0 && guard.clients.pgxl_session_started_count > 0 {
         if guard.protocol.pgxl.parse_failures == 0 && guard.protocol.pgxl.unknown_commands == 0 {
-            ("stable", "PGXL TCP connected with no protocol errors")
+            ("PGXL_STABLE", "PGXL TCP connected with no protocol errors")
         } else {
             (
-                "degraded",
+                "PGXL_DEGRADED",
                 "PGXL TCP connected but protocol counters show errors",
             )
         }
     } else if guard.clients.pgxl_session_started_count > 0 {
         (
-            "pgxl_tcp_connected",
+            "PGXL_CONNECTED",
             guard
                 .clients
                 .pgxl_last_disconnect_reason
@@ -3566,21 +3618,33 @@ fn pgxl_lifecycle_json(guard: &bridge_core::state::BridgeState) -> serde_json::V
         .amplifier_pgxl_tcp_attempted_after_status
     {
         (
-            "aethersdr_applet_visible",
+            "PGXL_TCP_PENDING",
             "AetherSDR attempted PGXL TCP after amplifier status",
+        )
+    } else if guard.clients.pgxl_manual_connect_no_socket_attempt_count > 2 {
+        (
+            "PGXL_DEGRADED",
+            "Amplifier is advertised but AetherSDR has not attempted PGXL TCP",
         )
     } else {
         (
-            "flex_accepted",
+            "PGXL_TCP_PENDING",
             "Amplifier handle exists; waiting for AetherSDR PGXL TCP connection",
         )
     };
+    let transition_count = guard
+        .flex_injection
+        .amplifier_reannounce_count
+        .saturating_add(guard.clients.pgxl_session_started_count)
+        .saturating_add(guard.clients.pgxl_manual_connect_no_socket_attempt_count);
     serde_json::json!({
         "state": state,
         "reason": reason,
         "last_disconnect_reason": guard.clients.pgxl_last_disconnect_reason,
         "sessions_started": guard.clients.pgxl_session_started_count,
         "active_clients": guard.clients.pgxl_client_count,
+        "transition_count": transition_count,
+        "last_transition_at_ms": system_time_ms(guard.flex_injection.amplifier_last_seen_at.or(guard.amp.last_successful_poll_at)),
     })
 }
 
@@ -4614,6 +4678,7 @@ mod tests {
         assert!(names.contains(&"aethersdr-smoke-test".to_string()));
         assert!(names.contains(&"aethersdr-operational-test".to_string()));
         assert!(names.contains(&"full-operational-test".to_string()));
+        assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
         assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));
@@ -4652,6 +4717,20 @@ mod tests {
         assert!(policy.effective_kat_allow_rf_risk);
         assert!(policy.effective_kpa_allow_control);
         assert!(!policy.effective_kpa_allow_rf_risk);
+    }
+
+    #[test]
+    fn simulate_control_uses_effective_policy() {
+        let mut cfg = BridgeConfig::default();
+        cfg.kat500.dry_run = true;
+        cfg.operational.enable_real_controls = true;
+        cfg.operational.enable_kat_tune = true;
+        cfg.operational.confirm_real_hardware_control = "I understand".to_string();
+        assert!(simulate_control(&cfg, SimulatedControlAction::Tune).is_ok());
+
+        let mut blocked = cfg.clone();
+        blocked.operational.confirm_real_hardware_control = "not confirmed".to_string();
+        assert!(blocked.validate().is_err());
     }
 
     #[test]

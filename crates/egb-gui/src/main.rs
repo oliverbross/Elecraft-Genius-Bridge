@@ -286,6 +286,19 @@ impl GuiApp {
         });
     }
 
+    fn run_simulator(&mut self, label: &'static str, action: &'static str) {
+        self.run_egb_command(
+            label,
+            vec![
+                "simulate-control".into(),
+                "--config".into(),
+                self.config_path.display().to_string(),
+                "--action".into(),
+                action.into(),
+            ],
+        );
+    }
+
     fn scan_serial_ports(&mut self) {
         let tx = self.tx.clone();
         thread::spawn(move || {
@@ -423,7 +436,14 @@ impl eframe::App for GuiApp {
                 ui.separator();
                 nav_button(ui, &mut self.tab, Tab::Dashboard, "Dashboard");
                 nav_button(ui, &mut self.tab, Tab::Setup, "Setup");
-                nav_button(ui, &mut self.tab, Tab::Diagnostics, "Diagnostics");
+                nav_button(ui, &mut self.tab, Tab::Support, "Support");
+                ui.separator();
+                ui.checkbox(&mut self.settings.advanced_diagnostics, "Advanced Diagnostics");
+                if self.settings.advanced_diagnostics {
+                    nav_button(ui, &mut self.tab, Tab::Diagnostics, "Diagnostics");
+                } else if self.tab == Tab::Diagnostics {
+                    self.tab = Tab::Dashboard;
+                }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     process_badge(
                         ui,
@@ -435,6 +455,7 @@ impl eframe::App for GuiApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Dashboard => self.ui_dashboard(ui),
             Tab::Setup => self.ui_setup_simple(ui),
+            Tab::Support => self.ui_support(ui),
             Tab::Diagnostics => self.ui_diagnostics(ui),
         });
         self.ui_progress_modal(ctx);
@@ -532,6 +553,7 @@ impl GuiApp {
     }
 
     fn ui_dashboard(&mut self, ui: &mut egui::Ui) {
+        self.ui_status_banner(ui);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_sized([230.0, 44.0], egui::Button::new("Start Operational Bridge"))
@@ -623,6 +645,9 @@ impl GuiApp {
                 );
             });
         }
+        if let Some(status) = &self.status {
+            self.ui_readiness_score(ui, status);
+        }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             self.summary_card(
@@ -695,6 +720,128 @@ impl GuiApp {
             });
     }
 
+    fn ui_status_banner(&self, ui: &mut egui::Ui) {
+        let (message, color) = self.status_banner();
+        egui::Frame::none()
+            .fill(color)
+            .rounding(8.0)
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(message)
+                        .color(egui::Color32::WHITE)
+                        .size(17.0)
+                        .strong(),
+                );
+            });
+        ui.add_space(8.0);
+    }
+
+    fn status_banner(&self) -> (String, egui::Color32) {
+        if let Some(error) = &self.status_error {
+            return (
+                format!("Bridge status unavailable: {error}"),
+                egui::Color32::from_rgb(126, 88, 22),
+            );
+        }
+        let Some(status) = &self.status else {
+            return (
+                "Bridge stopped or waiting for /status".to_string(),
+                egui::Color32::from_rgb(65, 73, 89),
+            );
+        };
+        if !runtime_build_matches(status) {
+            return (
+                "Runtime mismatch - use Clean restart bridge".to_string(),
+                egui::Color32::from_rgb(150, 42, 42),
+            );
+        }
+        if status.amp.advertisement_waiting_for_first_poll.unwrap_or(false)
+            || status.amp.first_poll_completed == Some(false)
+        {
+            return (
+                "Waiting for first KPA500 poll".to_string(),
+                egui::Color32::from_rgb(126, 88, 22),
+            );
+        }
+        if status.flex_injection.connection_state == "degraded" {
+            return (
+                format!(
+                    "Flex injection degraded: {}",
+                    status
+                        .flex_injection
+                        .degraded_reason
+                        .as_deref()
+                        .unwrap_or("reason unavailable")
+                ),
+                egui::Color32::from_rgb(126, 88, 22),
+            );
+        }
+        if matches!(
+            status.pgxl_lifecycle.state.as_str(),
+            "PGXL_TCP_PENDING" | "PGXL_FLAPPING" | "PGXL_DEGRADED"
+        ) {
+            return (
+                format!("PGXL {}", status.pgxl_lifecycle.state),
+                egui::Color32::from_rgb(126, 88, 22),
+            );
+        }
+        if status.clients.pgxl_connected || status.clients.tgxl_connected {
+            if status.controls.control_requested_count == 0 {
+                return (
+                    "AetherSDR connected - no control commands received yet".to_string(),
+                    egui::Color32::from_rgb(37, 90, 133),
+                );
+            }
+            return (
+                "Bridge operational - client controls have reached EGB".to_string(),
+                egui::Color32::from_rgb(30, 112, 73),
+            );
+        }
+        (
+            "Bridge operational - waiting for AetherSDR/SmartSDR clients".to_string(),
+            egui::Color32::from_rgb(37, 90, 133),
+        )
+    }
+
+    fn ui_readiness_score(&self, ui: &mut egui::Ui, status: &StatusSnapshot) {
+        let serial_ok = status.amp.connection_state == "connected"
+            && status.tuner.connection_state == "connected";
+        let flex_ok = status.flex_injection.connection_state == "connected";
+        let pgxl_ok = matches!(
+            status.pgxl_lifecycle.state.as_str(),
+            "PGXL_CONNECTED" | "PGXL_STABLE"
+        );
+        let controls_ok = status.controls.control_requested_count > 0
+            && status.controls.last_executed_elecraft_command.is_some();
+        let overall = if serial_ok && flex_ok && pgxl_ok && controls_ok {
+            "OPERATIONAL"
+        } else if serial_ok && (status.clients.pgxl_connected || status.clients.tgxl_connected) {
+            "PARTIALLY OPERATIONAL"
+        } else {
+            "NOT READY"
+        };
+        ui.group(|ui| {
+            ui.heading("Operational Readiness");
+            field(ui, "Serial layer", readiness_label(serial_ok, "OK", "WARN"));
+            field(ui, "Flex injection", readiness_label(flex_ok, "OK", "WARN"));
+            field(ui, "PGXL lifecycle", &status.pgxl_lifecycle.state);
+            field(
+                ui,
+                "AetherSDR controls",
+                if controls_ok {
+                    "OK"
+                } else if status.controls.control_requested_count > 0 {
+                    "BLOCKED"
+                } else {
+                    "NO COMMANDS SEEN"
+                },
+            );
+            field(ui, "SmartSDR tuner support", "EXPERIMENTAL");
+            field(ui, "Overall", overall);
+        });
+    }
+
     fn summary_card(&self, ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(22, 35, 56))
@@ -765,6 +912,14 @@ impl GuiApp {
                 ui,
                 "Last KPA raw",
                 amp.and_then(|a| a.last_raw_response.as_deref()).unwrap_or("-"),
+            );
+            field(
+                ui,
+                "Serial activity",
+                serial_activity_label(
+                    amp.and_then(|a| a.last_successful_command.as_deref()),
+                    amp.and_then(|a| a.last_raw_response.as_deref()),
+                ),
             );
             field(
                 ui,
@@ -918,6 +1073,14 @@ impl GuiApp {
                     .and_then(|t| t.unsolicited_count)
                     .map(|count| count.to_string())
                     .unwrap_or_else(|| "trace logs".to_string()),
+            );
+            field(
+                ui,
+                "Serial activity",
+                serial_activity_label(
+                    tuner.and_then(|t| t.last_successful_command.as_deref()),
+                    tuner.and_then(|t| t.last_raw_response.as_deref()),
+                ),
             );
             field(
                 ui,
@@ -1138,6 +1301,11 @@ impl GuiApp {
                 field(ui, "PGXL reason", &status.pgxl_lifecycle.reason);
                 field(
                     ui,
+                    "PGXL transitions",
+                    status.pgxl_lifecycle.transition_count.to_string(),
+                );
+                field(
+                    ui,
                     "TGXL clients",
                     status.clients.tgxl_client_count.to_string(),
                 );
@@ -1284,6 +1452,11 @@ impl GuiApp {
                     ui,
                     "Button command seen",
                     bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                );
+                field(
+                    ui,
+                    "Command source",
+                    control_source_label(&status.controls),
                 );
                 field(
                     ui,
@@ -1793,33 +1966,158 @@ impl GuiApp {
             field(ui, "KPA Operate", bool_text(Some(preview.kpa_operate)));
         });
 
+        if self.settings.advanced_diagnostics {
+            ui.separator();
+            ui.collapsing("Advanced Diagnostics", |ui| {
+                ui.label(
+                    "Lab and protocol settings are intentionally hidden from the normal workflow.",
+                );
+                if ui.button("Open /status").clicked() {
+                    open_url(&format!(
+                        "http://{}:{}/status",
+                        self.config.metrics.bind_ip, self.config.metrics.port
+                    ));
+                }
+                if ui.button("Open Logs Folder").clicked() {
+                    open_path(Path::new("logs"));
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Config file");
+                    let mut path = self.config_path.display().to_string();
+                    if ui.text_edit_singleline(&mut path).changed() {
+                        self.config_path = PathBuf::from(path);
+                    }
+                    if ui.button("Load").clicked() {
+                        self.load_config();
+                    }
+                    if ui.button("Validate").clicked() {
+                        self.validate_config();
+                    }
+                });
+            });
+        }
+    }
+
+    fn ui_support(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Support");
+        ui.label("Create one support bundle with the active status, config identity, logs, and recent diagnostics.");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_sized([210.0, 40.0], egui::Button::new("Create Support Bundle"))
+                .clicked()
+            {
+                match self.export_diagnostics_bundle() {
+                    Ok(path) => {
+                        self.latest_evidence_bundle = Some(path.clone());
+                        self.support_bundle_modal = Some(path.clone());
+                        self.push_log(format!("support bundle written to {}", path.display()));
+                    }
+                    Err(err) => self.push_log(format!("support bundle failed: {err}")),
+                }
+            }
+            if ui.button("Open Evidence Folder").clicked() {
+                open_path(Path::new("diagnostics"));
+            }
+            if let Some(path) = &self.latest_evidence_bundle {
+                if ui.button("Copy Latest Bundle Path").clicked() {
+                    ui.output_mut(|out| out.copied_text = path.display().to_string());
+                }
+            }
+        });
+        if let Some(path) = &self.latest_evidence_bundle {
+            field(ui, "Latest bundle", path.display().to_string());
+        } else {
+            field(ui, "Latest bundle", "none created in this GUI session");
+        }
         ui.separator();
-        ui.collapsing("Advanced Diagnostics", |ui| {
-            ui.label(
-                "Lab and protocol settings are intentionally hidden from the normal workflow.",
-            );
-            if ui.button("Open /status").clicked() {
-                open_url(&format!(
-                    "http://{}:{}/status",
-                    self.config.metrics.bind_ip, self.config.metrics.port
-                ));
+        ui.group(|ui| {
+            ui.heading("Command Visibility");
+            if let Some(status) = &self.status {
+                field(
+                    ui,
+                    "Any client command arrived",
+                    bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                );
+                field(ui, "Source", control_source_label(&status.controls));
+                field(
+                    ui,
+                    "TGXL direct",
+                    status
+                        .controls
+                        .last_tgxl_control_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "PGXL direct",
+                    status
+                        .controls
+                        .last_pgxl_control_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Flex API",
+                    status
+                        .controls
+                        .last_flex_amp_set_command
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Mapped Elecraft",
+                    status
+                        .controls
+                        .last_mapped_elecraft_action
+                        .as_deref()
+                        .unwrap_or("-"),
+                );
+                field(
+                    ui,
+                    "Executed / Blocked",
+                    status
+                        .controls
+                        .last_executed_elecraft_command
+                        .as_deref()
+                        .or(status.controls.last_safety_decision.as_deref())
+                        .unwrap_or("-"),
+                );
+            } else {
+                ui.label("Start the bridge to see live command visibility.");
             }
-            if ui.button("Open Logs Folder").clicked() {
-                open_path(Path::new("logs"));
-            }
-            ui.horizontal(|ui| {
-                ui.label("Config file");
-                let mut path = self.config_path.display().to_string();
-                if ui.text_edit_singleline(&mut path).changed() {
-                    self.config_path = PathBuf::from(path);
+        });
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading("Built-In Command Simulator");
+            ui.label("These checks validate EGB command mapping without relying on AetherSDR button enablement.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Simulate Tune").clicked() {
+                    self.run_simulator("simulate-tune", "tune");
                 }
-                if ui.button("Load").clicked() {
-                    self.load_config();
+                if ui.button("Simulate Standby").clicked() {
+                    self.run_simulator("simulate-standby", "standby");
                 }
-                if ui.button("Validate").clicked() {
-                    self.validate_config();
+                if ui.button("Simulate Operate").clicked() {
+                    self.run_simulator("simulate-operate", "operate");
+                }
+                if ui.button("Simulate Flex amplifier set").clicked() {
+                    self.run_simulator("simulate-flex-operate", "flex-operate");
                 }
             });
+        });
+        ui.separator();
+        ui.group(|ui| {
+            ui.heading("Recent GUI Log");
+            egui::ScrollArea::vertical()
+                .max_height(240.0)
+                .show(ui, |ui| {
+                    for line in self.diagnostics.iter().rev().take(80) {
+                        ui.monospace(line);
+                    }
+                });
         });
     }
 
@@ -2501,6 +2799,7 @@ impl GuiApp {
 enum Tab {
     Dashboard,
     Setup,
+    Support,
     Diagnostics,
 }
 
@@ -2510,6 +2809,8 @@ struct GuiSettings {
     start_minimized_to_tray: bool,
     close_to_tray: bool,
     redact_diagnostics: bool,
+    #[serde(default)]
+    advanced_diagnostics: bool,
 }
 
 impl Default for GuiSettings {
@@ -2519,6 +2820,7 @@ impl Default for GuiSettings {
             start_minimized_to_tray: false,
             close_to_tray: true,
             redact_diagnostics: true,
+            advanced_diagnostics: false,
         }
     }
 }
@@ -3044,6 +3346,10 @@ struct PgxlLifecycleStatus {
     sessions_started: u64,
     #[serde(default)]
     active_clients: usize,
+    #[serde(default)]
+    transition_count: u64,
+    #[serde(default)]
+    last_transition_at_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -3072,6 +3378,7 @@ fn stable_hash_hex(bytes: &[u8]) -> String {
 }
 
 fn support_summary_text(status: &StatusSnapshot) -> String {
+    let readiness = operational_readiness_text(status);
     format!(
         "Elecraft Genius Bridge Support Summary\n\n\
         Bridge: {}\n\
@@ -3081,6 +3388,7 @@ fn support_summary_text(status: &StatusSnapshot) -> String {
         Flex API: {} reason={}\n\
         Controls: kat_tune={} kpa_standby={} kpa_operate={}\n\
         PGXL lifecycle: {} - {}\n\
+        Operational readiness: {}\n\
         Config path: {}\n\
         Config hash match: {:?}\n\
         Bridge executable: {}\n\
@@ -3110,6 +3418,7 @@ fn support_summary_text(status: &StatusSnapshot) -> String {
         status.effective_controls.effective_kpa_operate_enabled,
         status.pgxl_lifecycle.state,
         status.pgxl_lifecycle.reason,
+        readiness,
         status.bridge.config_path.as_deref().unwrap_or("unknown"),
         status.bridge.config_hash_match,
         status
@@ -3119,6 +3428,25 @@ fn support_summary_text(status: &StatusSnapshot) -> String {
             .unwrap_or("unknown"),
         status.bridge.working_dir.as_deref().unwrap_or("unknown"),
     )
+}
+
+fn operational_readiness_text(status: &StatusSnapshot) -> &'static str {
+    let serial_ok =
+        status.amp.connection_state == "connected" && status.tuner.connection_state == "connected";
+    let flex_ok = status.flex_injection.connection_state == "connected";
+    let pgxl_ok = matches!(
+        status.pgxl_lifecycle.state.as_str(),
+        "PGXL_CONNECTED" | "PGXL_STABLE"
+    );
+    let controls_ok = status.controls.control_requested_count > 0
+        && status.controls.last_executed_elecraft_command.is_some();
+    if serial_ok && flex_ok && pgxl_ok && controls_ok {
+        "OPERATIONAL"
+    } else if serial_ok && (status.clients.pgxl_connected || status.clients.tgxl_connected) {
+        "PARTIALLY OPERATIONAL"
+    } else {
+        "NOT READY"
+    }
 }
 
 fn export_diagnostics_bundle(
@@ -3545,10 +3873,39 @@ fn connection_color(state: &str) -> egui::Color32 {
 
 fn pgxl_lifecycle_color_key(state: &str) -> &str {
     match state {
-        "stable" | "pgxl_tcp_connected" => "connected",
-        "degraded" => "degraded",
-        "not_advertised" => "disconnected",
+        "PGXL_STABLE" | "PGXL_CONNECTED" => "connected",
+        "PGXL_FLAPPING" | "PGXL_DEGRADED" => "degraded",
+        "NOT_STARTED" => "disconnected",
         _ => "connecting",
+    }
+}
+
+fn readiness_label(ok: bool, ok_text: &'static str, warn_text: &'static str) -> &'static str {
+    if ok {
+        ok_text
+    } else {
+        warn_text
+    }
+}
+
+fn serial_activity_label(last_command: Option<&str>, last_response: Option<&str>) -> String {
+    match (last_command, last_response) {
+        (Some(command), Some(response)) => format!("TX {command} / RX {response}"),
+        (Some(command), None) => format!("TX {command} / RX waiting"),
+        (None, Some(response)) => format!("RX {response}"),
+        (None, None) => "idle".to_string(),
+    }
+}
+
+fn control_source_label(status: &ControlStatus) -> &'static str {
+    if status.last_flex_amp_set_command.is_some() {
+        "Flex API"
+    } else if status.last_pgxl_control_command.is_some() {
+        "PGXL direct"
+    } else if status.last_tgxl_control_command.is_some() {
+        "TGXL direct"
+    } else {
+        "none"
     }
 }
 
@@ -3817,11 +4174,13 @@ mod tests {
             start_minimized_to_tray: true,
             close_to_tray: true,
             redact_diagnostics: true,
+            advanced_diagnostics: true,
         };
         let text = serde_yaml::to_string(&settings).unwrap();
         let parsed: GuiSettings = serde_yaml::from_str(&text).unwrap();
         assert!(parsed.start_bridge_on_launch);
         assert!(parsed.redact_diagnostics);
+        assert!(parsed.advanced_diagnostics);
     }
 
     #[test]

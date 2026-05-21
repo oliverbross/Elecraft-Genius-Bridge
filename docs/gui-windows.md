@@ -2,13 +2,13 @@
 
 `egb-gui.exe` is a Windows-first desktop companion for Elecraft Genius Bridge. It uses Rust `egui`/`eframe`, not Electron.
 
-Phase 21 redesigns the GUI around a dark operational dashboard with sidebar navigation:
+The normal GUI now uses a simple operational flow with three pages:
 
 - Dashboard
-- Configuration
-- Controls
-- Diagnostics
-- Logs
+- Setup
+- Support
+
+Advanced protocol labs, raw profiles, and detailed diagnostics are hidden until **Advanced Diagnostics** is enabled in the sidebar.
 
 ## Build
 
@@ -43,6 +43,19 @@ Default config loaded by the GUI:
 config.flex-injection-readonly.yaml
 ```
 
+## Normal Workflow
+
+1. Open `egb-gui.exe`.
+2. Use **Setup** to select the KPA500 COM port, KAT500 COM port, Flex radio IP, and this PC's LAN IP.
+3. Choose one operating level:
+   - **Safe mode**: monitor only.
+   - **Operational mode**: KAT500 Tune and KPA500 Standby can be enabled.
+   - **RF-risk mode**: KPA500 Operate can be enabled only with explicit confirmation.
+4. Click **Save Setup**.
+5. Go to **Dashboard** and click **Start Operational Bridge**.
+6. Watch the top banner and readiness cards.
+7. Use **Support** -> **Create Support Bundle** when you need to send evidence for analysis.
+
 ## What The GUI Does
 
 - Edits and validates the bridge YAML config.
@@ -53,9 +66,11 @@ config.flex-injection-readonly.yaml
 - Lists serial ports.
 - Runs read-only KPA500/KAT500 tests through the existing CLI.
 - Runs a KPA500 `^RVM;` serial probe for busy-port/timeout diagnosis.
-- Captures the last 500 GUI/bridge log lines shown in the Logs tab.
+- Captures the last 500 GUI/bridge log lines.
 - Exports ZIP diagnostics bundles under `diagnostics\`.
 - Shows the latest evidence bundle path, current run directory, captured warning/error count, and SmartSDR tuner flap count.
+- Shows command visibility for Flex API, PGXL direct, and TGXL direct control paths.
+- Provides command simulator buttons for Tune, Standby, Operate, and Flex amplifier set. These validate EGB mapping and safety policy without depending on AetherSDR button enablement.
 - Stores GUI settings in `egb-gui-settings.yaml`.
 
 ## Safety Defaults
@@ -69,7 +84,7 @@ config.flex-injection-readonly.yaml
 
 ## KPA500 Troubleshooting
 
-Use Configuration -> `Probe KPA500 ^RVM;`.
+Enable **Advanced Diagnostics**, then use the KPA500 probe or serial diagnostics.
 
 Expected working response:
 
