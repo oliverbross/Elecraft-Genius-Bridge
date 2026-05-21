@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_CONFIG: &str = "config.flex-injection-readonly.yaml";
+const DEFAULT_CONFIG: &str = "config.aethersdr-operational.yaml";
 const LOG_LIMIT: usize = 500;
 const GUI_SETTINGS_PATH: &str = "egb-gui-settings.yaml";
 const GUI_GIT_COMMIT: &str = env!("GIT_HASH");
@@ -426,29 +426,137 @@ impl eframe::App for GuiApp {
         self.poll_status_if_due();
         self.bridge.refresh();
 
+        let is_readonly_config = self.config_path.to_string_lossy().contains("readonly");
+        let operational_mode = self.config.operational.enable_real_controls;
+
         egui::SidePanel::left("nav")
             .resizable(false)
-            .exact_width(190.0)
+            .exact_width(200.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(14, 17, 26))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 36, 52)))
+                    .inner_margin(egui::Margin::same(0.0)),
+            )
             .show(ctx, |ui| {
+                ui.add_space(16.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("EGB")
+                            .size(28.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(100, 175, 255)),
+                    );
+                    ui.label(
+                        egui::RichText::new("Elecraft Genius Bridge")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(120, 135, 160)),
+                    );
+                });
                 ui.add_space(12.0);
-                ui.heading("EGB");
-                ui.label("Elecraft Genius Bridge");
+
+                let process_state =
+                    effective_process_state(self.bridge.state(), self.status.as_ref());
+                let (state_color, state_label) = match process_state {
+                    ProcessState::Running => (egui::Color32::from_rgb(46, 160, 95), "RUNNING"),
+                    ProcessState::Starting => (egui::Color32::from_rgb(220, 170, 50), "STARTING"),
+                    ProcessState::Degraded => (egui::Color32::from_rgb(200, 120, 40), "DEGRADED"),
+                    ProcessState::Stopped => (egui::Color32::from_rgb(100, 110, 130), "STOPPED"),
+                    ProcessState::Error => (egui::Color32::from_rgb(200, 60, 60), "FAILED"),
+                };
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(18, 22, 34))
+                    .inner_margin(egui::Margin::symmetric(16.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(state_label)
+                                .color(state_color)
+                                .size(12.0)
+                                .strong(),
+                        );
+                    });
+                ui.add_space(8.0);
+
+                for (tab, label) in [
+                    (Tab::Dashboard, "Dashboard"),
+                    (Tab::Setup, "Setup"),
+                    (Tab::Support, "Support"),
+                ] {
+                    let selected = self.tab == tab;
+                    let btn = egui::Button::new(egui::RichText::new(label).size(14.0).color(
+                        if selected {
+                            egui::Color32::from_rgb(100, 175, 255)
+                        } else {
+                            egui::Color32::from_rgb(160, 170, 190)
+                        },
+                    ))
+                    .fill(if selected {
+                        egui::Color32::from_rgb(22, 38, 65)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::NONE)
+                    .rounding(egui::Rounding::same(6.0))
+                    .min_size(egui::vec2(184.0, 34.0));
+                    if ui.add(btn).clicked() {
+                        self.tab = tab;
+                    }
+                }
+
+                ui.add_space(4.0);
                 ui.separator();
-                nav_button(ui, &mut self.tab, Tab::Dashboard, "Dashboard");
-                nav_button(ui, &mut self.tab, Tab::Setup, "Setup");
-                nav_button(ui, &mut self.tab, Tab::Support, "Support");
-                ui.separator();
-                ui.checkbox(&mut self.settings.advanced_diagnostics, "Advanced Diagnostics");
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.checkbox(&mut self.settings.advanced_diagnostics, "");
+                    ui.label(
+                        egui::RichText::new("Advanced")
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(120, 135, 160)),
+                    );
+                });
                 if self.settings.advanced_diagnostics {
-                    nav_button(ui, &mut self.tab, Tab::Diagnostics, "Diagnostics");
+                    let selected = self.tab == Tab::Diagnostics;
+                    let btn =
+                        egui::Button::new(egui::RichText::new("Diagnostics").size(14.0).color(
+                            if selected {
+                                egui::Color32::from_rgb(100, 175, 255)
+                            } else {
+                                egui::Color32::from_rgb(160, 170, 190)
+                            },
+                        ))
+                        .fill(if selected {
+                            egui::Color32::from_rgb(22, 38, 65)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        })
+                        .stroke(egui::Stroke::NONE)
+                        .rounding(egui::Rounding::same(6.0))
+                        .min_size(egui::vec2(184.0, 34.0));
+                    if ui.add(btn).clicked() {
+                        self.tab = Tab::Diagnostics;
+                    }
                 } else if self.tab == Tab::Diagnostics {
                     self.tab = Tab::Dashboard;
                 }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    process_badge(
-                        ui,
-                        effective_process_state(self.bridge.state(), self.status.as_ref()),
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "v{}",
+                            GUI_GIT_COMMIT.get(..7).unwrap_or(GUI_GIT_COMMIT)
+                        ))
+                        .size(10.0)
+                        .color(egui::Color32::from_rgb(70, 80, 100)),
                     );
+                    if is_readonly_config && operational_mode {
+                        ui.label(
+                            egui::RichText::new("Readonly config active")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(220, 170, 50)),
+                        );
+                    }
                 });
             });
 
@@ -553,171 +661,193 @@ impl GuiApp {
     }
 
     fn ui_dashboard(&mut self, ui: &mut egui::Ui) {
-        self.ui_status_banner(ui);
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_sized([230.0, 44.0], egui::Button::new("Start Operational Bridge"))
-                .clicked()
-            {
-                self.start_bridge();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            self.ui_status_banner(ui);
+
+            // Readonly config warning
+            if self.config_path.to_string_lossy().contains("readonly") && self.config.operational.enable_real_controls {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(60, 45, 10))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("WARNING: Loaded config contains 'readonly' but operational mode is enabled. Use the recommended operational config from Setup.")
+                            .color(egui::Color32::from_rgb(255, 210, 80)).size(13.0));
+                    });
+                ui.add_space(4.0);
             }
-            if ui.button("Stop").clicked() {
-                self.stop_bridge();
-            }
-            let restart_required = self.restart_required();
-            if ui
-                .add_enabled(
-                    restart_required || self.bridge.is_running(),
-                    egui::Button::new(if restart_required {
-                        "Restart Bridge to Apply"
-                    } else {
-                        "Restart"
-                    }),
-                )
-                .clicked()
-            {
-                self.restart_bridge();
-            }
-            if ui.button("Clean restart bridge").clicked() {
-                self.clean_restart_bridge();
-            }
-            if ui.button("Export Support Bundle").clicked() {
-                match self.export_diagnostics_bundle() {
-                    Ok(path) => {
-                        self.latest_evidence_bundle = Some(path.clone());
-                        self.support_bundle_modal = Some(path.clone());
-                        self.push_log(format!("support bundle written to {}", path.display()));
+
+            // Action bar
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let start_btn = egui::Button::new(egui::RichText::new("Start Bridge").size(14.0).strong())
+                    .fill(egui::Color32::from_rgb(30, 95, 60))
+                    .rounding(egui::Rounding::same(8.0))
+                    .min_size(egui::vec2(140.0, 38.0));
+                if ui.add(start_btn).clicked() {
+                    self.start_bridge();
+                }
+
+                let stop_btn = egui::Button::new(egui::RichText::new("Stop").size(13.0))
+                    .fill(egui::Color32::from_rgb(120, 35, 35))
+                    .rounding(egui::Rounding::same(8.0))
+                    .min_size(egui::vec2(70.0, 38.0));
+                if ui.add(stop_btn).clicked() {
+                    self.stop_bridge();
+                }
+
+                let restart_required = self.restart_required();
+                let restart_label = if restart_required { "Apply & Restart" } else { "Restart" };
+                let restart_btn = egui::Button::new(egui::RichText::new(restart_label).size(13.0))
+                    .fill(egui::Color32::from_rgb(45, 55, 85))
+                    .rounding(egui::Rounding::same(8.0))
+                    .min_size(egui::vec2(120.0, 38.0));
+                if ui.add_enabled(restart_required || self.bridge.is_running(), restart_btn).clicked() {
+                    self.restart_bridge();
+                }
+
+                if ui.add(egui::Button::new("Clean Restart").rounding(egui::Rounding::same(8.0)).min_size(egui::vec2(100.0, 38.0))).clicked() {
+                    self.clean_restart_bridge();
+                }
+
+                if ui.add(egui::Button::new("Export Bundle").rounding(egui::Rounding::same(8.0)).min_size(egui::vec2(100.0, 38.0))).clicked() {
+                    match self.export_diagnostics_bundle() {
+                        Ok(path) => {
+                            self.latest_evidence_bundle = Some(path.clone());
+                            self.support_bundle_modal = Some(path.clone());
+                            self.push_log(format!("support bundle written to {}", path.display()));
+                        }
+                        Err(err) => self.push_log(format!("support bundle failed: {err}")),
                     }
-                    Err(err) => self.push_log(format!("support bundle failed: {err}")),
+                }
+            });
+
+            if let Some(error) = &self.status_error {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!("/status unavailable: {error}")).color(egui::Color32::from_rgb(220, 170, 50)).size(12.0));
+            }
+            if let Some(status) = &self.status {
+                if !runtime_build_matches(status) {
+                    ui.label(egui::RichText::new(format!(
+                        "Runtime mismatch: GUI {} / bridge {}. Use Clean Restart.",
+                        GUI_GIT_COMMIT, status.bridge.git_commit.as_deref().unwrap_or("unknown")
+                    )).color(egui::Color32::from_rgb(220, 70, 70)).size(12.0));
                 }
             }
-        });
-        if let Some(error) = &self.status_error {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                format!("/status unavailable: {error}"),
-            );
-        }
-        if let Some(status) = &self.status {
-            if !runtime_build_matches(status) {
-                ui.colored_label(
-                    egui::Color32::RED,
-                    format!(
-                        "Runtime mismatch: GUI {} / bridge {}. Use Clean restart bridge.",
-                        GUI_GIT_COMMIT,
-                        status.bridge.git_commit.as_deref().unwrap_or("unknown")
-                    ),
-                );
-            }
-        }
-        self.ui_config_state_banner(ui);
-        if let Some(status) = &self.status {
-            ui.horizontal_wrapped(|ui| {
-                field(
-                    ui,
-                    "Last client command",
-                    status
-                        .controls
-                        .last_tgxl_control_command
-                        .as_deref()
-                        .or(status.controls.last_pgxl_control_command.as_deref())
-                        .or(status.controls.last_flex_amp_set_command.as_deref())
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Mapped Elecraft",
-                    status
-                        .controls
-                        .last_mapped_elecraft_action
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Executed/Blocked",
-                    status
-                        .controls
-                        .last_executed_elecraft_command
-                        .as_deref()
-                        .or(status.controls.last_safety_decision.as_deref())
-                        .unwrap_or("-"),
-                );
-            });
-        }
-        if let Some(status) = &self.status {
-            self.ui_readiness_score(ui, status);
-        }
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            self.summary_card(
-                ui,
-                "Bridge",
-                self.bridge.state().label(),
-                self.bridge.state().color(),
-            );
+
+            ui.add_space(4.0);
+            self.ui_config_state_banner(ui);
+
+            // Last command trace
             if let Some(status) = &self.status {
-                self.summary_card(
-                    ui,
-                    "PGXL",
-                    status.pgxl_lifecycle.state.as_str(),
-                    connection_color(pgxl_lifecycle_color_key(&status.pgxl_lifecycle.state)),
-                );
-                self.summary_card(
-                    ui,
-                    "TGXL",
-                    bool_text(Some(status.clients.tgxl_connected)),
-                    status_color(status.clients.tgxl_connected),
-                );
-                self.summary_card(
-                    ui,
-                    "Flex",
-                    &status.flex_injection.connection_state,
-                    connection_color(&status.flex_injection.connection_state),
-                );
-                let hardware_ok = status.amp.connection_state == "connected"
-                    && status.tuner.connection_state == "connected";
-                self.summary_card(
-                    ui,
-                    "Hardware",
-                    if hardware_ok { "OK" } else { "WARN" },
-                    status_color(hardware_ok),
-                );
-                let sockets_ok = status.clients.pgxl_connected && status.clients.tgxl_connected;
-                self.summary_card(
-                    ui,
-                    "Direct sockets",
-                    if sockets_ok { "OK" } else { "WARN" },
-                    status_color(sockets_ok),
-                );
-                let controls_ok = status.effective_controls.operational_override_active
-                    && (status.effective_controls.effective_kat_tune_enabled
-                        || status.effective_controls.effective_kpa_standby_enabled);
-                self.summary_card(
-                    ui,
-                    "Controls",
-                    if controls_ok { "OK" } else { "WARN" },
-                    status_color(controls_ok),
-                );
-                let smartsdr_ok = status.flex_injection.amplifier_handle.is_some();
-                self.summary_card(
-                    ui,
-                    "SmartSDR",
-                    if smartsdr_ok { "AMP OK" } else { "WARN" },
-                    status_color(smartsdr_ok),
-                );
+                ui.add_space(2.0);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(16, 20, 32))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            field_styled(ui, "Command", status.controls.last_tgxl_control_command.as_deref()
+                                .or(status.controls.last_pgxl_control_command.as_deref())
+                                .or(status.controls.last_flex_amp_set_command.as_deref())
+                                .unwrap_or("-"));
+                            field_styled(ui, "Mapped", status.controls.last_mapped_elecraft_action.as_deref().unwrap_or("-"));
+                            field_styled(ui, "Result", status.controls.last_executed_elecraft_command.as_deref()
+                                .or(status.controls.last_safety_decision.as_deref())
+                                .unwrap_or("-"));
+                        });
+                    });
             }
-        });
-        ui.add_space(8.0);
-        egui::Grid::new("dashboard_grid")
-            .num_columns(3)
-            .spacing([14.0, 12.0])
-            .show(ui, |ui| {
-                ui.vertical(|ui| self.ui_kpa_panel(ui));
-                ui.vertical(|ui| self.ui_kat_panel(ui));
-                ui.vertical(|ui| self.ui_flex_card(ui));
-                ui.end_row();
+
+            // Operational Status panel
+            if let Some(status) = &self.status {
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(16, 22, 36))
+                    .rounding(8.0)
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 48, 72)))
+                    .inner_margin(egui::Margin::same(12.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Operational Status").size(15.0).strong().color(egui::Color32::from_rgb(160, 178, 205)));
+                        ui.add_space(4.0);
+
+                        let tune_ok = status.controls.last_executed_elecraft_command.as_deref()
+                            .is_some_and(|cmd| cmd.contains("T;"))
+                            || status.controls.last_mapped_elecraft_action.as_deref()
+                            .is_some_and(|cmd| cmd.contains("T;"));
+                        let tune_color = if tune_ok { egui::Color32::from_rgb(46, 190, 105) } else { egui::Color32::from_rgb(120, 130, 150) };
+                        let tune_label = if tune_ok { "WORKING" } else { "NOT TESTED" };
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("TGXL Tune:").size(13.0).color(egui::Color32::from_rgb(140, 155, 180)));
+                            ui.label(egui::RichText::new(tune_label).size(13.0).strong().color(tune_color));
+                        });
+
+                        let pgxl_pending = status.pgxl_lifecycle.state == "PGXL_TCP_PENDING";
+                        let pgxl_connected = matches!(status.pgxl_lifecycle.state.as_str(), "PGXL_CONNECTED" | "PGXL_STABLE");
+                        let pgxl_color = if pgxl_connected {
+                            egui::Color32::from_rgb(46, 190, 105)
+                        } else if pgxl_pending {
+                            egui::Color32::from_rgb(220, 170, 50)
+                        } else {
+                            egui::Color32::from_rgb(200, 80, 80)
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("PGXL:").size(13.0).color(egui::Color32::from_rgb(140, 155, 180)));
+                            ui.label(egui::RichText::new(&status.pgxl_lifecycle.state).size(13.0).strong().color(pgxl_color));
+                        });
+                        if pgxl_pending {
+                            ui.label(egui::RichText::new("Action: Click PGXL Connect in AetherSDR, or restart AetherSDR. EGB retries every 30s.")
+                                .size(11.5).color(egui::Color32::from_rgb(200, 180, 100)));
+                        }
+
+                        if status.flex_injection.pgxl_connect_assist_enabled {
+                            let real_kpa = status.amp.state.as_deref().unwrap_or("unknown");
+                            let flex_ad = status.flex_injection.last_advertised_flex_amp_state.as_deref().unwrap_or("-");
+                            if flex_ad.to_lowercase().contains("operate") && real_kpa.to_lowercase().contains("standby") {
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(format!("Connect-assist: virtual OPERATE to Flex (real KPA: {real_kpa})"))
+                                    .size(11.0).color(egui::Color32::from_rgb(100, 155, 220)));
+                            }
+                        }
+                    });
+            }
+
+            // Readiness score
+            if let Some(status) = &self.status {
+                ui.add_space(6.0);
+                self.ui_readiness_score(ui, status);
+            }
+
+            // Summary cards
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                self.summary_card(ui, "Bridge", self.bridge.state().label(), self.bridge.state().color());
+                if let Some(status) = &self.status {
+                    self.summary_card(ui, "PGXL", status.pgxl_lifecycle.state.as_str(), connection_color(pgxl_lifecycle_color_key(&status.pgxl_lifecycle.state)));
+                    self.summary_card(ui, "TGXL", bool_text(Some(status.clients.tgxl_connected)), status_color(status.clients.tgxl_connected));
+                    self.summary_card(ui, "Flex", &status.flex_injection.connection_state, connection_color(&status.flex_injection.connection_state));
+                    let hw_ok = status.amp.connection_state == "connected" && status.tuner.connection_state == "connected";
+                    self.summary_card(ui, "Hardware", if hw_ok { "OK" } else { "WARN" }, status_color(hw_ok));
+                    let sockets_ok = status.clients.pgxl_connected && status.clients.tgxl_connected;
+                    self.summary_card(ui, "Sockets", if sockets_ok { "OK" } else { "WARN" }, status_color(sockets_ok));
+                    let controls_ok = status.effective_controls.operational_override_active
+                        && (status.effective_controls.effective_kat_tune_enabled || status.effective_controls.effective_kpa_standby_enabled);
+                    self.summary_card(ui, "Controls", if controls_ok { "OK" } else { "WARN" }, status_color(controls_ok));
+                }
             });
+
+            // Hardware panels
+            ui.add_space(8.0);
+            egui::Grid::new("dashboard_grid")
+                .num_columns(3)
+                .spacing([14.0, 12.0])
+                .show(ui, |ui| {
+                    ui.vertical(|ui| self.ui_kpa_panel(ui));
+                    ui.vertical(|ui| self.ui_kat_panel(ui));
+                    ui.vertical(|ui| self.ui_flex_card(ui));
+                    ui.end_row();
+                });
+        });
     }
 
     fn ui_status_banner(&self, ui: &mut egui::Ui) {
@@ -725,16 +855,17 @@ impl GuiApp {
         egui::Frame::none()
             .fill(color)
             .rounding(8.0)
-            .inner_margin(egui::Margin::same(12.0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 52, 75)))
+            .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(message)
                         .color(egui::Color32::WHITE)
-                        .size(17.0)
+                        .size(15.0)
                         .strong(),
                 );
             });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
     }
 
     fn status_banner(&self) -> (String, egui::Color32) {
@@ -756,7 +887,10 @@ impl GuiApp {
                 egui::Color32::from_rgb(150, 42, 42),
             );
         }
-        if status.amp.advertisement_waiting_for_first_poll.unwrap_or(false)
+        if status
+            .amp
+            .advertisement_waiting_for_first_poll
+            .unwrap_or(false)
             || status.amp.first_poll_completed == Some(false)
         {
             return (
@@ -821,42 +955,68 @@ impl GuiApp {
         } else {
             "NOT READY"
         };
-        ui.group(|ui| {
-            ui.heading("Operational Readiness");
-            field(ui, "Serial layer", readiness_label(serial_ok, "OK", "WARN"));
-            field(ui, "Flex injection", readiness_label(flex_ok, "OK", "WARN"));
-            field(ui, "PGXL lifecycle", &status.pgxl_lifecycle.state);
-            field(
-                ui,
-                "AetherSDR controls",
-                if controls_ok {
-                    "OK"
-                } else if status.controls.control_requested_count > 0 {
-                    "BLOCKED"
-                } else {
-                    "NO COMMANDS SEEN"
-                },
-            );
-            field(ui, "SmartSDR tuner support", "EXPERIMENTAL");
-            field(ui, "Overall", overall);
-        });
+        let overall_color = match overall {
+            "OPERATIONAL" => egui::Color32::from_rgb(46, 190, 105),
+            "PARTIALLY OPERATIONAL" => egui::Color32::from_rgb(220, 170, 50),
+            _ => egui::Color32::from_rgb(200, 80, 80),
+        };
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(16, 22, 36))
+            .rounding(8.0)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 48, 72)))
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Readiness")
+                            .size(15.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(160, 178, 205)),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(overall)
+                            .size(14.0)
+                            .strong()
+                            .color(overall_color),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    readiness_pill(ui, "Serial", serial_ok);
+                    readiness_pill(ui, "Flex", flex_ok);
+                    readiness_pill(ui, "PGXL", pgxl_ok);
+                    readiness_pill(ui, "Controls", controls_ok);
+                });
+            });
     }
 
     fn summary_card(&self, ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
         egui::Frame::none()
-            .fill(egui::Color32::from_rgb(22, 35, 56))
+            .fill(egui::Color32::from_rgb(18, 26, 44))
             .rounding(8.0)
-            .inner_margin(egui::Margin::same(12.0))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(32, 44, 68)))
+            .inner_margin(egui::Margin::same(10.0))
             .show(ui, |ui| {
-                ui.set_min_width(130.0);
-                ui.label(egui::RichText::new(label).color(egui::Color32::from_rgb(160, 178, 205)));
-                ui.label(egui::RichText::new(value).color(color).size(20.0).strong());
+                ui.set_min_width(110.0);
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(120, 140, 170)),
+                );
+                ui.label(egui::RichText::new(value).color(color).size(16.0).strong());
             });
     }
 
     fn ui_kpa_panel(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.heading("KPA500");
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(16, 22, 36))
+            .rounding(8.0)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 48, 72)))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+            ui.label(egui::RichText::new("KPA500").size(16.0).strong().color(egui::Color32::from_rgb(130, 165, 210)));
+            ui.add_space(2.0);
             let amp = self.status.as_ref().map(|status| &status.amp);
             field(
                 ui,
@@ -1003,8 +1163,14 @@ impl GuiApp {
     }
 
     fn ui_kat_panel(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.heading("KAT500");
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(16, 22, 36))
+            .rounding(8.0)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 48, 72)))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+            ui.label(egui::RichText::new("KAT500").size(16.0).strong().color(egui::Color32::from_rgb(130, 165, 210)));
+            ui.add_space(2.0);
             let tuner = self.status.as_ref().map(|status| &status.tuner);
             field(
                 ui,
@@ -1082,6 +1248,19 @@ impl GuiApp {
                     tuner.and_then(|t| t.last_raw_response.as_deref()),
                 ),
             );
+            if let Some(status) = &self.status {
+                field(
+                    ui,
+                    "Flex TX frequency",
+                    format_frequency(status.radio_context.frequency_hz),
+                );
+                field(ui, "Current band", radio_band_label(&status.radio_context));
+                field(
+                    ui,
+                    "Last tune",
+                    format_last_tune(&status.radio_context),
+                );
+            }
             field(
                 ui,
                 "Capabilities",
@@ -1137,378 +1316,424 @@ impl GuiApp {
     }
 
     fn ui_flex_card(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.heading("Flex / Clients");
-            if let Some(status) = &self.status {
-                field(ui, "Flex state", &status.flex_injection.connection_state);
-                field(
-                    ui,
-                    "Real KPA state",
-                    status.amp.state.as_deref().unwrap_or("-"),
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(16, 22, 36))
+            .rounding(8.0)
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 48, 72)))
+            .inner_margin(egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Flex / Clients")
+                        .size(16.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(130, 165, 210)),
                 );
-                field(
-                    ui,
-                    "Advertised Flex",
-                    status
-                        .flex_injection
-                        .last_advertised_flex_amp_state
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "EGB desired amp",
-                    status
-                        .flex_injection
-                        .flex_desired_amp_state
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Radio-rewritten amp",
-                    status
-                        .flex_injection
-                        .radio_rewritten_amp_state
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Advertised PGXL",
-                    status
-                        .flex_injection
-                        .last_advertised_pgxl_state
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "TGXL operate",
-                    status
-                        .flex_injection
-                        .last_advertised_tgxl_operate
-                        .map(|value| bool_text(Some(value)))
-                        .unwrap_or("unknown"),
-                );
-                field(
-                    ui,
-                    "State mismatch",
-                    status
-                        .flex_injection
-                        .state_advertisement_mismatch
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Amp profile",
-                    status
-                        .flex_injection
-                        .active_amplifier_status_profile
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "TGXL profile",
-                    status
-                        .flex_injection
-                        .active_tgxl_control_profile
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Degraded reason",
-                    status
-                        .flex_injection
-                        .degraded_reason
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                if status.flex_injection.enabled
-                    && status.flex_injection.connection_state != "connected"
-                {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Flex injection not active - AMP applet may not appear.",
+                ui.add_space(2.0);
+                if let Some(status) = &self.status {
+                    field(ui, "Flex state", &status.flex_injection.connection_state);
+                    field(
+                        ui,
+                        "TX frequency",
+                        format_frequency(status.radio_context.frequency_hz),
                     );
-                }
-                field(
-                    ui,
-                    "Radio endpoint",
-                    status.flex_injection.radio_addr.as_deref().unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Last Flex error",
-                    status.flex_injection.last_error.as_deref().unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Client handle",
-                    status
-                        .flex_injection
-                        .client_handle
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Amplifier",
-                    status
-                        .flex_injection
-                        .amplifier_handle
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Interlock",
-                    status
-                        .flex_injection
-                        .interlock_handle
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Amp create",
-                    format!(
-                        "sent={} accepted={} sub_amp_all={}",
-                        status.flex_injection.amplifier_create_sent,
-                        status.flex_injection.amplifier_create_accepted,
-                        status.flex_injection.sub_amplifier_all_accepted
-                    ),
-                );
-                field(
-                    ui,
-                    "Last Flex TX",
-                    status.flex_injection.last_tx_line.as_deref().unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Last Flex RX",
-                    status.flex_injection.last_rx_line.as_deref().unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "PGXL clients",
-                    status.clients.pgxl_client_count.to_string(),
-                );
-                field(ui, "PGXL lifecycle", &status.pgxl_lifecycle.state);
-                field(ui, "PGXL reason", &status.pgxl_lifecycle.reason);
-                field(
-                    ui,
-                    "PGXL transitions",
-                    status.pgxl_lifecycle.transition_count.to_string(),
-                );
-                field(
-                    ui,
-                    "TGXL clients",
-                    status.clients.tgxl_client_count.to_string(),
-                );
-                field(
-                    ui,
-                    "SmartSDR PGXL",
-                    if status.flex_injection.amplifier_handle.is_some() {
-                        "supported / seen"
-                    } else {
-                        "supported / not seen"
-                    },
-                );
-                field(
-                    ui,
-                    "SmartSDR TGXL",
-                    "unsupported until Flex tuner injection is verified",
-                );
-                field(
-                    ui,
-                    "Sessions seen",
-                    format!(
-                        "PGXL {} / TGXL {}",
-                        status.clients.pgxl_session_started_count,
-                        status.clients.tgxl_session_started_count
-                    ),
-                );
-                field(
-                    ui,
-                    "Last TGXL close",
-                    status
-                        .clients
-                        .tgxl_last_disconnect_reason
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Ping ok/fail",
-                    format!(
-                        "{}/{}",
-                        status.flex_injection.ping_count, status.flex_injection.ping_failure_count
-                    ),
-                );
-                field(
-                    ui,
-                    "SmartSDR tuner",
-                    format!(
-                        "appeared {} / disappeared {}",
-                        status.flex_diagnostics.smartsdr_tuner_appeared_count,
-                        status.flex_diagnostics.smartsdr_tuner_disappeared_count
-                    ),
-                );
-                field(
-                    ui,
-                    "Tuner disappear",
-                    status
-                        .flex_diagnostics
-                        .smartsdr_tuner_last_disappearance_reason
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Flex tuner age",
-                    format_ms_age(status.flex_diagnostics.flex_tuner_presence_age_ms),
-                );
-                field(
-                    ui,
-                    "Pending/expired",
-                    format!(
-                        "{}/{}",
-                        status.flex_injection.pending_count,
-                        status.flex_injection.expired_pending_count
-                    ),
-                );
-                field(
-                    ui,
-                    "PGXL expected direct",
-                    status
-                        .flex_diagnostics
-                        .amplifier_direct_connect_expected
-                        .map(|value| bool_text(Some(value)))
-                        .unwrap_or("unknown"),
-                );
-                field(
-                    ui,
-                    "PGXL direct attempted",
-                    bool_text(Some(
+                    field(ui, "Band", radio_band_label(&status.radio_context));
+                    field(
+                        ui,
+                        "Mode",
+                        status.radio_context.mode.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "TX antenna",
+                        status.radio_context.tx_antenna.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Radio context age",
+                        format_ms_age(status.radio_context.context_age_ms),
+                    );
+                    field(
+                        ui,
+                        "Real KPA state",
+                        status.amp.state.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Advertised Flex",
                         status
                             .flex_injection
-                            .amplifier_pgxl_tcp_attempted_after_status,
-                    )),
-                );
-                field(
-                    ui,
-                    "Flex operate lab",
-                    format!(
-                        "sent={} accepted={}",
-                        status.flex_injection.flex_operate_lab_command_count,
-                        status.flex_injection.flex_operate_lab_accept_count
-                    ),
-                );
-                field(
-                    ui,
-                    "PGXL connect-assist",
-                    format!(
-                        "enabled={} sent={} result={} tcp={}",
-                        bool_text(Some(status.flex_injection.pgxl_connect_assist_enabled)),
-                        status.flex_injection.pgxl_connect_assist_sent_count,
-                        status
-                            .flex_injection
-                            .pgxl_connect_assist_last_result
+                            .last_advertised_flex_amp_state
                             .as_deref()
                             .unwrap_or("-"),
-                        bool_text(Some(
-                            status.flex_injection.pgxl_connect_assist_triggered_tcp
-                        ))
-                    ),
-                );
-                field(
-                    ui,
-                    "PGXL no socket",
-                    format!(
-                        "{} {}",
-                        status.clients.pgxl_manual_connect_no_socket_attempt_count,
+                    );
+                    field(
+                        ui,
+                        "EGB desired amp",
+                        status
+                            .flex_injection
+                            .flex_desired_amp_state
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Radio-rewritten amp",
+                        status
+                            .flex_injection
+                            .radio_rewritten_amp_state
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Advertised PGXL",
+                        status
+                            .flex_injection
+                            .last_advertised_pgxl_state
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "TGXL operate",
+                        status
+                            .flex_injection
+                            .last_advertised_tgxl_operate
+                            .map(|value| bool_text(Some(value)))
+                            .unwrap_or("unknown"),
+                    );
+                    field(
+                        ui,
+                        "State mismatch",
+                        status
+                            .flex_injection
+                            .state_advertisement_mismatch
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Amp profile",
+                        status
+                            .flex_injection
+                            .active_amplifier_status_profile
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "TGXL profile",
+                        status
+                            .flex_injection
+                            .active_tgxl_control_profile
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Degraded reason",
+                        status
+                            .flex_injection
+                            .degraded_reason
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    if status.flex_injection.enabled
+                        && status.flex_injection.connection_state != "connected"
+                    {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Flex injection not active - AMP applet may not appear.",
+                        );
+                    }
+                    field(
+                        ui,
+                        "Radio endpoint",
+                        status.flex_injection.radio_addr.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Last Flex error",
+                        status.flex_injection.last_error.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Client handle",
+                        status
+                            .flex_injection
+                            .client_handle
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Amplifier",
+                        status
+                            .flex_injection
+                            .amplifier_handle
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Interlock",
+                        status
+                            .flex_injection
+                            .interlock_handle
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Amp create",
+                        format!(
+                            "sent={} accepted={} sub_amp_all={}",
+                            status.flex_injection.amplifier_create_sent,
+                            status.flex_injection.amplifier_create_accepted,
+                            status.flex_injection.sub_amplifier_all_accepted
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Last Flex TX",
+                        status.flex_injection.last_tx_line.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Last Flex RX",
+                        status.flex_injection.last_rx_line.as_deref().unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "PGXL clients",
+                        status.clients.pgxl_client_count.to_string(),
+                    );
+                    field(ui, "PGXL lifecycle", &status.pgxl_lifecycle.state);
+                    field(ui, "PGXL reason", &status.pgxl_lifecycle.reason);
+                    field(
+                        ui,
+                        "PGXL transitions",
+                        status.pgxl_lifecycle.transition_count.to_string(),
+                    );
+                    field(
+                        ui,
+                        "TGXL clients",
+                        status.clients.tgxl_client_count.to_string(),
+                    );
+                    field(
+                        ui,
+                        "SmartSDR PGXL",
+                        if status.flex_injection.amplifier_handle.is_some() {
+                            "supported / seen"
+                        } else {
+                            "supported / not seen"
+                        },
+                    );
+                    field(
+                        ui,
+                        "SmartSDR TGXL",
+                        "unsupported until Flex tuner injection is verified",
+                    );
+                    field(
+                        ui,
+                        "Sessions seen",
+                        format!(
+                            "PGXL {} / TGXL {}",
+                            status.clients.pgxl_session_started_count,
+                            status.clients.tgxl_session_started_count
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Last TGXL close",
                         status
                             .clients
-                            .pgxl_last_no_socket_attempt_warning
+                            .tgxl_last_disconnect_reason
                             .as_deref()
-                            .unwrap_or("")
-                    ),
-                );
-                field(
-                    ui,
-                    "Last amplifier ad",
-                    status
-                        .flex_injection
-                        .last_amplifier_status_line
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(ui, "State lag", format_ms_age(status.amp.stale_duration_ms));
-                field(
-                    ui,
-                    "Button command seen",
-                    bool_text(Some(status.controls.aethersdr_button_command_seen)),
-                );
-                field(
-                    ui,
-                    "Command source",
-                    control_source_label(&status.controls),
-                );
-                field(
-                    ui,
-                    "Last TGXL control",
-                    status
-                        .controls
-                        .last_tgxl_control_command
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Last PGXL control",
-                    status
-                        .controls
-                        .last_pgxl_control_command
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Last Flex amp set",
-                    status
-                        .controls
-                        .last_flex_amp_set_command
-                        .as_deref()
-                        .unwrap_or("-"),
-                );
-                field(
-                    ui,
-                    "Safety blocks",
-                    format!(
-                        "dry_run {} / RF {}",
-                        status.controls.blocked_by_dry_run_count,
-                        status.controls.blocked_by_rf_risk_count
-                    ),
-                );
-                field(
-                    ui,
-                    "Meters",
-                    status
-                        .flex_injection
-                        .meter_handles
-                        .iter()
-                        .map(|meter| meter.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
-            } else {
-                ui.label("Start the bridge and enable metrics for live client state.");
-            }
-        });
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Ping ok/fail",
+                        format!(
+                            "{}/{}",
+                            status.flex_injection.ping_count,
+                            status.flex_injection.ping_failure_count
+                        ),
+                    );
+                    field(
+                        ui,
+                        "SmartSDR tuner",
+                        format!(
+                            "appeared {} / disappeared {}",
+                            status.flex_diagnostics.smartsdr_tuner_appeared_count,
+                            status.flex_diagnostics.smartsdr_tuner_disappeared_count
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Tuner disappear",
+                        status
+                            .flex_diagnostics
+                            .smartsdr_tuner_last_disappearance_reason
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Flex tuner age",
+                        format_ms_age(status.flex_diagnostics.flex_tuner_presence_age_ms),
+                    );
+                    field(
+                        ui,
+                        "Pending/expired",
+                        format!(
+                            "{}/{}",
+                            status.flex_injection.pending_count,
+                            status.flex_injection.expired_pending_count
+                        ),
+                    );
+                    field(
+                        ui,
+                        "PGXL expected direct",
+                        status
+                            .flex_diagnostics
+                            .amplifier_direct_connect_expected
+                            .map(|value| bool_text(Some(value)))
+                            .unwrap_or("unknown"),
+                    );
+                    field(
+                        ui,
+                        "PGXL direct attempted",
+                        bool_text(Some(
+                            status
+                                .flex_injection
+                                .amplifier_pgxl_tcp_attempted_after_status,
+                        )),
+                    );
+                    field(
+                        ui,
+                        "AMP widget risk",
+                        status
+                            .flex_diagnostics
+                            .amp_widget_visibility_risk
+                            .as_deref()
+                            .unwrap_or("none"),
+                    );
+                    field(
+                        ui,
+                        "Amp handle changes",
+                        status
+                            .flex_diagnostics
+                            .amplifier_handle_change_count
+                            .to_string(),
+                    );
+                    field(
+                        ui,
+                        "Flex operate lab",
+                        format!(
+                            "sent={} accepted={}",
+                            status.flex_injection.flex_operate_lab_command_count,
+                            status.flex_injection.flex_operate_lab_accept_count
+                        ),
+                    );
+                    field(
+                        ui,
+                        "PGXL connect-assist",
+                        format!(
+                            "enabled={} sent={} result={} tcp={}",
+                            bool_text(Some(status.flex_injection.pgxl_connect_assist_enabled)),
+                            status.flex_injection.pgxl_connect_assist_sent_count,
+                            status
+                                .flex_injection
+                                .pgxl_connect_assist_last_result
+                                .as_deref()
+                                .unwrap_or("-"),
+                            bool_text(Some(
+                                status.flex_injection.pgxl_connect_assist_triggered_tcp
+                            ))
+                        ),
+                    );
+                    field(
+                        ui,
+                        "PGXL no socket",
+                        format!(
+                            "{} {}",
+                            status.clients.pgxl_manual_connect_no_socket_attempt_count,
+                            status
+                                .clients
+                                .pgxl_last_no_socket_attempt_warning
+                                .as_deref()
+                                .unwrap_or("")
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Last amplifier ad",
+                        status
+                            .flex_injection
+                            .last_amplifier_status_line
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(ui, "State lag", format_ms_age(status.amp.stale_duration_ms));
+                    field(
+                        ui,
+                        "Button command seen",
+                        bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                    );
+                    field(ui, "Command source", control_source_label(&status.controls));
+                    field(
+                        ui,
+                        "Last TGXL control",
+                        status
+                            .controls
+                            .last_tgxl_control_command
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Last PGXL control",
+                        status
+                            .controls
+                            .last_pgxl_control_command
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Last Flex amp set",
+                        status
+                            .controls
+                            .last_flex_amp_set_command
+                            .as_deref()
+                            .unwrap_or("-"),
+                    );
+                    field(
+                        ui,
+                        "Safety blocks",
+                        format!(
+                            "dry_run {} / RF {}",
+                            status.controls.blocked_by_dry_run_count,
+                            status.controls.blocked_by_rf_risk_count
+                        ),
+                    );
+                    field(
+                        ui,
+                        "Meters",
+                        status
+                            .flex_injection
+                            .meter_handles
+                            .iter()
+                            .map(|meter| meter.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                } else {
+                    ui.label("Start the bridge and enable metrics for live client state.");
+                }
+            });
     }
 
     #[allow(dead_code)]
@@ -1918,14 +2143,41 @@ impl GuiApp {
         }
 
         ui.separator();
-        ui.horizontal(|ui| {
-            if ui.button("Save Setup").clicked() {
+        ui.horizontal_wrapped(|ui| {
+            let save_btn = egui::Button::new(egui::RichText::new("Save Setup").size(13.0).strong())
+                .fill(egui::Color32::from_rgb(30, 80, 55))
+                .rounding(egui::Rounding::same(6.0))
+                .min_size(egui::vec2(100.0, 34.0));
+            if ui.add(save_btn).clicked() {
                 self.apply_recommended_aethersdr_setup(false);
                 self.save_config();
             }
             if ui.button("Reset to Recommended AetherSDR Setup").clicked() {
                 self.apply_recommended_aethersdr_setup(true);
                 self.save_config();
+            }
+            let ops_btn = egui::Button::new(
+                egui::RichText::new("Use Recommended Operational Config").size(12.0),
+            )
+            .fill(egui::Color32::from_rgb(35, 55, 95))
+            .rounding(egui::Rounding::same(6.0))
+            .min_size(egui::vec2(240.0, 34.0));
+            if ui.add(ops_btn).clicked() {
+                let saved_kpa_com = self.config.kpa500.com_port.clone();
+                let saved_kat_com = self.config.kat500.com_port.clone();
+                let saved_radio_ip = self.config.flex_injection.radio_ip.clone();
+                let saved_amp_ip = self.config.flex_injection.amplifier_ip.clone();
+                self.config_path = PathBuf::from("config.aethersdr-operational.yaml");
+                self.load_config();
+                self.config.kpa500.com_port = saved_kpa_com;
+                self.config.kat500.com_port = saved_kat_com;
+                self.config.flex_injection.radio_ip = saved_radio_ip;
+                self.config.flex_injection.amplifier_ip = saved_amp_ip;
+                self.apply_recommended_aethersdr_setup(true);
+                self.save_config();
+                self.push_log(
+                    "switched to config.aethersdr-operational.yaml with current COM/IP values",
+                );
             }
             if ui.button("Scan Serial Ports").clicked() {
                 self.scan_serial_ports();
@@ -3015,6 +3267,8 @@ struct StatusSnapshot {
     bridge: BridgeStatus,
     amp: DeviceStatus,
     tuner: DeviceStatus,
+    #[serde(default)]
+    radio_context: RadioContextStatus,
     clients: ClientStatus,
     flex_injection: FlexStatus,
     #[serde(default)]
@@ -3025,6 +3279,32 @@ struct StatusSnapshot {
     pgxl_lifecycle: PgxlLifecycleStatus,
     #[serde(default)]
     flex_diagnostics: FlexDiagnostics,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct RadioContextStatus {
+    #[serde(default)]
+    active_tx_slice: Option<u32>,
+    #[serde(default)]
+    frequency_hz: Option<u64>,
+    #[serde(default)]
+    band: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    tx_antenna: Option<String>,
+    #[serde(default)]
+    rx_antenna: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    last_tune_frequency_hz: Option<u64>,
+    #[serde(default)]
+    last_tune_band: Option<String>,
+    #[serde(default)]
+    context_age_ms: Option<u128>,
+    #[serde(default)]
+    last_tune_age_ms: Option<u128>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -3238,6 +3518,12 @@ struct FlexStatus {
     pgxl_connect_assist_last_result: Option<String>,
     #[serde(default)]
     pgxl_connect_assist_triggered_tcp: bool,
+    #[serde(default)]
+    pgxl_connect_assist_retry_count: u64,
+    #[serde(default)]
+    amplifier_handle_change_count: u64,
+    #[serde(default)]
+    amp_widget_visibility_risk: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -3262,6 +3548,10 @@ struct FlexDiagnostics {
     flex_tuner_presence_age_ms: Option<u128>,
     #[serde(default)]
     amplifier_direct_connect_expected: Option<bool>,
+    #[serde(default)]
+    amplifier_handle_change_count: u64,
+    #[serde(default)]
+    amp_widget_visibility_risk: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -3802,15 +4092,55 @@ fn latest_evidence_bundle() -> Option<PathBuf> {
 
 fn apply_modern_style(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(10, 16, 28);
-    visuals.window_fill = egui::Color32::from_rgb(16, 24, 39);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(31, 45, 70);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(42, 77, 122);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(56, 112, 180);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(43, 124, 220);
+    // Deep navy/charcoal base
+    visuals.panel_fill = egui::Color32::from_rgb(12, 14, 22);
+    visuals.window_fill = egui::Color32::from_rgb(18, 21, 32);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(8, 10, 16);
+    visuals.faint_bg_color = egui::Color32::from_rgb(22, 26, 38);
+    // Widget states with refined blue accent
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(24, 28, 42);
+    visuals.widgets.noninteractive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 48, 68));
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 38, 58);
+    visuals.widgets.inactive.bg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(48, 58, 82));
+    visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(38, 55, 88);
+    visuals.widgets.hovered.bg_stroke =
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(72, 120, 195));
+    visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(45, 78, 135);
+    visuals.widgets.active.bg_stroke =
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 150, 230));
+    visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.open.bg_fill = egui::Color32::from_rgb(35, 48, 78);
+    visuals.widgets.open.rounding = egui::Rounding::same(6.0);
+    // Selection accent
+    visuals.selection.bg_fill = egui::Color32::from_rgb(38, 100, 185);
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 175, 255));
+    // Window styling
+    visuals.window_rounding = egui::Rounding::same(10.0);
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 4.0),
+        blur: 16.0,
+        spread: 2.0,
+        color: egui::Color32::from_black_alpha(60),
+    };
+    visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 48, 68));
+    // Subtle separator
+    visuals.widgets.noninteractive.fg_stroke =
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(155, 165, 185));
     ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.window_margin = egui::Margin::same(14.0);
+    ctx.set_style(style);
 }
 
+#[allow(dead_code)]
 fn nav_button(ui: &mut egui::Ui, tab: &mut Tab, candidate: Tab, label: &str) {
     let selected = *tab == candidate;
     if ui
@@ -3821,6 +4151,7 @@ fn nav_button(ui: &mut egui::Ui, tab: &mut Tab, candidate: Tab, label: &str) {
     }
 }
 
+#[allow(dead_code)]
 fn process_badge(ui: &mut egui::Ui, state: ProcessState) {
     let (text, color) = match state {
         ProcessState::Stopped => ("stopped", egui::Color32::GRAY),
@@ -3880,12 +4211,34 @@ fn pgxl_lifecycle_color_key(state: &str) -> &str {
     }
 }
 
+#[allow(dead_code)]
 fn readiness_label(ok: bool, ok_text: &'static str, warn_text: &'static str) -> &'static str {
     if ok {
         ok_text
     } else {
         warn_text
     }
+}
+
+fn readiness_pill(ui: &mut egui::Ui, label: &str, ok: bool) {
+    let (bg, fg) = if ok {
+        (
+            egui::Color32::from_rgb(20, 55, 38),
+            egui::Color32::from_rgb(80, 210, 130),
+        )
+    } else {
+        (
+            egui::Color32::from_rgb(55, 38, 18),
+            egui::Color32::from_rgb(220, 170, 50),
+        )
+    };
+    egui::Frame::none()
+        .fill(bg)
+        .rounding(12.0)
+        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).size(11.0).strong().color(fg));
+        });
 }
 
 fn serial_activity_label(last_command: Option<&str>, last_response: Option<&str>) -> String {
@@ -3930,6 +4283,22 @@ fn field(ui: &mut egui::Ui, label: &str, value: impl ToString) {
     ui.horizontal(|ui| {
         ui.label(format!("{label}:"));
         ui.monospace(value.to_string());
+    });
+}
+
+fn field_styled(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(format!("{label}:"))
+                .size(12.0)
+                .color(egui::Color32::from_rgb(100, 115, 145)),
+        );
+        ui.label(
+            egui::RichText::new(value)
+                .size(12.0)
+                .strong()
+                .color(egui::Color32::from_rgb(180, 195, 220)),
+        );
     });
 }
 
@@ -4014,6 +4383,32 @@ fn format_watts(value: Option<f32>) -> String {
     value
         .map(|value| format!("{value:.1} W"))
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_frequency(value: Option<u64>) -> String {
+    value
+        .map(|hz| format!("{:.6} MHz", hz as f64 / 1_000_000.0))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn radio_band_label(context: &RadioContextStatus) -> &str {
+    if context.band.is_empty() {
+        "unknown"
+    } else {
+        context.band.as_str()
+    }
+}
+
+fn format_last_tune(context: &RadioContextStatus) -> String {
+    match (
+        context.last_tune_frequency_hz,
+        context.last_tune_band.as_deref(),
+    ) {
+        (Some(hz), Some(band)) => format!("{} on {}", format_frequency(Some(hz)), band),
+        (Some(hz), None) => format_frequency(Some(hz)),
+        (None, Some(band)) => band.to_string(),
+        (None, None) => "-".to_string(),
+    }
 }
 
 fn format_ratio(value: Option<f32>) -> String {

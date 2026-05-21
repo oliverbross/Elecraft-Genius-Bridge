@@ -974,9 +974,15 @@ fn simulate_control(cfg: &BridgeConfig, action: SimulatedControlAction) -> Resul
     println!("simulation_source={source}");
     println!("mapped_elecraft_command={mapped}");
     println!("allowed={allowed}");
-    println!("decision={}", if allowed { "would_execute" } else { "blocked" });
+    println!(
+        "decision={}",
+        if allowed { "would_execute" } else { "blocked" }
+    );
     println!("reason={reason}");
-    println!("operational_override_active={}", policy.operational_override_active);
+    println!(
+        "operational_override_active={}",
+        policy.operational_override_active
+    );
     println!("raw_kpa_dry_run={}", policy.raw_kpa_dry_run);
     println!("raw_kat_dry_run={}", policy.raw_kat_dry_run);
     Ok(())
@@ -3525,6 +3531,19 @@ async fn status_json(state: &SharedState) -> String {
             "stale_duration_ms": stale_duration_ms(guard.tuner.last_successful_poll_at),
             "runtime": runtime_json(&guard.tuner.runtime),
         },
+        "radio_context": {
+            "active_tx_slice": guard.radio_context.active_tx_slice,
+            "frequency_hz": guard.radio_context.frequency_hz,
+            "band": guard.radio_context.band.as_str(),
+            "mode": guard.radio_context.mode,
+            "tx_antenna": guard.radio_context.tx_antenna,
+            "rx_antenna": guard.radio_context.rx_antenna,
+            "source": guard.radio_context.source,
+            "last_tune_frequency_hz": guard.radio_context.last_tune_frequency_hz,
+            "last_tune_band": guard.radio_context.last_tune_band.map(|band| band.as_str()),
+            "context_age_ms": stale_duration_ms(guard.radio_context.updated_at),
+            "last_tune_age_ms": stale_duration_ms(guard.radio_context.last_tune_at),
+        },
         "clients": {
             "pgxl_connected": guard.clients.pgxl_connected,
             "tgxl_connected": guard.clients.tgxl_connected,
@@ -3559,6 +3578,8 @@ async fn status_json(state: &SharedState) -> String {
             "tuner_presence_expired_count": guard.flex_injection.tuner_presence_expired_count,
             "tuner_reannounce_count": guard.flex_injection.tuner_reannounce_count,
             "amplifier_reannounce_count": guard.flex_injection.amplifier_reannounce_count,
+            "amplifier_handle_change_count": guard.flex_injection.amplifier_handle_change_count,
+            "amp_widget_visibility_risk": amp_widget_visibility_risk(&guard),
             "amplifier_direct_connect_expected": guard.flex_injection.amplifier_direct_connect_expected,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
@@ -3566,6 +3587,34 @@ async fn status_json(state: &SharedState) -> String {
         "protocol": guard.protocol,
     })
     .to_string()
+}
+
+fn amp_widget_visibility_risk(guard: &bridge_core::state::BridgeState) -> Option<String> {
+    if !guard.flex_injection.enabled {
+        return Some("Flex amplifier injection is disabled".to_string());
+    }
+    if guard.flex_injection.connection_state != bridge_core::ConnectionState::Connected {
+        return Some(format!(
+            "Flex injection is {}",
+            guard.flex_injection.connection_state.as_str()
+        ));
+    }
+    if guard.flex_injection.amplifier_handle.is_none() {
+        return Some("No Flex amplifier handle observed".to_string());
+    }
+    if guard.flex_injection.amplifier_handle_change_count > 1 {
+        return Some(format!(
+            "Amplifier handle changed {} times",
+            guard.flex_injection.amplifier_handle_change_count
+        ));
+    }
+    if guard.flex_injection.state_advertisement_mismatch.is_some() {
+        return guard.flex_injection.state_advertisement_mismatch.clone();
+    }
+    if guard.clients.pgxl_session_started_count == 0 {
+        return Some("AetherSDR has not opened PGXL TCP yet".to_string());
+    }
+    None
 }
 
 fn tuner_mode_label(tuner: &bridge_core::TunerState) -> &'static str {

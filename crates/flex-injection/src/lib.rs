@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bridge_core::{
-    append_evidence_json, append_evidence_line, ConnectionState, FlexMeterHandle, SharedState,
+    append_evidence_json, append_evidence_line, Band, ConnectionState, FlexMeterHandle, SharedState,
 };
 use std::collections::HashMap;
 use std::fs::{create_dir_all, OpenOptions};
@@ -152,6 +152,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
     let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
+    let mut pgxl_connect_assist_retry_timer = Box::pin(sleep(Duration::from_secs(30)));
 
     loop {
         tokio::select! {
@@ -172,6 +173,12 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 {
                     let mut guard = state.write().await;
                     guard.flex_injection.last_rx_line = Some(line.clone());
+                }
+                if let Some(status) = parse_slice_status(&line) {
+                    update_radio_context_from_slice(&state, &status).await;
+                }
+                if let Some(status) = parse_transmit_status(&line) {
+                    update_radio_context_from_transmit(&state, &status).await;
                 }
 
                 if session.has_handle && !registration_sent {
@@ -362,6 +369,39 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     );
                 }
                 tuner_refresh_timer.as_mut().reset(tokio::time::Instant::now() + settings.tuner_refresh_interval);
+            }
+            () = &mut pgxl_connect_assist_retry_timer, if settings.pgxl_connect_assist => {
+                let should_retry = {
+                    let guard = state.read().await;
+                    registration_sent
+                        && session.amplifier_handle.is_some()
+                        && guard.clients.pgxl_session_started_count == 0
+                };
+                if should_retry {
+                    session.assist_sent_handle = None;
+                    {
+                        let mut guard = state.write().await;
+                        guard.flex_injection.pgxl_connect_assist_retry_count =
+                            guard.flex_injection.pgxl_connect_assist_retry_count.saturating_add(1);
+                    }
+                    send_tracked_command(
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                        PendingCommand::new(
+                            "pgxl_connect_assist_retry",
+                            "sub amplifier all",
+                            PendingKind::AmplifierReannounce,
+                        ),
+                    )
+                    .await?;
+                    info!(
+                        event_id = "pgxl_connect_assist_retry",
+                        "PGXL connect-assist retry: reset assist guard and re-sent sub amplifier all"
+                    );
+                }
+                pgxl_connect_assist_retry_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(30));
             }
         }
     }
@@ -754,6 +794,12 @@ impl FlexSession {
 
 async fn set_amplifier_handle(state: &SharedState, handle: &str) {
     let mut guard = state.write().await;
+    if guard.flex_injection.amplifier_handle.as_deref() != Some(handle) {
+        guard.flex_injection.amplifier_handle_change_count = guard
+            .flex_injection
+            .amplifier_handle_change_count
+            .saturating_add(1);
+    }
     guard.flex_injection.amplifier_handle = Some(handle.to_string());
     guard.flex_injection.amplifier_last_seen_at = Some(SystemTime::now());
 }
@@ -1080,10 +1126,7 @@ impl AmplifierStatus {
 }
 
 fn parse_amplifier_status(line: &str) -> Option<AmplifierStatus> {
-    if !line.starts_with('S') {
-        return None;
-    }
-    let body = line.split_once('|')?.1;
+    let body = status_body(line)?;
     let rest = body.strip_prefix("amplifier ")?;
     let mut parts = rest.split_whitespace();
     let handle = parts.next()?.to_string();
@@ -1098,6 +1141,172 @@ fn parse_amplifier_status(line: &str) -> Option<AmplifierStatus> {
         handle,
         kvs,
     })
+}
+
+fn status_body(line: &str) -> Option<&str> {
+    if !line.starts_with('S') {
+        return None;
+    }
+    Some(line.split_once('|')?.1)
+}
+
+#[derive(Debug, Clone)]
+struct KeyValueStatus {
+    raw: String,
+    handle: Option<String>,
+    kvs: Vec<(String, String)>,
+}
+
+impl KeyValueStatus {
+    fn value(&self, key: &str) -> Option<&str> {
+        self.kvs
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+fn parse_kv_status(line: &str, object: &str) -> Option<KeyValueStatus> {
+    let body = status_body(line)?;
+    let rest = body.strip_prefix(object)?.trim_start();
+    let mut parts = rest.split_whitespace();
+    let first = parts.next();
+    let (handle, tokens): (Option<String>, Vec<&str>) =
+        if first.is_some_and(|part| part.contains('=')) {
+            (None, std::iter::once(first.unwrap()).chain(parts).collect())
+        } else {
+            (first.map(str::to_string), parts.collect())
+        };
+    let kvs = tokens
+        .into_iter()
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect::<Vec<_>>();
+    Some(KeyValueStatus {
+        raw: line.to_string(),
+        handle,
+        kvs,
+    })
+}
+
+fn parse_slice_status(line: &str) -> Option<KeyValueStatus> {
+    parse_kv_status(line, "slice ")
+}
+
+fn parse_transmit_status(line: &str) -> Option<KeyValueStatus> {
+    parse_kv_status(line, "transmit ")
+}
+
+async fn update_radio_context_from_slice(state: &SharedState, status: &KeyValueStatus) {
+    let frequency_hz = status
+        .value("RF_frequency")
+        .or_else(|| status.value("frequency"))
+        .or_else(|| status.value("freq"))
+        .and_then(parse_flex_frequency_hz);
+    let is_tx = status
+        .value("tx")
+        .is_some_and(|value| matches!(value, "1" | "true" | "True" | "TRUE"));
+    let slice_id = status
+        .handle
+        .as_deref()
+        .and_then(parse_flex_handle_or_decimal);
+    let mut guard = state.write().await;
+    let should_update = is_tx
+        || guard.radio_context.active_tx_slice.is_none()
+        || guard.radio_context.frequency_hz.is_none();
+    if !should_update {
+        return;
+    }
+    if let Some(slice_id) = slice_id {
+        guard.radio_context.active_tx_slice = Some(slice_id);
+    }
+    if let Some(frequency_hz) = frequency_hz {
+        let band = Band::from_frequency_hz(frequency_hz);
+        guard.frequency_hz = frequency_hz;
+        guard.band = band;
+        guard.radio_context.frequency_hz = Some(frequency_hz);
+        guard.radio_context.band = band;
+    }
+    if let Some(mode) = status.value("mode") {
+        guard.radio_context.mode = Some(mode.to_string());
+    }
+    if let Some(tx_ant) = status.value("txant").or_else(|| status.value("tx_ant")) {
+        guard.radio_context.tx_antenna = Some(tx_ant.to_string());
+    }
+    if let Some(rx_ant) = status.value("rxant").or_else(|| status.value("rx_ant")) {
+        guard.radio_context.rx_antenna = Some(rx_ant.to_string());
+    }
+    guard.radio_context.source = Some("flex_slice".to_string());
+    guard.radio_context.updated_at = Some(SystemTime::now());
+    let record = serde_json::json!({
+        "event": "radio_context_updated",
+        "source": "flex_slice",
+        "active_tx_slice": guard.radio_context.active_tx_slice,
+        "frequency_hz": guard.radio_context.frequency_hz,
+        "band": guard.radio_context.band.as_str(),
+        "mode": guard.radio_context.mode,
+        "tx_antenna": guard.radio_context.tx_antenna,
+        "rx_antenna": guard.radio_context.rx_antenna,
+        "raw": status.raw,
+    });
+    drop(guard);
+    append_evidence_json("radio-context.json", &record);
+}
+
+async fn update_radio_context_from_transmit(state: &SharedState, status: &KeyValueStatus) {
+    let mut guard = state.write().await;
+    let mut changed = false;
+    if let Some(tx_ant) = status.value("tx_ant").or_else(|| status.value("txant")) {
+        guard.radio_context.tx_antenna = Some(tx_ant.to_string());
+        changed = true;
+    }
+    if let Some(rx_ant) = status.value("rx_ant").or_else(|| status.value("rxant")) {
+        guard.radio_context.rx_antenna = Some(rx_ant.to_string());
+        changed = true;
+    }
+    if changed {
+        guard.radio_context.source = Some("flex_transmit".to_string());
+        guard.radio_context.updated_at = Some(SystemTime::now());
+        let record = serde_json::json!({
+            "event": "radio_context_updated",
+            "source": "flex_transmit",
+            "frequency_hz": guard.radio_context.frequency_hz,
+            "band": guard.radio_context.band.as_str(),
+            "tx_antenna": guard.radio_context.tx_antenna,
+            "rx_antenna": guard.radio_context.rx_antenna,
+            "raw": status.raw,
+        });
+        drop(guard);
+        append_evidence_json("radio-context.json", &record);
+    }
+}
+
+fn parse_flex_frequency_hz(value: &str) -> Option<u64> {
+    let parsed = value.parse::<f64>().ok()?;
+    if parsed <= 0.0 {
+        return None;
+    }
+    let hz = if parsed < 1000.0 {
+        parsed * 1_000_000.0
+    } else if parsed < 1_000_000.0 {
+        parsed * 1000.0
+    } else {
+        parsed
+    };
+    Some(hz.round() as u64)
+}
+
+fn parse_flex_handle_or_decimal(value: &str) -> Option<u32> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u32>().ok()
+    }
 }
 
 async fn log_amp_snapshot(state: &SharedState) {
@@ -1406,6 +1615,16 @@ fn registration_commands_inner(
         "sub amplifier all",
         PendingKind::Subscription,
     ));
+    commands.push(PendingCommand::new(
+        "sub_slice_all",
+        "sub slice all",
+        PendingKind::Subscription,
+    ));
+    commands.push(PendingCommand::new(
+        "sub_tx_all",
+        "sub tx all",
+        PendingKind::Subscription,
+    ));
     commands
 }
 
@@ -1596,6 +1815,44 @@ mod tests {
     #[test]
     fn ignores_response_lines_when_parsing_amplifier_status() {
         assert!(parse_amplifier_status("R44|0|amplifier 0x42000001 model=PowerGeniusXL").is_none());
+    }
+
+    #[test]
+    fn parses_flex_frequency_units() {
+        assert_eq!(parse_flex_frequency_hz("14.200000"), Some(14_200_000));
+        assert_eq!(parse_flex_frequency_hz("14200.000"), Some(14_200_000));
+        assert_eq!(parse_flex_frequency_hz("14200000"), Some(14_200_000));
+        assert_eq!(parse_flex_frequency_hz("0.0"), None);
+    }
+
+    #[test]
+    fn parses_slice_status_with_tx_context() {
+        let status = parse_slice_status(
+            "S1A2B|slice 0 RF_frequency=14.200000 tx=1 mode=USB txant=ANT1 rxant=ANT1",
+        )
+        .unwrap();
+        assert_eq!(status.handle.as_deref(), Some("0"));
+        assert_eq!(status.value("RF_frequency"), Some("14.200000"));
+        assert_eq!(status.value("tx"), Some("1"));
+        assert_eq!(status.value("mode"), Some("USB"));
+    }
+
+    #[tokio::test]
+    async fn flex_slice_updates_shared_radio_context() {
+        let state = bridge_core::state::shared_default_state();
+        let status = parse_slice_status(
+            "S1A2B|slice 1 RF_frequency=7.100000 tx=1 mode=LSB txant=ANT2 rxant=ANT1",
+        )
+        .unwrap();
+        update_radio_context_from_slice(&state, &status).await;
+        let guard = state.read().await;
+        assert_eq!(guard.frequency_hz, 7_100_000);
+        assert_eq!(guard.band, bridge_core::Band::M40);
+        assert_eq!(guard.radio_context.active_tx_slice, Some(1));
+        assert_eq!(guard.radio_context.frequency_hz, Some(7_100_000));
+        assert_eq!(guard.radio_context.band, bridge_core::Band::M40);
+        assert_eq!(guard.radio_context.mode.as_deref(), Some("LSB"));
+        assert_eq!(guard.radio_context.tx_antenna.as_deref(), Some("ANT2"));
     }
 
     #[tokio::test]
@@ -1917,10 +2174,10 @@ mod tests {
                 .to_string()
         ));
         assert!(commands.contains(&"keepalive enable".to_string()));
-        assert_eq!(
-            commands.last().map(String::as_str),
-            Some("sub amplifier all")
-        );
+        assert!(commands.contains(&"sub amplifier all".to_string()));
+        assert!(commands.contains(&"sub slice all".to_string()));
+        assert!(commands.contains(&"sub tx all".to_string()));
+        assert_eq!(commands.last().map(String::as_str), Some("sub tx all"));
     }
 
     #[tokio::test]

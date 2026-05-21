@@ -443,6 +443,67 @@ impl Kat500Driver {
         };
 
         if autotune {
+            let (suppress_duplicate, frequency_hz, band_label) = {
+                let mut guard = self.state.write().await;
+                let now = SystemTime::now();
+                let suppress_duplicate = guard
+                    .radio_context
+                    .last_tune_at
+                    .and_then(|last| now.duration_since(last).ok())
+                    .is_some_and(|elapsed| elapsed < Duration::from_millis(1500));
+                let frequency_hz = guard.radio_context.frequency_hz;
+                let band = guard.radio_context.band;
+                let band_label = band.as_str().to_string();
+                if suppress_duplicate {
+                    guard.controls.duplicate_autotune_suppressed_count = guard
+                        .controls
+                        .duplicate_autotune_suppressed_count
+                        .saturating_add(1);
+                    guard.controls.last_safety_decision =
+                        Some("duplicate_autotune_suppressed".to_string());
+                } else {
+                    guard.radio_context.last_tune_at = Some(now);
+                    guard.radio_context.last_tune_frequency_hz = frequency_hz;
+                    guard.radio_context.last_tune_band = Some(band);
+                    guard.controls.last_tune_frequency_hz = frequency_hz;
+                    guard.controls.last_tune_band = Some(band_label.clone());
+                }
+                (suppress_duplicate, frequency_hz, band_label)
+            };
+            if suppress_duplicate {
+                append_evidence_json(
+                    "control-events.jsonl",
+                    &serde_json::json!({
+                        "device": "KAT500",
+                        "command": "autotune",
+                        "decision": "duplicate_autotune_suppressed",
+                        "frequency_hz": frequency_hz,
+                        "band": band_label,
+                    }),
+                );
+                append_evidence_line(
+                    "kat500-tune-sequence.log",
+                    format!(
+                        "KAT500 autotune duplicate suppressed frequency_hz={:?} band={}",
+                        frequency_hz, band_label
+                    ),
+                );
+                return Ok(());
+            }
+            append_evidence_line(
+                "kat500-tune-sequence.log",
+                format!(
+                    "KAT500 autotune requested frequency_hz={:?} band={} context_source=Flex",
+                    frequency_hz, band_label
+                ),
+            );
+            append_evidence_line(
+                "tune-band-decision.md",
+                format!(
+                    "- Tune requested with Flex TX frequency `{:?}` Hz, band `{}`. EGB does not send an unverified KAT500 band-set command; KAT500 receives `T;` only.",
+                    frequency_hz, band_label
+                ),
+            );
             self.apply_desired_command(
                 port,
                 transcript,

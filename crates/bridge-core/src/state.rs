@@ -27,6 +27,42 @@ impl Default for Band {
     }
 }
 
+impl Band {
+    pub fn from_frequency_hz(frequency_hz: u64) -> Self {
+        match frequency_hz {
+            1_800_000..=2_000_000 => Self::M160,
+            3_500_000..=4_000_000 => Self::M80,
+            5_330_500..=5_406_500 => Self::M60,
+            7_000_000..=7_300_000 => Self::M40,
+            10_100_000..=10_150_000 => Self::M30,
+            14_000_000..=14_350_000 => Self::M20,
+            18_068_000..=18_168_000 => Self::M17,
+            21_000_000..=21_450_000 => Self::M15,
+            24_890_000..=24_990_000 => Self::M12,
+            28_000_000..=29_700_000 => Self::M10,
+            50_000_000..=54_000_000 => Self::M6,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::M160 => "160m",
+            Self::M80 => "80m",
+            Self::M60 => "60m",
+            Self::M40 => "40m",
+            Self::M30 => "30m",
+            Self::M20 => "20m",
+            Self::M17 => "17m",
+            Self::M15 => "15m",
+            Self::M12 => "12m",
+            Self::M10 => "10m",
+            Self::M6 => "6m",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AmpOperatingState {
     Standby,
@@ -93,6 +129,7 @@ impl Default for AmpOperatingState {
 pub struct BridgeState {
     pub frequency_hz: u64,
     pub band: Band,
+    pub radio_context: RadioContext,
     pub amp: AmpState,
     pub tuner: TunerState,
     pub flex_injection: FlexInjectionState,
@@ -109,6 +146,12 @@ impl Default for BridgeState {
         Self {
             frequency_hz: 14_200_000,
             band: Band::M20,
+            radio_context: RadioContext {
+                frequency_hz: Some(14_200_000),
+                band: Band::M20,
+                source: Some("default".to_string()),
+                ..RadioContext::default()
+            },
             amp: AmpState::default(),
             tuner: TunerState::default(),
             flex_injection: FlexInjectionState::default(),
@@ -120,6 +163,23 @@ impl Default for BridgeState {
             config_identity: RuntimeConfigIdentity::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RadioContext {
+    pub active_tx_slice: Option<u32>,
+    pub frequency_hz: Option<u64>,
+    pub band: Band,
+    pub mode: Option<String>,
+    pub tx_antenna: Option<String>,
+    pub rx_antenna: Option<String>,
+    pub source: Option<String>,
+    pub last_tune_frequency_hz: Option<u64>,
+    pub last_tune_band: Option<Band>,
+    #[serde(skip)]
+    pub updated_at: Option<SystemTime>,
+    #[serde(skip)]
+    pub last_tune_at: Option<SystemTime>,
 }
 
 impl BridgeState {
@@ -358,6 +418,8 @@ pub struct FlexInjectionState {
     pub tuner_presence_expired_count: u64,
     pub tuner_reannounce_count: u64,
     pub amplifier_reannounce_count: u64,
+    pub amplifier_handle_change_count: u64,
+    pub amp_widget_visibility_risk: Option<String>,
     pub amplifier_direct_connect_expected: Option<bool>,
     pub last_amplifier_status_line: Option<String>,
     pub last_emitted_amplifier_advertisement_line: Option<String>,
@@ -379,6 +441,7 @@ pub struct FlexInjectionState {
     pub pgxl_connect_assist_sent_count: u64,
     pub pgxl_connect_assist_last_result: Option<String>,
     pub pgxl_connect_assist_triggered_tcp: bool,
+    pub pgxl_connect_assist_retry_count: u64,
     pub ping_ack_count: u64,
     pub last_ping_latency_ms: Option<u64>,
     pub last_tuner_disappearance_reason: Option<String>,
@@ -511,6 +574,9 @@ pub struct ControlDiagnostics {
     pub blocked_by_dry_run_count: u64,
     pub blocked_by_rf_risk_count: u64,
     pub control_requested_count: u64,
+    pub duplicate_autotune_suppressed_count: u64,
+    pub last_tune_frequency_hz: Option<u64>,
+    pub last_tune_band: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -588,5 +654,19 @@ mod tests {
         assert_eq!(stats.last_poll_latency_ms, 300);
         assert_eq!(stats.max_poll_latency_ms, 300);
         assert_eq!(stats.average_poll_latency_ms(), Some(200));
+    }
+
+    #[test]
+    fn derives_ham_band_from_frequency() {
+        assert_eq!(Band::from_frequency_hz(1_900_000), Band::M160);
+        assert_eq!(Band::from_frequency_hz(3_800_000), Band::M80);
+        assert_eq!(Band::from_frequency_hz(7_100_000), Band::M40);
+        assert_eq!(Band::from_frequency_hz(14_200_000), Band::M20);
+        assert_eq!(Band::from_frequency_hz(18_100_000), Band::M17);
+        assert_eq!(Band::from_frequency_hz(21_200_000), Band::M15);
+        assert_eq!(Band::from_frequency_hz(24_930_000), Band::M12);
+        assert_eq!(Band::from_frequency_hz(28_500_000), Band::M10);
+        assert_eq!(Band::from_frequency_hz(50_300_000), Band::M6);
+        assert_eq!(Band::from_frequency_hz(11_000_000), Band::Unknown);
     }
 }
