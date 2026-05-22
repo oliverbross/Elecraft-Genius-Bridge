@@ -1292,6 +1292,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_uses_current_flex_frequency_and_band() {
+        let state = shared_mock_state();
+        {
+            let mut guard = state.write().await;
+            guard.radio_context.frequency_hz = Some(10_125_000);
+            guard.radio_context.band = bridge_core::Band::M30;
+        }
+        let line = status_line(95, &state, false, "control_ready").await;
+        assert!(line.contains("S95|status "));
+        assert!(line.contains("freqA=10.125000"));
+        assert!(line.contains("bandA=30"));
+        assert!(line.contains("state=1"));
+    }
+
+    #[tokio::test]
     async fn relay_command_updates_state() {
         let state = shared_mock_state();
         apply_relay_command("tune relay=0 move=1", &state)

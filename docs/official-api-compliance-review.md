@@ -29,7 +29,7 @@ Phase 47 scope is protocol correctness. It does not treat Elecraft serial pollin
 | `bypass set=0/1` | `C<seq>|bypass set=N` | Success/error | desired bypass state | Full when enabled | KAT500 `BYP;` / `BYPN;` | State-change safe, gated | Maps through existing safety gate. |
 | `activate ant=N` | `C<seq>|activate ant=N` | Success + status push | antenna 1..3 | Full when enabled | KAT500 `AN<n>;` | State-change safe, gated | Implemented via desired antenna state. |
 | `activate ch=N` | `C<seq>|activate ch=N` | Success/error | active channel | Partial | None | Read-only/virtual state | Added stable virtual channel acceptance; EGB only emulates one KAT500 path. |
-| `autotune` | `C<seq>|autotune` | Success + status push | tune request | Full when enabled | KAT500 `T;` | RF-risk/tune gated | Existing mapping retained; tune lifecycle now resets after completion/failure. |
+| `autotune` | `C<seq>|autotune` | Success + status push | tune request | Full when enabled | KAT500 `F <kHz>;` then `T;` | RF-risk/tune gated | Flex TX frequency is applied as KAT500 ATU frequency context before tune. |
 | `save` | `C<seq>|save` | Success/reboot behavior | persistent config | Partial safe no-op | None | State-change/config | Added stable success; EGB config persistence remains YAML/GUI owned. |
 | `tune relay/move` | `C<seq>|tune relay=N move=+1|-1` | Success/error | relay C1/L/C2 and movement | Partial | None yet | Destructive/unknown | Accepts official 1-based ids and old zero-based traces, but does not send unverified KAT500 relay controls. |
 

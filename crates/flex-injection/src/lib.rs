@@ -3,7 +3,7 @@ use bridge_core::{
     append_evidence_json, append_evidence_line, Band, ConnectionState, FlexMeterHandle,
     LifecycleState, SharedState,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -181,6 +181,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     Err(_) => anyhow::bail!("timed out waiting for Flex API traffic"),
                 };
                 session.observe_line(&line);
+                session.remember_recent_line(format!("RX {line}"));
                 if let Some(handle) = session.handle.clone() {
                     let mut guard = state.write().await;
                     guard.flex_injection.client_handle = Some(handle);
@@ -269,7 +270,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         )
                         .await;
                         if status.is_removed() {
-                            record_amplifier_removed(&state, &status.handle).await;
+                            record_amplifier_removed(&state, &status.handle, &session).await;
                             continue;
                         }
                         set_amplifier_handle(&state, &status.handle).await;
@@ -587,6 +588,7 @@ async fn send_tracked_command(
         );
     }
     send_command(writer, seq, &pending.command).await?;
+    session.remember_recent_line(format!("TX C{seq}|{}", pending.command));
     if pending.kind == PendingKind::AmplifierCreate {
         append_flex_log_line(
             "amplifier-status-lines.log",
@@ -707,9 +709,17 @@ struct FlexSession {
     assist_sent_handle: Option<String>,
     pending: HashMap<u32, PendingCommand>,
     sent_labels: HashSet<String>,
+    recent_lines: VecDeque<String>,
 }
 
 impl FlexSession {
+    fn remember_recent_line(&mut self, line: impl Into<String>) {
+        if self.recent_lines.len() >= 50 {
+            self.recent_lines.pop_front();
+        }
+        self.recent_lines.push_back(line.into());
+    }
+
     fn cleanup_pending(&mut self, ttl: Duration, max_size: usize) -> u64 {
         let now = Instant::now();
         let before = self.pending.len();
@@ -982,13 +992,48 @@ async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
     }
 }
 
-async fn record_amplifier_removed(state: &SharedState, handle: &str) {
+async fn record_amplifier_removed(state: &SharedState, handle: &str, session: &FlexSession) {
     let mut guard = state.write().await;
     let previous_state = guard.flex_injection.last_advertised_flex_amp_state.clone();
     let pgxl_client_count = guard.clients.pgxl_client_count;
     let pgxl_started = guard.clients.pgxl_session_started_count;
     let last_command = guard.flex_injection.last_command.clone();
     let last_response = guard.flex_injection.last_response.clone();
+    let last_rx = guard.flex_injection.last_rx_line.clone();
+    let last_tx = guard.flex_injection.last_tx_line.clone();
+    let last_emitted = guard
+        .flex_injection
+        .last_emitted_amplifier_advertisement_line
+        .clone();
+    let last_status = guard.flex_injection.last_amplifier_status_line.clone();
+    let last_pgxl_state = guard.flex_injection.last_advertised_pgxl_state.clone();
+    let kpa_snapshot = serde_json::json!({
+        "connection_state": guard.amp.connection_state.as_str(),
+        "poll_success_count": guard.amp.runtime.poll_success_count,
+        "first_poll_completed": guard.amp.first_poll_completed,
+        "state": guard.amp.state.pgxl_state(),
+        "operate": guard.amp.operate,
+        "temperature_c": guard.amp.temperature_c,
+        "pa_voltage_volts": guard.amp.pa_voltage_volts,
+        "pa_current_amps": guard.amp.pa_current_amps,
+        "forward_power_watts": guard.amp.forward_power_watts,
+        "swr": guard.amp.swr,
+        "fault": guard.amp.fault,
+        "last_raw_response": guard.amp.last_raw_response,
+        "last_successful_command": guard.amp.last_successful_command,
+    });
+    let object_snapshot = serde_json::json!({
+        "amplifier_create_count": guard.flex_injection.amplifier_create_count,
+        "duplicate_amplifier_create_count": guard.flex_injection.duplicate_amplifier_create_count,
+        "duplicate_meter_create_count": guard.flex_injection.duplicate_meter_create_count,
+        "duplicate_interlock_create_count": guard.flex_injection.duplicate_interlock_create_count,
+        "duplicate_subscription_count": guard.flex_injection.duplicate_subscription_count,
+        "amplifier_create_accepted": guard.flex_injection.amplifier_create_accepted,
+        "sub_amplifier_all_accepted": guard.flex_injection.sub_amplifier_all_accepted,
+        "meter_handles": guard.flex_injection.meter_handles,
+        "interlock_handle": guard.flex_injection.interlock_handle,
+    });
+    let recent_lines = session.recent_lines.iter().cloned().collect::<Vec<_>>();
     guard.flex_injection.amplifier_removed_count = guard
         .flex_injection
         .amplifier_removed_count
@@ -1019,6 +1064,14 @@ async fn record_amplifier_removed(state: &SharedState, handle: &str) {
             "pgxl_session_started_count": pgxl_started,
             "last_flex_command": last_command,
             "last_flex_response": last_response,
+            "last_flex_rx": last_rx,
+            "last_flex_tx": last_tx,
+            "last_emitted_amplifier_line": last_emitted,
+            "last_radio_amplifier_status_line": last_status,
+            "last_pgxl_advertised_state": last_pgxl_state,
+            "kpa_snapshot": kpa_snapshot,
+            "flex_object_snapshot": object_snapshot,
+            "recent_flex_lines": recent_lines,
         }),
     );
     append_evidence_line(
@@ -1026,6 +1079,23 @@ async fn record_amplifier_removed(state: &SharedState, handle: &str) {
         format!(
             "- Flex reported amplifier `{handle}` removed. previous_state={:?} pgxl_clients={} pgxl_sessions={} last_command={:?} last_response={:?}",
             previous_state, pgxl_client_count, pgxl_started, last_command, last_response
+        ),
+    );
+    append_evidence_line(
+        "amplifier-removed-live-root-cause.md",
+        format!(
+            "# Amplifier Removed Live Root Cause\n\nObserved `amplifier {handle} removed` from Flex.\n\n\
+## Last Flex Lines\n\n{}\n\n\
+## Last Advertisements\n\n- Last emitted amplifier line: {:?}\n- Last radio amplifier status line: {:?}\n- Last PGXL advertised state: {:?}\n\n\
+## KPA Snapshot\n\n```json\n{}\n```\n\n\
+## Flex Object Snapshot\n\n```json\n{}\n```\n\n\
+## Interpretation\n\nThis is a Flex-side object lifecycle failure. The run is not operationally ready until the preceding Flex RX/TX sequence shows whether the radio removed the object because of duplicate registration, rejected lifecycle commands, keepalive loss, interlock/meter rejection, or invalid amplifier identity fields.\n",
+            recent_lines.join("\n"),
+            last_emitted,
+            last_status,
+            last_pgxl_state,
+            serde_json::to_string_pretty(&kpa_snapshot).unwrap_or_else(|_| "{}".to_string()),
+            serde_json::to_string_pretty(&object_snapshot).unwrap_or_else(|_| "{}".to_string()),
         ),
     );
 }
@@ -1758,6 +1828,7 @@ async fn synthetic_amplifier_status_line(
 fn advertised_amp_state(amp: &bridge_core::AmpState) -> &'static str {
     if !amp.first_poll_completed
         && amp.startup_state_policy.as_deref() == Some("wait_for_first_kpa_poll")
+        && !amp_has_recent_poll(amp)
     {
         return "UNKNOWN";
     }
@@ -1766,6 +1837,15 @@ fn advertised_amp_state(amp: &bridge_core::AmpState) -> &'static str {
     } else {
         amp.state.pgxl_state()
     }
+}
+
+fn amp_has_recent_poll(amp: &bridge_core::AmpState) -> bool {
+    if amp.runtime.poll_success_count == 0 {
+        return false;
+    }
+    amp.last_successful_poll_at
+        .and_then(|poll| SystemTime::now().duration_since(poll).ok())
+        .is_some_and(|elapsed| elapsed <= Duration::from_secs(10))
 }
 
 fn advertised_amp_state_for_settings(
@@ -2353,6 +2433,55 @@ mod tests {
         }
         let commands = registration_commands_with_state(&settings, &state).await;
         assert!(commands[0].command.contains("state=UNKNOWN"));
+    }
+
+    #[tokio::test]
+    async fn wait_policy_uses_live_state_after_recent_poll() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
+            pgxl_connect_assist: false,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.startup_state_policy = Some("wait_for_first_kpa_poll".to_string());
+            guard.amp.connection_state = bridge_core::ConnectionState::Connected;
+            guard.amp.connected = true;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+            guard.amp.temperature_c = 38.0;
+            guard.amp.last_successful_poll_at = Some(SystemTime::now());
+            guard.amp.runtime.record_poll_success(20);
+        }
+        let commands = registration_commands_with_state(&settings, &state).await;
+        assert!(commands[0].command.contains("state=OPERATE"));
+        assert!(!commands[0].command.contains("state=UNKNOWN"));
+
+        let status = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
+        assert!(status.contains("state=OPERATE"));
+        assert!(status.contains("temp=38.0"));
     }
 
     #[test]

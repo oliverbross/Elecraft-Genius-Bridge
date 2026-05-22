@@ -6,7 +6,7 @@ This table maps official PGXL/TGXL behavior onto verified Elecraft KPA500/KAT500
 
 | Official TGXL behavior | Elecraft command | Verification | Safety |
 |---|---|---|---|
-| `autotune` | `T;` | Supported by current KAT500 control path | RF-risk/tune gated |
+| `autotune` | `F <kHz>;` then `T;` | `F` is documented frequency context; `T;` is hardware-confirmed executable | RF-risk/tune gated |
 | `bypass set=1` | `BYP;` | Command mapping present; validate before broad use | State-change safe, gated |
 | `bypass set=0` | `BYPN;` | Command mapping present; validate before broad use | State-change safe, gated |
 | `activate ant=N` | `AN<n>;` | Command mapping present; validate before broad use | State-change safe, gated |
@@ -39,6 +39,6 @@ This table maps official PGXL/TGXL behavior onto verified Elecraft KPA500/KAT500
 
 ## Known Limitations
 
-- KAT500 band forcing is not sent because a verified safe band-set command is not confirmed.
+- KAT500 band/frequency context uses documented `F <kHz>;` before tune. Raw relay forcing remains unsupported.
 - PGXL `vac` is not populated from KPA500 `^VI` unless voltage semantics are validated against PGXL expectations.
 - TGXL manual relay controls remain blocked because KAT500 relay equivalents are not verified.

@@ -82,6 +82,12 @@ const CMD_AUTOTUNE: ElecraftCommand = ElecraftCommand {
     safety: CommandSafety::RfRisk,
     verified: true,
 };
+const CMD_FREQUENCY_CONTEXT: ElecraftCommand = ElecraftCommand {
+    label: "set_frequency_context",
+    wire: "F <kHz>;",
+    safety: CommandSafety::StateChangeSafe,
+    verified: false,
+};
 const CMD_BYPASS_ON: ElecraftCommand = ElecraftCommand {
     label: "set_bypass_on",
     wire: "BYPB;",
@@ -143,6 +149,7 @@ pub fn command_map() -> &'static [ElecraftCommand] {
         CMD_FAULT,
         CMD_VSWR,
         CMD_FORWARD_ADC,
+        CMD_FREQUENCY_CONTEXT,
         CMD_AUTOTUNE,
         CMD_BYPASS_ON,
         CMD_BYPASS_OFF,
@@ -444,7 +451,7 @@ impl Kat500Driver {
         };
 
         if autotune {
-            let (suppress_duplicate, frequency_hz, band_label) = {
+            let (suppress_duplicate, frequency_hz, band_label, frequency_wire) = {
                 let mut guard = self.state.write().await;
                 let now = SystemTime::now();
                 let suppress_duplicate = guard
@@ -455,6 +462,7 @@ impl Kat500Driver {
                 let frequency_hz = guard.radio_context.frequency_hz;
                 let band = guard.radio_context.band;
                 let band_label = band.as_str().to_string();
+                let frequency_wire = frequency_context_wire(frequency_hz);
                 if suppress_duplicate {
                     guard.controls.duplicate_autotune_suppressed_count = guard
                         .controls
@@ -477,7 +485,7 @@ impl Kat500Driver {
                         "KAT500 T; accepted for execution",
                     );
                 }
-                (suppress_duplicate, frequency_hz, band_label)
+                (suppress_duplicate, frequency_hz, band_label, frequency_wire)
             };
             if suppress_duplicate {
                 append_evidence_json(
@@ -509,10 +517,52 @@ impl Kat500Driver {
             append_evidence_line(
                 "tune-band-decision.md",
                 format!(
-                    "- Tune requested with Flex TX frequency `{:?}` Hz, band `{}`. EGB does not send an unverified KAT500 band-set command; KAT500 receives `T;` only.",
-                    frequency_hz, band_label
+                    "- Tune requested with Flex TX frequency `{:?}` Hz, band `{}`. EGB sends documented KAT500 frequency context `{}` before `T;` when frequency is known and tune is enabled.",
+                    frequency_hz,
+                    band_label,
+                    frequency_wire.as_deref().unwrap_or("none")
                 ),
             );
+            if let Some(wire) = frequency_wire {
+                if self.command_allowed(CMD_AUTOTUNE) {
+                    append_evidence_line(
+                        "kat500-tune-sequence.log",
+                        format!("KAT500 frequency context TX {wire} before T;"),
+                    );
+                    match send_wire_command(
+                        port,
+                        CMD_FREQUENCY_CONTEXT.label,
+                        &wire,
+                        &["F "],
+                        Duration::from_millis(1000),
+                        transcript,
+                    )
+                    .await
+                    {
+                        Ok(read) => {
+                            let mut guard = self.state.write().await;
+                            parse_kat500_response(&read.response, &mut guard.tuner);
+                            guard.controls.last_safety_decision =
+                                Some("kat500_frequency_context_applied".to_string());
+                        }
+                        Err(err) => {
+                            let mut guard = self.state.write().await;
+                            guard.controls.last_safety_decision =
+                                Some(format!("kat500_frequency_context_failed: {err}"));
+                            drop(guard);
+                            append_evidence_line(
+                                "kat500-tune-sequence.log",
+                                format!("KAT500 frequency context failed before tune: {err}"),
+                            );
+                        }
+                    }
+                } else {
+                    append_evidence_line(
+                        "kat500-tune-sequence.log",
+                        format!("KAT500 frequency context {wire} skipped because tune is blocked"),
+                    );
+                }
+            }
             let tune_result = self
                 .apply_desired_command(port, transcript, CMD_AUTOTUNE, "TGXL autotune -> KAT500 T;")
                 .await;
@@ -788,6 +838,12 @@ impl Kat500Driver {
             );
         }
         Ok(())
+    }
+
+    fn command_allowed(&self, command: ElecraftCommand) -> bool {
+        (command.safety == CommandSafety::ReadOnly || !self.settings.dry_run)
+            && (command.safety != CommandSafety::StateChangeSafe || self.settings.allow_control)
+            && (command.safety != CommandSafety::RfRisk || self.settings.allow_rf_risk)
     }
 
     async fn open_with_discovery(
@@ -1075,6 +1131,29 @@ fn parse_kat500_response(response: &str, tuner: &mut bridge_core::TunerState) {
             Ok(value) if value <= 4095 => tuner.forward_power_watts = f32::from(value),
             _ => warn_invalid("forward_adc", raw, response),
         }
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("F ")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        let frequency = raw.trim();
+        if frequency.parse::<u32>().is_ok() {
+            set_capability_value(&mut tuner.capabilities, "atu_frequency_khz", frequency);
+        } else {
+            warn_invalid("atu_frequency_khz", raw, response);
+        }
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("BN")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        if raw.parse::<u8>().is_ok_and(|value| value <= 10) {
+            set_capability_value(&mut tuner.capabilities, "band_number", raw);
+        } else {
+            warn_invalid("band_number", raw, response);
+        }
     }
 }
 
@@ -1259,7 +1338,8 @@ fn expected_prefixes(command: ElecraftCommand) -> &'static [&'static str] {
         "read_fault" => &["FLT"],
         "read_vswr" => &["VSWR "],
         "read_forward_adc" => &["VFWD "],
-        "autotune" => &["T", "TP", "VSWR", "VRFL", "F", "ATTN", "AMPI", "BN"],
+        "autotune" => &["T", "FT"],
+        "set_frequency_context" => &["F "],
         _ => &[],
     }
 }
@@ -1296,6 +1376,14 @@ fn antenna_command(antenna: u8) -> ElecraftCommand {
         safety: CommandSafety::StateChangeSafe,
         verified: antenna <= 3,
     }
+}
+
+fn frequency_context_wire(frequency_hz: Option<u64>) -> Option<String> {
+    let frequency_hz = frequency_hz?;
+    if !(1_800_000..=54_000_000).contains(&frequency_hz) {
+        return None;
+    }
+    Some(format!("F {};", (frequency_hz + 500) / 1000))
 }
 
 struct SerialTranscript {
@@ -1491,6 +1579,35 @@ mod tests {
     }
 
     #[test]
+    fn frequency_context_wire_uses_flex_tx_frequency_khz() {
+        assert_eq!(
+            frequency_context_wire(Some(10_125_000)).as_deref(),
+            Some("F 10125;")
+        );
+        assert_eq!(
+            frequency_context_wire(Some(14_200_499)).as_deref(),
+            Some("F 14200;")
+        );
+        assert_eq!(
+            frequency_context_wire(Some(14_200_500)).as_deref(),
+            Some("F 14201;")
+        );
+        assert_eq!(frequency_context_wire(Some(1_000_000)), None);
+        assert_eq!(frequency_context_wire(None), None);
+    }
+
+    #[test]
+    fn parser_records_frequency_and_band_context_responses() {
+        let mut tuner = bridge_core::TunerState::default();
+        parse_kat500_response("F 10125;", &mut tuner);
+        parse_kat500_response("BN04;", &mut tuner);
+        assert!(tuner
+            .capabilities
+            .contains(&"atu_frequency_khz=10125".to_string()));
+        assert!(tuner.capabilities.contains(&"band_number=04".to_string()));
+    }
+
+    #[test]
     fn response_matching_routes_out_of_order_lines() {
         assert!(!matches_expected_response(
             "VRFL 0;",
@@ -1538,11 +1655,12 @@ mod tests {
             .all(|command| !command.label.is_empty() && !command.wire.is_empty()));
         assert_eq!(CMD_FIRMWARE.safety, CommandSafety::ReadOnly);
         assert_eq!(CMD_AUTOTUNE.safety, CommandSafety::RfRisk);
+        assert_eq!(CMD_FREQUENCY_CONTEXT.safety, CommandSafety::StateChangeSafe);
         assert_eq!(antenna_command(1).safety, CommandSafety::StateChangeSafe);
         assert!(command_map()
             .iter()
             .filter(|command| command.safety != CommandSafety::DestructiveOrUnknown)
-            .all(|command| command.verified));
+            .all(|command| command.verified || command.label == "set_frequency_context"));
     }
 
     #[test]

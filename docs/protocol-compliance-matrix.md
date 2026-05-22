@@ -23,7 +23,7 @@ Phase 45 source baseline:
 | `bypass set=0/1` | Missing | Maps to desired KAT500 `BYP;` / `BYPN;` through existing safety gates | Requires live hardware validation with controls enabled. |
 | `activate ch=1/2` | Missing | Not yet implemented | Existing `activate ant=N` remains implemented. |
 | `activate ant=1/2/3` | Implemented | Kept | Requires controls enabled to actuate KAT500 antenna command. |
-| `autotune` | Implemented | Kept; now paired with Flex band/frequency evidence | KAT500 cannot be explicitly forced to a band with current verified command map. |
+| `autotune` | Implemented | KAT500 `F <kHz>;` context is sent before `T;` when Flex TX frequency is known and tune is enabled | KAT500 owns memory/bin behavior; raw relay forcing remains unsupported. |
 
 ## Flex Radio Context
 
@@ -47,6 +47,6 @@ Phase 45 source baseline:
 
 ## Known Compatibility Workarounds
 
-`pgxl_connect_assist` sends a Flex-side `amplifier set <handle> operate=1` to trigger AetherSDR PGXL TCP connection. It does not send `^OS1;` to KPA500. Flex has rejected this in some runs with `500000A7`, so it is a compatibility workaround, not the primary lifecycle model.
+`pgxl_connect_assist` sends a Flex-side `amplifier set <handle> operate=1` to trigger AetherSDR PGXL TCP connection. It does not send `^OS1;` to KPA500. Flex has rejected this in some runs with `500000A7`, so it is an advanced compatibility workaround, not the primary lifecycle model, and should remain off by default.
 
 The preferred stable path is the documented PGXL lifecycle: amplifier create, meters, interlock, keepalive, subscriptions, and a stable LAN-reachable `ip`/`port`.

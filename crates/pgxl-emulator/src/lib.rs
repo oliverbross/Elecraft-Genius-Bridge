@@ -571,6 +571,7 @@ fn status_body_from_amp(amp: &bridge_core::AmpState, aethersdr_compat: bool) -> 
 fn advertised_state_from_amp(amp: &bridge_core::AmpState) -> &'static str {
     if !amp.first_poll_completed
         && amp.startup_state_policy.as_deref() == Some("wait_for_first_kpa_poll")
+        && !amp_has_recent_poll(amp)
     {
         return "UNKNOWN";
     }
@@ -579,6 +580,15 @@ fn advertised_state_from_amp(amp: &bridge_core::AmpState) -> &'static str {
     } else {
         amp.state.pgxl_state()
     }
+}
+
+fn amp_has_recent_poll(amp: &bridge_core::AmpState) -> bool {
+    if amp.runtime.poll_success_count == 0 {
+        return false;
+    }
+    amp.last_successful_poll_at
+        .and_then(|poll| SystemTime::now().duration_since(poll).ok())
+        .is_some_and(|elapsed| elapsed <= Duration::from_secs(10))
 }
 
 fn pgxl_meffa_value(amp: &bridge_core::AmpState) -> &str {
@@ -1049,6 +1059,32 @@ mod tests {
         assert!(body.contains("vac=0"));
         assert!(body.contains("meffa=OK"));
         assert!(body.contains("peakfwd=44.7712"));
+    }
+
+    #[tokio::test]
+    async fn healthy_kpa_state_never_emits_pgxl_unknown() {
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.startup_state_policy = Some("wait_for_first_kpa_poll".to_string());
+            guard.amp.first_poll_completed = false;
+            guard.amp.connection_state = ConnectionState::Connected;
+            guard.amp.connected = true;
+            guard.amp.operate = true;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+            guard.amp.temperature_c = 38.0;
+            guard.amp.pa_voltage_volts = 68.9;
+            guard.amp.pa_current_amps = 0.0;
+            guard.amp.swr = 1.0;
+            guard.amp.meffa = "OK".to_string();
+            guard.amp.last_successful_poll_at = Some(SystemTime::now());
+            guard.amp.runtime.record_poll_success(25);
+        }
+        let body = status_body(&state, true).await;
+        assert!(body.contains("state=OPERATE"));
+        assert!(!body.contains("state=UNKNOWN"));
+        assert!(body.contains("temp=38.0"));
+        assert!(body.contains("meffa=OK"));
     }
 
     #[test]
