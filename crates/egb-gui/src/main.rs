@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_CONFIG: &str = "config.aethersdr-operational.yaml";
+const DEFAULT_CONFIG: &str = "config.aethersdr-real-operational.yaml";
 const LOG_LIMIT: usize = 500;
 const GUI_SETTINGS_PATH: &str = "egb-gui-settings.yaml";
 const GUI_GIT_COMMIT: &str = env!("GIT_HASH");
@@ -387,6 +387,7 @@ impl GuiApp {
             .unwrap_or("not running");
         let restart_required = self.restart_required();
         ui.horizontal_wrapped(|ui| {
+            field(ui, "Profile", config_profile_label(&self.config_path));
             field(ui, "Loaded config", self.config_path.display().to_string());
             field(ui, "Saved", if saved { "Saved" } else { "Unsaved" });
             field(ui, "Running config", running_path);
@@ -2222,7 +2223,7 @@ impl GuiApp {
                 self.save_config();
             }
             let ops_btn = egui::Button::new(
-                egui::RichText::new("Use Recommended Operational Config").size(12.0),
+                egui::RichText::new("Use Real Operational Tune/Standby Config").size(12.0),
             )
             .fill(egui::Color32::from_rgb(35, 55, 95))
             .rounding(egui::Rounding::same(6.0))
@@ -2232,7 +2233,7 @@ impl GuiApp {
                 let saved_kat_com = self.config.kat500.com_port.clone();
                 let saved_radio_ip = self.config.flex_injection.radio_ip.clone();
                 let saved_amp_ip = self.config.flex_injection.amplifier_ip.clone();
-                self.config_path = PathBuf::from("config.aethersdr-operational.yaml");
+                self.config_path = PathBuf::from("config.aethersdr-real-operational.yaml");
                 self.load_config();
                 self.config.kpa500.com_port = saved_kpa_com;
                 self.config.kat500.com_port = saved_kat_com;
@@ -2241,7 +2242,7 @@ impl GuiApp {
                 self.apply_recommended_aethersdr_setup(true);
                 self.save_config();
                 self.push_log(
-                    "switched to config.aethersdr-operational.yaml with current COM/IP values",
+                    "switched to config.aethersdr-real-operational.yaml with current COM/IP values",
                 );
             }
             if ui.button("Scan Serial Ports").clicked() {
@@ -4137,6 +4138,21 @@ fn runtime_build_matches(status: &StatusSnapshot) -> bool {
     status.bridge.git_commit.as_deref() == Some(GUI_GIT_COMMIT)
 }
 
+fn config_profile_label(path: &Path) -> &'static str {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    match name {
+        "config.aethersdr-known-good.yaml" => "Monitor / Dry-run known-good",
+        "config.aethersdr-real-operational.yaml" => "Real operational Tune/Standby",
+        "config.aethersdr-operational.yaml" => "Legacy operational profile",
+        value if value.contains("readonly") => "Read-only / dry-run",
+        value if value.contains("mock") => "Mock",
+        _ => "Custom",
+    }
+}
+
 fn run_egb_capture(args: &[String]) -> Result<String> {
     let output = Command::new(find_egb_binary()?)
         .args(args)
@@ -4713,6 +4729,18 @@ mod tests {
         assert!(parsed.start_bridge_on_launch);
         assert!(parsed.redact_diagnostics);
         assert!(parsed.advanced_diagnostics);
+    }
+
+    #[test]
+    fn config_profile_label_distinguishes_monitor_and_real_operational() {
+        assert_eq!(
+            config_profile_label(Path::new("config.aethersdr-known-good.yaml")),
+            "Monitor / Dry-run known-good"
+        );
+        assert_eq!(
+            config_profile_label(Path::new("config.aethersdr-real-operational.yaml")),
+            "Real operational Tune/Standby"
+        );
     }
 
     #[test]

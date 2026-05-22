@@ -665,15 +665,13 @@ impl Kat500Driver {
         {
             let mut guard = self.state.write().await;
             guard.controls.last_mapped_elecraft_action = Some(action.to_string());
-            guard.controls.last_safety_decision =
-                if command.label == "autotune" && decision == "blocked_by_dry_run" {
-                    Some(
-                        "TGXL autotune command received and intentionally blocked by dry_run"
-                            .to_string(),
-                    )
-                } else {
-                    Some(decision.to_string())
-                };
+            guard.controls.last_safety_decision = if command.label == "autotune"
+                && decision == "blocked_by_dry_run"
+            {
+                Some("Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-real-operational.yaml for live tune testing.".to_string())
+            } else {
+                Some(decision.to_string())
+            };
             match decision {
                 "blocked_by_dry_run" => {
                     guard.controls.blocked_by_dry_run_count =
@@ -700,7 +698,7 @@ impl Kat500Driver {
         append_evidence_line(
             "tgxl-control-commands.log",
             if command.label == "autotune" && decision == "blocked_by_dry_run" {
-                "TGXL autotune command received and intentionally blocked by dry_run".to_string()
+                "Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-real-operational.yaml for live tune testing.".to_string()
             } else {
                 format!("KAT500 {} {} {decision}", command.label, command.wire)
             },

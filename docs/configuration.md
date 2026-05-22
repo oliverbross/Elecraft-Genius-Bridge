@@ -71,7 +71,7 @@ Set `kpa500.allow_rf_risk: true` only for local controlled KPA500 operate testin
 
 ## Operational Mode
 
-Normal profiles stay read-only or dry-run by default. For real AetherSDR operation, use `config.aethersdr-operational.yaml` and enable only the controls you intend to test:
+Normal profiles stay read-only or dry-run by default. For real AetherSDR Tune/Standby testing, use `config.aethersdr-real-operational.yaml`. It enables KAT500 Tune and KPA500 Standby, while keeping KPA500 Operate and clear fault disabled.
 
 ```yaml
 operational:

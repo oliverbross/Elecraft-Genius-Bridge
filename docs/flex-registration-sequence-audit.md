@@ -61,7 +61,7 @@ The latest failed evidence showed these violations:
 After rebuilding the current commit, run a short evidence test with KPA500 Remote closed:
 
 ```powershell
-.\target-msvc\release\egb.exe evidence-test --config .\config.aethersdr-operational.yaml --duration-minutes 5
+.\target-msvc\release\egb.exe evidence-test --config .\config.aethersdr-real-operational.yaml --duration-minutes 5
 ```
 
 Expected safe outcomes:
@@ -70,4 +70,3 @@ Expected safe outcomes:
 - If COM21 is free, KPA preflight passes before amplifier create.
 - Flex amplifier create uses `ip=192.168.0.189`.
 - No `amplifier set <handle> operate=1` is sent unless an RF-risk user command is received and explicitly enabled.
-

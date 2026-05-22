@@ -8,7 +8,7 @@ Defaults remain safe:
 - `allow_rf_risk: false` blocks KPA500 operate and KAT500 tune.
 - `operational.enable_real_controls: false` disables operational overrides.
 
-To run real controls, load `config.aethersdr-operational.yaml`, review the COM ports and IP addresses, then enable only the actions you intend to test:
+To run real Tune/Standby controls, load `config.aethersdr-real-operational.yaml`, review the COM ports and IP addresses, then enable only the actions you intend to test:
 
 ```yaml
 operational:

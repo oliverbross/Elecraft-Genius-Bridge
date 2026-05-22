@@ -1353,6 +1353,48 @@ fn simulate_control(cfg: &BridgeConfig, action: SimulatedControlAction) -> Resul
     Ok(())
 }
 
+fn operation_mode_label(policy: &EffectiveControlPolicy) -> &'static str {
+    if policy.effective_kpa_operate_enabled {
+        "RF-RISK OPERATE"
+    } else if policy.effective_kat_tune_enabled || policy.effective_kpa_standby_enabled {
+        "OPERATIONAL TUNE/STANDBY"
+    } else {
+        "MONITOR ONLY"
+    }
+}
+
+fn operation_mode_detail(policy: &EffectiveControlPolicy) -> String {
+    format!(
+        "kat_tune={} kpa_standby={} kpa_operate={} override_active={}",
+        policy.effective_kat_tune_enabled,
+        policy.effective_kpa_standby_enabled,
+        policy.effective_kpa_operate_enabled,
+        policy.operational_override_active
+    )
+}
+
+fn print_mode_banner(cfg: &BridgeConfig, mode: &str) {
+    let policy = effective_control_policy(cfg);
+    let label = operation_mode_label(&policy);
+    let detail = operation_mode_detail(&policy);
+    let border = "=".repeat(72);
+    println!("{border}");
+    println!("EGB {mode} MODE: {label}");
+    println!("{detail}");
+    println!("{border}");
+    append_evidence_line(
+        "mode-banner.log",
+        format!("mode={mode} label={label} {detail}"),
+    );
+    info!(
+        event_id = "mode_banner",
+        mode,
+        label,
+        detail = %detail,
+        "runtime mode banner"
+    );
+}
+
 async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
     let evidence = EvidenceRun::start("run", &config_path, &cfg, std::env::args())?;
     let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
@@ -1421,6 +1463,7 @@ async fn run_evidence_test(
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start(mode, &config_path, &cfg, std::env::args())?;
+    print_mode_banner(&cfg, mode);
     let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
@@ -5463,6 +5506,32 @@ mod tests {
         assert!(policy.effective_kat_allow_rf_risk);
         assert!(policy.effective_kpa_allow_control);
         assert!(!policy.effective_kpa_allow_rf_risk);
+    }
+
+    #[test]
+    fn mode_banner_labels_monitor_operational_and_rf_risk() {
+        let monitor = BridgeConfig::default();
+        assert_eq!(
+            operation_mode_label(&effective_control_policy(&monitor)),
+            "MONITOR ONLY"
+        );
+
+        let mut tune_standby = BridgeConfig::default();
+        tune_standby.operational.enable_real_controls = true;
+        tune_standby.operational.enable_kat_tune = true;
+        tune_standby.operational.enable_kpa_standby = true;
+        tune_standby.operational.confirm_real_hardware_control = "I understand".to_string();
+        assert_eq!(
+            operation_mode_label(&effective_control_policy(&tune_standby)),
+            "OPERATIONAL TUNE/STANDBY"
+        );
+
+        let mut rf_risk = tune_standby.clone();
+        rf_risk.operational.enable_kpa_operate = true;
+        assert_eq!(
+            operation_mode_label(&effective_control_policy(&rf_risk)),
+            "RF-RISK OPERATE"
+        );
     }
 
     #[test]
