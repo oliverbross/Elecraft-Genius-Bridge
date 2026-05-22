@@ -22,6 +22,7 @@ use std::fs::{self, File};
 use std::io::Seek;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -547,8 +548,328 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn start_bridge(cfg: &BridgeConfig, config_path: Option<&Path>) -> Result<SharedState> {
+fn runtime_git_commit() -> &'static str {
+    option_env!("GIT_HASH").unwrap_or("unknown")
+}
+
+fn runtime_build_timestamp() -> &'static str {
+    option_env!("BUILD_TIMESTAMP").unwrap_or("unknown")
+}
+
+fn executable_path_text() -> String {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("unknown ({err})"))
+}
+
+fn working_dir_text() -> String {
+    std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("unknown ({err})"))
+}
+
+fn print_runtime_startup_identity(config_path: Option<&Path>) {
+    let config = config_path
+        .map(|path| {
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .display()
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("egb executable_path={}", executable_path_text());
+    println!("egb working_dir={}", working_dir_text());
+    println!("egb git_commit={}", runtime_git_commit());
+    println!("egb build_timestamp={}", runtime_build_timestamp());
+    println!("egb config_path={config}");
+    info!(
+        event_id = "runtime_identity",
+        executable_path = %executable_path_text(),
+        working_dir = %working_dir_text(),
+        git_commit = runtime_git_commit(),
+        build_timestamp = runtime_build_timestamp(),
+        config_path = %config,
+        "runtime identity"
+    );
+}
+
+fn git_head_commit() -> Option<String> {
+    let in_repo = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    if String::from_utf8_lossy(&in_repo.stdout).trim().is_empty() {
+        return None;
+    }
+    ProcessCommand::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn enforce_current_binary_if_possible() -> Result<()> {
+    let embedded = runtime_git_commit();
+    if embedded == "unknown" {
+        warn!(
+            event_id = "runtime_commit_unknown",
+            "binary has no embedded git commit; stale-build enforcement skipped"
+        );
+        return Ok(());
+    }
+    let Some(head) = git_head_commit() else {
+        info!(
+            event_id = "runtime_head_unavailable",
+            "git HEAD unavailable; assuming release-folder execution and skipping stale-build enforcement"
+        );
+        return Ok(());
+    };
+    if embedded != head {
+        anyhow::bail!(
+            "RUNTIME_COMMIT_MISMATCH: executable commit {embedded} does not match repository HEAD {head}. Rebuild and run the current egb.exe. executable_path={}",
+            executable_path_text()
+        );
+    }
+    Ok(())
+}
+
+fn advertised_pgxl_ip(cfg: &BridgeConfig) -> Result<IpAddr> {
+    cfg.flex_injection
+        .force_advertised_pgxl_ip
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&cfg.flex_injection.amplifier_ip)
+        .parse()
+        .context("flex_injection advertised PGXL IP passed validation but failed to parse")
+}
+
+fn loopback_pgxl_ip_is_intentional(cfg: &BridgeConfig) -> bool {
+    let server_loopback = cfg
+        .server
+        .bind_ip
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
+    let radio_loopback = cfg
+        .flex_injection
+        .radio_ip
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
+    server_loopback && radio_loopback
+}
+
+fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) -> Result<()> {
+    if cfg.flex_injection.enabled {
+        let advertised = advertised_pgxl_ip(cfg)?;
+        if advertised.is_loopback() && !loopback_pgxl_ip_is_intentional(cfg) {
+            anyhow::bail!(
+                "INVALID_PGXL_ADVERTISED_IP: flex_injection advertises loopback IP {advertised}, but the Flex radio/client path is not local-only. Set flex_injection.amplifier_ip or force_advertised_pgxl_ip to this PC's reachable LAN IP."
+            );
+        }
+        if mode == BridgeStartMode::Operational && cfg.flex_injection.pgxl_connect_assist {
+            anyhow::bail!(
+                "PGXL_CONNECT_ASSIST_DISABLED_FOR_OPERATIONAL_RUN: flex_injection.pgxl_connect_assist sends a rejected Flex operate command and is no longer allowed in operational/evidence runs. Disable it or use a lab command."
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_startup_preflights(
+    cfg: &BridgeConfig,
+    state: &SharedState,
+    policy: &EffectiveControlPolicy,
+    config_path: Option<&Path>,
+    mode: BridgeStartMode,
+) -> Result<()> {
+    validate_operational_start_config(cfg, mode)?;
+    if cfg.kpa500.enabled && !cfg.kpa500.mock && (cfg.pgxl.enabled || cfg.flex_injection.enabled) {
+        run_kpa_startup_preflight(cfg, state, policy).await?;
+    }
+    if cfg.kat500.enabled && !cfg.kat500.mock && cfg.tgxl.enabled {
+        run_kat_startup_preflight(cfg, state, policy).await?;
+    }
+    append_evidence_line(
+        "startup-preflight.log",
+        format!(
+            "startup preflight passed config_path={} mode={mode:?}",
+            config_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+    );
+    Ok(())
+}
+
+async fn run_kpa_startup_preflight(
+    cfg: &BridgeConfig,
+    state: &SharedState,
+    policy: &EffectiveControlPolicy,
+) -> Result<()> {
+    append_evidence_line(
+        "kpa-startup-diagnostics.md",
+        format!(
+            "- KPA500 preflight: port `{}` baud `{}` dry_run `{}`.",
+            cfg.kpa500.com_port, cfg.kpa500.baud, policy.effective_kpa_dry_run
+        ),
+    );
+    info!(
+        event_id = "kpa500_startup_preflight",
+        port = %cfg.kpa500.com_port,
+        baud = cfg.kpa500.baud,
+        dry_run = policy.effective_kpa_dry_run,
+        "KPA500 startup preflight started"
+    );
+    let driver = Kpa500Driver::new(
+        Kpa500Settings {
+            com_port: cfg.kpa500.com_port.clone(),
+            baud: cfg.kpa500.baud,
+            polling_interval: Duration::from_millis(cfg.kpa500.polling_interval_ms),
+            mock: false,
+            dry_run: policy.effective_kpa_dry_run,
+            allow_control: policy.effective_kpa_allow_control,
+            allow_rf_risk: policy.effective_kpa_allow_rf_risk,
+            control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
+            transcript_dir: cfg
+                .logging
+                .serial_transcript_dir
+                .as_ref()
+                .map(PathBuf::from),
+        },
+        state.clone(),
+    );
+    let outcomes = driver.poll_status_outcomes().await.map_err(|err| {
+        anyhow::anyhow!(
+            "KPA500_PORT_LOCKED_OR_UNAVAILABLE: failed KPA500 preflight on {} at {} baud before PGXL/Flex startup: {}. Close Elecraft KPA500 Remote, other EGB instances, or any process holding the COM port.",
+            cfg.kpa500.com_port,
+            cfg.kpa500.baud,
+            err
+        )
+    })?;
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.error.is_some())
+        .map(|outcome| {
+            format!(
+                "{}: {}",
+                outcome.command.label,
+                outcome.error.as_deref().unwrap_or("unknown error")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "KPA500_PORT_LOCKED_OR_UNAVAILABLE: KPA500 preflight opened {} but required read-only commands failed: {}",
+            cfg.kpa500.com_port,
+            failed.join("; ")
+        );
+    }
+    append_evidence_line(
+        "kpa-startup-diagnostics.md",
+        "- KPA500 preflight passed: `^OS;`, `^WS;`, `^TM;`, `^VI;`, and `^FL;` returned valid responses before PGXL/Flex startup.",
+    );
+    info!(
+        event_id = "kpa500_startup_preflight_passed",
+        port = %cfg.kpa500.com_port,
+        "KPA500 startup preflight passed"
+    );
+    Ok(())
+}
+
+async fn run_kat_startup_preflight(
+    cfg: &BridgeConfig,
+    state: &SharedState,
+    policy: &EffectiveControlPolicy,
+) -> Result<()> {
+    append_evidence_line(
+        "kpa-startup-diagnostics.md",
+        format!(
+            "- KAT500 preflight: port `{}` baud `{}` dry_run `{}`.",
+            cfg.kat500.com_port, cfg.kat500.baud, policy.effective_kat_dry_run
+        ),
+    );
+    info!(
+        event_id = "kat500_startup_preflight",
+        port = %cfg.kat500.com_port,
+        baud = cfg.kat500.baud,
+        dry_run = policy.effective_kat_dry_run,
+        "KAT500 startup preflight started"
+    );
+    let driver = Kat500Driver::new(
+        Kat500Settings {
+            com_port: cfg.kat500.com_port.clone(),
+            baud: cfg.kat500.baud,
+            polling_interval: Duration::from_millis(cfg.kat500.polling_interval_ms),
+            mock: false,
+            dry_run: policy.effective_kat_dry_run,
+            allow_control: policy.effective_kat_allow_control,
+            allow_rf_risk: policy.effective_kat_allow_rf_risk,
+            transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
+            transcript_dir: cfg
+                .logging
+                .serial_transcript_dir
+                .as_ref()
+                .map(PathBuf::from),
+        },
+        state.clone(),
+    );
+    let outcomes = driver.poll_status_outcomes().await.map_err(|err| {
+        anyhow::anyhow!(
+            "KAT500_PORT_LOCKED_OR_UNAVAILABLE: failed KAT500 preflight on {} at {} baud before TGXL startup: {}. Close Elecraft KAT500 Utility, other EGB instances, or any process holding the COM port.",
+            cfg.kat500.com_port,
+            cfg.kat500.baud,
+            err
+        )
+    })?;
+    let failed = outcomes
+        .iter()
+        .filter(|outcome| outcome.error.is_some())
+        .map(|outcome| {
+            format!(
+                "{}: {}",
+                outcome.command.label,
+                outcome.error.as_deref().unwrap_or("unknown error")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "KAT500_PORT_LOCKED_OR_UNAVAILABLE: KAT500 preflight opened {} but required read-only commands failed: {}",
+            cfg.kat500.com_port,
+            failed.join("; ")
+        );
+    }
+    append_evidence_line(
+        "kpa-startup-diagnostics.md",
+        "- KAT500 preflight passed before TGXL startup.",
+    );
+    info!(
+        event_id = "kat500_startup_preflight_passed",
+        port = %cfg.kat500.com_port,
+        "KAT500 startup preflight passed"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeStartMode {
+    Operational,
+    Lab,
+}
+
+async fn start_bridge(
+    cfg: &BridgeConfig,
+    config_path: Option<&Path>,
+    mode: BridgeStartMode,
+) -> Result<SharedState> {
     let _ = BRIDGE_STARTED_AT.set(SystemTime::now());
+    print_runtime_startup_identity(config_path);
+    enforce_current_binary_if_possible()?;
     let all_mock = cfg.kpa500.mock && cfg.kat500.mock;
     let state = if all_mock {
         shared_mock_state()
@@ -574,6 +895,8 @@ async fn start_bridge(cfg: &BridgeConfig, config_path: Option<&Path>) -> Result<
         guard.amp.startup_state_policy =
             Some(cfg.flex_injection.amplifier_startup_state_policy.clone());
     }
+
+    run_startup_preflights(cfg, &state, &control_policy, config_path, mode).await?;
 
     if cfg.kpa500.enabled {
         let driver = Kpa500Driver::new(
@@ -699,16 +1022,7 @@ async fn start_bridge(cfg: &BridgeConfig, config_path: Option<&Path>) -> Result<
             .radio_ip
             .parse()
             .context("flex_injection.radio_ip passed validation but failed to parse")?;
-        let advertised_amplifier_ip: IpAddr = cfg
-            .flex_injection
-            .force_advertised_pgxl_ip
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&cfg.flex_injection.amplifier_ip)
-            .parse()
-            .context(
-                "flex_injection force advertised PGXL IP passed validation but failed to parse",
-            )?;
+        let advertised_amplifier_ip = advertised_pgxl_ip(cfg)?;
         let settings = FlexInjectionSettings {
             radio_addr: SocketAddr::new(radio_ip, cfg.flex_injection.radio_port),
             amplifier_ip: advertised_amplifier_ip,
@@ -1041,7 +1355,7 @@ fn simulate_control(cfg: &BridgeConfig, action: SimulatedControlAction) -> Resul
 
 async fn run_bridge(cfg: BridgeConfig, config_path: PathBuf) -> Result<()> {
     let evidence = EvidenceRun::start("run", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     info!("Elecraft Genius Bridge running; press Ctrl+C to stop");
@@ -1060,7 +1374,7 @@ async fn run_soak_test(cfg: BridgeConfig, config_path: PathBuf, duration_hours: 
         anyhow::bail!("--duration-hours must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start("soak-test", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_hours * 3600.0);
@@ -1107,7 +1421,7 @@ async fn run_evidence_test(
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start(mode, &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_minutes * 60.0);
@@ -1160,7 +1474,7 @@ async fn run_ecosystem_soak_test(
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start("ecosystem-soak-test", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_minutes * 60.0);
@@ -1451,7 +1765,7 @@ async fn run_pgxl_pairing_lab(
         anyhow::bail!("--duration-minutes must be a finite value greater than 0");
     }
     let evidence = EvidenceRun::start("pgxl-pairing-lab", &config_path, &cfg, std::env::args())?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Lab).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let duration = Duration::from_secs_f64(duration_minutes * 60.0);
@@ -1522,7 +1836,7 @@ async fn compare_pgxl_profiles(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Lab).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1559,7 +1873,7 @@ async fn run_amplifier_operate_lab(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Lab).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1592,7 +1906,6 @@ async fn run_aethersdr_operational_test(
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         anyhow::bail!("--duration-seconds must be a finite value greater than 0");
     }
-    cfg.flex_injection.pgxl_connect_assist = true;
     cfg.flex_injection.trace_amplifier_advertisements = true;
     cfg.validate()?;
     let evidence = EvidenceRun::start(
@@ -1601,7 +1914,7 @@ async fn run_aethersdr_operational_test(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1629,7 +1942,6 @@ async fn run_full_operational_test(
     if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
         anyhow::bail!("--duration-seconds must be a finite value greater than 0");
     }
-    cfg.flex_injection.pgxl_connect_assist = true;
     cfg.flex_injection.trace_amplifier_advertisements = true;
     cfg.validate()?;
     let evidence = EvidenceRun::start(
@@ -1638,7 +1950,7 @@ async fn run_full_operational_test(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1707,7 +2019,7 @@ async fn run_pgxl_direct_trigger_matrix(
         &cfg,
         std::env::args(),
     )?;
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Lab).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -1755,7 +2067,7 @@ async fn test_startup_sequence(
         "first-poll-sequence.log",
         "Starting bridge with KPA first-poll gate before Flex amplifier advertisement",
     );
-    let state = start_bridge(&cfg, Some(&config_path)).await?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
     evidence.write_status("status-start.json", &state).await?;
     let sampler = evidence.start_status_sampler(state.clone());
     let started = Instant::now();
@@ -3172,30 +3484,49 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
 
 async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
     let guard = state.read().await;
-    let mut failures = Vec::new();
-    let mut warnings = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     if guard.amp.runtime.poll_success_count == 0 {
-        failures.push("KPA500 polling did not succeed");
+        failures.push("KPA500 polling did not succeed".to_string());
     }
     if guard.tuner.runtime.poll_success_count == 0 {
-        failures.push("KAT500 polling did not succeed");
+        failures.push("KAT500 polling did not succeed".to_string());
     }
     if guard.clients.pgxl_session_started_count == 0 {
-        warnings.push("No PGXL direct client connected during the test");
+        warnings.push("No PGXL direct client connected during the test".to_string());
     }
     if guard.clients.tgxl_session_started_count == 0 {
-        warnings.push("No TGXL direct client connected during the test");
+        warnings.push("No TGXL direct client connected during the test".to_string());
     }
     if cfg.flex_injection.enabled {
+        if let Err(err) = validate_operational_start_config(cfg, BridgeStartMode::Operational) {
+            failures.push(err.to_string());
+        }
         if guard.flex_injection.connection_state != ConnectionState::Connected {
-            failures.push("Flex injection is not connected");
+            failures.push("Flex injection is not connected".to_string());
         }
         if guard.flex_injection.amplifier_handle.is_none() {
-            failures.push("Flex amplifier handle was not created");
+            failures.push("Flex amplifier handle was not created".to_string());
+        }
+        if guard.flex_injection.amplifier_removed_count > 0 {
+            failures.push("Flex removed the amplifier object".to_string());
+        }
+        if guard.flex_injection.duplicate_amplifier_create_count > 0 {
+            failures.push("Duplicate amplifier create attempts occurred".to_string());
+        }
+    }
+    if let Some(head) = git_head_commit() {
+        let embedded = runtime_git_commit();
+        if embedded != "unknown" && embedded != head {
+            failures.push(
+                "RUNTIME_COMMIT_MISMATCH: running binary commit differs from repository HEAD"
+                    .to_string(),
+            );
         }
     }
     if guard.config_identity.config_hash_match == Some(false) {
-        failures.push("CONFIG_MISMATCH: source config and effective runtime config differ");
+        failures
+            .push("CONFIG_MISMATCH: source config and effective runtime config differ".to_string());
     }
     if guard.effective_controls.operational_override_active
         && guard
@@ -3206,7 +3537,9 @@ async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &Shar
                 reason.contains("dry_run") && !reason.contains("intentionally blocked")
             })
     {
-        warnings.push("A control was still blocked by dry_run despite operational override");
+        warnings.push(
+            "A control was still blocked by dry_run despite operational override".to_string(),
+        );
     }
     let verdict = if failures.is_empty() {
         if warnings.is_empty() {
@@ -5153,6 +5486,43 @@ mod tests {
         assert!(identity.config_hash.is_some());
         assert!(identity.config_effective_hash.is_some());
         assert_eq!(identity.config_hash, identity.config_effective_hash);
+    }
+
+    #[test]
+    fn operational_start_rejects_loopback_pgxl_ip_for_lan_radio() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
+        cfg.flex_injection.amplifier_ip = "127.0.0.1".to_string();
+        cfg.server.bind_ip = "127.0.0.1".to_string();
+        let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("INVALID_PGXL_ADVERTISED_IP"));
+    }
+
+    #[test]
+    fn operational_start_allows_loopback_pgxl_ip_for_local_radio_path() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "127.0.0.1".to_string();
+        cfg.flex_injection.amplifier_ip = "127.0.0.1".to_string();
+        cfg.server.bind_ip = "127.0.0.1".to_string();
+        validate_operational_start_config(&cfg, BridgeStartMode::Operational).unwrap();
+    }
+
+    #[test]
+    fn operational_start_rejects_pgxl_connect_assist() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
+        cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
+        cfg.flex_injection.pgxl_connect_assist = true;
+        let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PGXL_CONNECT_ASSIST_DISABLED"));
+        validate_operational_start_config(&cfg, BridgeStartMode::Lab).unwrap();
     }
 
     #[test]

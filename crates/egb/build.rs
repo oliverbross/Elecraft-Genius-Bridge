@@ -3,6 +3,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    if let Some(head_ref) = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        println!("cargo:rerun-if-changed=../../.git/{head_ref}");
+    }
     let git = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

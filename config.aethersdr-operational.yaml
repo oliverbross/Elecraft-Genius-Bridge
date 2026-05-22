@@ -72,10 +72,10 @@ operational:
 
 flex_injection:
   enabled: true
-  radio_ip: 127.0.0.1
+  radio_ip: 192.168.0.199
   radio_port: 4992
-  amplifier_ip: 127.0.0.1
-  force_advertised_pgxl_ip:
+  amplifier_ip: 192.168.0.189
+  force_advertised_pgxl_ip: 192.168.0.189
   amplifier_port: 9008
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
@@ -88,10 +88,10 @@ flex_injection:
   trace_amplifier_advertisements: true
   pgxl_force_operate_advertisement: false
   flex_force_operate_via_radio: false
-  pgxl_connect_assist: true
+  pgxl_connect_assist: false
   amplifier_startup_state_policy: wait_for_first_kpa_poll
   wait_first_kpa_poll_timeout_ms: 10000
-  amplifier_reannounce_interval_ms: 5000
+  amplifier_reannounce_interval_ms: 30000
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
