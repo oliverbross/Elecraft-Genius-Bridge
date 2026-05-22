@@ -69,6 +69,12 @@ impl FlexInjectionSettings {
         self.pgxl_force_operate_advertisement
             || self.amplifier_status_profile == "aethersdr_pgxl_direct_lab"
     }
+
+    fn is_lab_mode(&self) -> bool {
+        self.amplifier_status_profile == "aethersdr_pgxl_direct_lab"
+            || self.pgxl_force_operate_advertisement
+            || self.flex_force_operate_via_radio
+    }
 }
 
 pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
@@ -101,10 +107,36 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
                 guard.flex_injection.last_error = Some(err.to_string());
             }
         }
+        let amplifier_removed = {
+            let guard = state.read().await;
+            guard.flex_injection.amplifier_removed_count > 0
+        };
         {
             let mut guard = state.write().await;
             if guard.flex_injection.connection_state == ConnectionState::Connected {
                 backoff = settings.reconnect_initial.max(Duration::from_millis(100));
+            }
+            if amplifier_removed && !settings.is_lab_mode() {
+                guard.flex_injection.connection_state = ConnectionState::Degraded;
+                guard.flex_injection.degraded_reason = Some(
+                    "Flex removed the amplifier object; registration halted until bridge restart"
+                        .to_string(),
+                );
+                guard.flex_injection.amplifier_recreate_reason =
+                    Some("halted after Flex amplifier removed event".to_string());
+                guard.lifecycle.flex_session.transition(
+                    LifecycleState::Degraded,
+                    "Flex amplifier removed; reconnect disabled until restart",
+                );
+                guard.lifecycle.amplifier.transition(
+                    LifecycleState::Removed,
+                    "Flex removed amplifier object; restart required",
+                );
+                warn!(
+                    event_id = "flex_amplifier_registration_halted",
+                    "Flex removed amplifier object; EGB will not recreate it until restart"
+                );
+                break;
             }
             guard.flex_injection.connection_state = ConnectionState::Degraded;
             guard.flex_injection.degraded_reason =
@@ -271,7 +303,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         .await;
                         if status.is_removed() {
                             record_amplifier_removed(&state, &status.handle, &session).await;
-                            continue;
+                            anyhow::bail!(
+                                "Flex removed amplifier object {}; registration halted",
+                                status.handle
+                            );
                         }
                         set_amplifier_handle(&state, &status.handle).await;
                         if settings.flex_force_operate_via_radio {
@@ -1749,10 +1784,23 @@ pub fn amplifier_create_command_with_state(
             }
             command.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1");
         }
-        "strict_real_pgxl" => {}
+        "strict_real_pgxl" | "official_pgxl" => {}
         _ => {}
     }
     command
+}
+
+pub fn amplifier_create_has_nonstandard_fields(command: &str) -> bool {
+    [
+        " state=",
+        " connected=",
+        " configured=",
+        " enabled=",
+        " direct=",
+        " lan=",
+    ]
+    .iter()
+    .any(|field| command.contains(field))
 }
 
 async fn synthetic_amplifier_status_line(
@@ -2579,6 +2627,66 @@ mod tests {
         assert!(variants.iter().any(|variant| {
             variant.name == "STANDBY-A-model-ip" && variant.line.contains("state=STANDBY")
         }));
+    }
+
+    #[tokio::test]
+    async fn real_operational_profile_emits_official_create_only() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "192.168.0.199:4992".parse().unwrap(),
+            amplifier_ip: "192.168.0.189".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "official_pgxl".to_string(),
+            trace_amplifier_advertisements: true,
+            pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
+            pgxl_connect_assist: false,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(30000),
+        };
+        let state = bridge_core::state::shared_default_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.first_poll_completed = true;
+            guard.amp.last_successful_poll_at = Some(SystemTime::now());
+            guard.amp.runtime.record_poll_success(10);
+        }
+        let commands = registration_commands_with_state(&settings, &state).await;
+        assert_eq!(
+            commands[0].command,
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB"
+        );
+        assert!(!amplifier_create_has_nonstandard_fields(
+            &commands[0].command
+        ));
+    }
+
+    #[test]
+    fn force_direct_profile_emits_nonstandard_create_fields_for_lab_only() {
+        let command = amplifier_create_command_with_state(
+            "192.168.0.189".parse().unwrap(),
+            9008,
+            "PowerGeniusXL",
+            "EGB-KPA500",
+            "ANT1:PORTA,ANT2:PORTB",
+            "aethersdr_force_direct",
+            Some("STANDBY"),
+        );
+        assert!(amplifier_create_has_nonstandard_fields(&command));
+        assert!(command.contains("direct=1"));
     }
 
     #[test]

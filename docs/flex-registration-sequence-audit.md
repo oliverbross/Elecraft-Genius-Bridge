@@ -18,6 +18,7 @@ The operational Flex amplifier registration sequence is:
 5. Connect to Flex TCP API port 4992 and wait for `H<client-handle>`.
 6. Send one amplifier create command:
    - `amplifier create ip=<egb-lan-ip> port=9008 model=PowerGeniusXL serial_num=<serial> ant=ANT1:PORTA,ANT2:PORTB`
+   - Do not include `state`, `connected`, `configured`, `enabled`, `direct`, or `lan` on the create command in operational/evidence runs.
 7. Create meters once per Flex session:
    - `meter create name=FWD type=AMP ...`
    - `meter create name=RL type=AMP ...`
@@ -54,6 +55,8 @@ The latest failed evidence showed these violations:
 - KAT500 preflight now blocks TGXL startup when the port is locked or read-only polling fails.
 - Operational/evidence runs reject loopback PGXL advertised IP when the Flex radio path is LAN.
 - Operational/evidence runs reject `pgxl_connect_assist=true`.
+- Operational/evidence runs reject amplifier profiles that add non-standard fields to `amplifier create`.
+- If Flex sends `amplifier <handle> removed`, EGB marks the lifecycle failed and stops re-registering until restart instead of entering a create/remove loop.
 - Operational configs now advertise `192.168.0.189` and keep connect-assist disabled.
 
 ## Remaining Live Proof Needed

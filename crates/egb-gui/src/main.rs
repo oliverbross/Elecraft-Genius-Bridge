@@ -4145,7 +4145,7 @@ fn config_profile_label(path: &Path) -> &'static str {
         .unwrap_or_default();
     match name {
         "config.aethersdr-known-good.yaml" => "Monitor / Dry-run known-good",
-        "config.aethersdr-real-operational.yaml" => "Real operational Tune/Standby",
+        "config.aethersdr-real-operational.yaml" => "Real operational Tune/Standby (official PGXL)",
         "config.aethersdr-operational.yaml" => "Legacy operational profile",
         value if value.contains("readonly") => "Read-only / dry-run",
         value if value.contains("mock") => "Mock",
@@ -4739,7 +4739,7 @@ mod tests {
         );
         assert_eq!(
             config_profile_label(Path::new("config.aethersdr-real-operational.yaml")),
-            "Real operational Tune/Standby"
+            "Real operational Tune/Standby (official PGXL)"
         );
     }
 

@@ -675,8 +675,25 @@ fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) 
                 "PGXL_CONNECT_ASSIST_DISABLED_FOR_OPERATIONAL_RUN: flex_injection.pgxl_connect_assist sends a rejected Flex operate command and is no longer allowed in operational/evidence runs. Disable it or use a lab command."
             );
         }
+        if mode == BridgeStartMode::Operational
+            && amplifier_create_profile_emits_nonstandard_fields(
+                &cfg.flex_injection.amplifier_status_profile,
+            )
+        {
+            anyhow::bail!(
+                "NONSTANDARD_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} adds non-standard fields to the Flex amplifier create command. Use official_pgxl, pgxl_paired, minimal, or strict_real_pgxl for operational/evidence runs.",
+                cfg.flex_injection.amplifier_status_profile
+            );
+        }
     }
     Ok(())
+}
+
+fn amplifier_create_profile_emits_nonstandard_fields(profile: &str) -> bool {
+    matches!(
+        profile,
+        "pgxl_verbose" | "old_good_pgxl" | "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab"
+    )
 }
 
 async fn run_startup_preflights(
@@ -2532,6 +2549,10 @@ async fn evidence_summary_markdown(state: &SharedState, elapsed: Option<Duration
     if guard.flex_injection.tuner_disappeared_count > 0 {
         result = "WARN";
         warnings.push("SmartSDR/Flex tuner presence disappeared during the run.");
+    }
+    if guard.flex_injection.amplifier_removed_count > 0 {
+        result = "FAIL";
+        warnings.push("Flex removed the amplifier object during the run.");
     }
     if guard.clients.pgxl_session_started_count == 0
         && guard.clients.tgxl_session_started_count == 0
@@ -5592,6 +5613,38 @@ mod tests {
             .to_string();
         assert!(err.contains("PGXL_CONNECT_ASSIST_DISABLED"));
         validate_operational_start_config(&cfg, BridgeStartMode::Lab).unwrap();
+    }
+
+    #[test]
+    fn operational_start_rejects_nonstandard_amplifier_create_profiles() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
+        cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
+
+        for profile in [
+            "pgxl_verbose",
+            "old_good_pgxl",
+            "aethersdr_force_direct",
+            "aethersdr_pgxl_direct_lab",
+        ] {
+            cfg.flex_injection.amplifier_status_profile = profile.to_string();
+            let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("NONSTANDARD_AMPLIFIER_CREATE_PROFILE"));
+            validate_operational_start_config(&cfg, BridgeStartMode::Lab).unwrap();
+        }
+
+        for profile in [
+            "official_pgxl",
+            "pgxl_paired",
+            "minimal",
+            "strict_real_pgxl",
+        ] {
+            cfg.flex_injection.amplifier_status_profile = profile.to_string();
+            validate_operational_start_config(&cfg, BridgeStartMode::Operational).unwrap();
+        }
     }
 
     #[test]

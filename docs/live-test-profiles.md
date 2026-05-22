@@ -39,6 +39,7 @@ Purpose:
 - Execute AetherSDR Tune against KAT500.
 - Execute KPA500 Standby when requested.
 - Keep KPA500 Operate disabled.
+- Use the official minimal Flex amplifier create command.
 
 Enabled real commands:
 - KAT500 Tune: `T;`
@@ -48,6 +49,14 @@ Still blocked:
 - KPA500 Operate: `^OS1;`
 - KPA500 clear fault: `^FLC;`
 - KAT500 antenna and bypass changes.
+
+Flex amplifier create line:
+
+```text
+amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB
+```
+
+Operational/evidence runs reject profiles that add non-standard fields such as `state`, `connected`, `configured`, `enabled`, `direct`, or `lan` to the create command.
 
 ## RF-Risk Operate
 
@@ -73,4 +82,3 @@ Real Tune/Standby validation:
 ```powershell
 .\target\release\egb.exe evidence-test --config .\config.aethersdr-real-operational.yaml --duration-minutes 5
 ```
-

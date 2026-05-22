@@ -71,4 +71,10 @@ Operational readiness is a failure if any of these are true:
 - Flex reports `amplifier <handle> removed`.
 - Amplifier create is repeated due to reconnect churn.
 - `pgxl_connect_assist` is enabled in a normal operational/evidence run.
+- The operational amplifier profile would add non-standard fields to `amplifier create`.
 
+The operational create command must be exactly:
+
+```text
+amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB
+```

@@ -479,6 +479,7 @@ impl FlexInjectionConfig {
     fn validate_status_profile(&self) -> Result<(), ConfigError> {
         match self.amplifier_status_profile.as_str() {
             "minimal"
+            | "official_pgxl"
             | "pgxl_paired"
             | "pgxl_verbose"
             | "old_good_pgxl"
@@ -486,7 +487,7 @@ impl FlexInjectionConfig {
             | "aethersdr_pgxl_direct_lab"
             | "strict_real_pgxl" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "flex_injection.amplifier_status_profile must be one of minimal, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_force_direct, aethersdr_pgxl_direct_lab, strict_real_pgxl; got {other}"
+                "flex_injection.amplifier_status_profile must be one of minimal, official_pgxl, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_force_direct, aethersdr_pgxl_direct_lab, strict_real_pgxl; got {other}"
             ))),
         }
     }
@@ -638,6 +639,9 @@ pgxl:
         let mut cfg = BridgeConfig::default();
         cfg.flex_injection.enabled = true;
         cfg.flex_injection.amplifier_status_profile = "strict_real_pgxl".to_string();
+        cfg.validate().unwrap();
+
+        cfg.flex_injection.amplifier_status_profile = "official_pgxl".to_string();
         cfg.validate().unwrap();
 
         cfg.flex_injection.amplifier_status_profile = "old_good_pgxl".to_string();
