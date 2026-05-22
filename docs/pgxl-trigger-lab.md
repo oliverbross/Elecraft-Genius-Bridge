@@ -12,7 +12,8 @@ Profiles:
 - `pgxl_paired`: current normal profile; documented create fields plus evidence logging of a paired PGXL status line.
 - `pgxl_verbose`: experimental; adds `connected=1 configured=1 enabled=1` to the create command.
 - `old_good_pgxl`: last-known-good regression profile with direct-connect readiness fields.
-- `aethersdr_operational`: recommended AetherSDR operational profile; adds live `state` plus `connected=1 configured=1 enabled=1 direct=1 lan=1`.
+- `aethersdr_minimal`: recommended AetherSDR operational profile; adds live `state` only.
+- `aethersdr_operational`: alias for `aethersdr_minimal`.
 - `aethersdr_force_direct`: lab/regression profile; adds verbose fields plus `direct=1 lan=1`.
 
 Experimental fields are isolated behind the profile because they are not confirmed as accepted by real Flex firmware.

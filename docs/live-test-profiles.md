@@ -53,10 +53,10 @@ Still blocked:
 Flex amplifier create line:
 
 ```text
-amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=<live-kpa-state> connected=1 configured=1 enabled=1 direct=1 lan=1
+amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=<live-kpa-state>
 ```
 
-The extra fields are explicitly isolated in `amplifier_status_profile: aethersdr_operational`. Phase 49 safeguards still apply: KPA/KAT preflight must pass, the advertised IP must be reachable from the radio/client path, and `pgxl_connect_assist` remains off.
+The single extra field is explicitly isolated in `amplifier_status_profile: aethersdr_minimal`. Phase 49 safeguards still apply: KPA/KAT preflight must pass, the advertised IP must be reachable from the radio/client path, and `pgxl_connect_assist` remains off.
 
 ## Strict Official PGXL Audit
 

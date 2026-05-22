@@ -251,6 +251,16 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     }
                     for item in items.iter() {
                         if item.label == "amplifier_create" {
+                            validate_amplifier_create_for_profile(
+                                &settings.amplifier_status_profile,
+                                &item.command,
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                            info!(
+                                profile = %settings.amplifier_status_profile,
+                                create_line = %item.command,
+                                "Flex amplifier create profile selected"
+                            );
                             trace_amplifier_advertisement(
                                 settings,
                                 &state,
@@ -1778,7 +1788,12 @@ pub fn amplifier_create_command_with_state(
             }
             command.push_str(" connected=1 configured=1 enabled=1");
         }
-        "aethersdr_operational" | "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
+        "aethersdr_minimal" | "aethersdr_operational" => {
+            if let Some(state_value) = state_value {
+                command.push_str(&format!(" state={}", sanitize_token(state_value)));
+            }
+        }
+        "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
             if let Some(state_value) = state_value {
                 command.push_str(&format!(" state={}", sanitize_token(state_value)));
             }
@@ -1801,6 +1816,44 @@ pub fn amplifier_create_has_nonstandard_fields(command: &str) -> bool {
     ]
     .iter()
     .any(|field| command.contains(field))
+}
+
+pub fn validate_amplifier_create_for_profile(profile: &str, command: &str) -> Result<(), String> {
+    let has_state = command.contains(" state=");
+    let forbidden = [
+        " connected=",
+        " configured=",
+        " enabled=",
+        " direct=",
+        " lan=",
+    ]
+    .iter()
+    .filter(|field| command.contains(**field))
+    .copied()
+    .collect::<Vec<_>>();
+    match profile {
+        "official_pgxl" => {
+            if has_state || !forbidden.is_empty() {
+                return Err(format!(
+                    "official_pgxl create line contains non-official fields: {command}"
+                ));
+            }
+        }
+        "aethersdr_minimal" | "aethersdr_operational" => {
+            if !has_state {
+                return Err(format!(
+                    "{profile} create line must include only live state as the compatibility field: {command}"
+                ));
+            }
+            if !forbidden.is_empty() {
+                return Err(format!(
+                    "{profile} create line contains stripped/noisy fields {forbidden:?}: {command}"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 async fn synthetic_amplifier_status_line(
@@ -1857,7 +1910,7 @@ async fn synthetic_amplifier_status_line(
             ]);
             line.push_str(" connected=1 configured=1 enabled=1");
         }
-        "aethersdr_operational" | "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
+        "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
             candidate_fields.extend([
                 "connected".to_string(),
                 "configured".to_string(),
@@ -2690,7 +2743,30 @@ mod tests {
     }
 
     #[test]
-    fn aethersdr_operational_profile_emits_compat_create_fields() {
+    fn aethersdr_minimal_profile_emits_only_state_create_field() {
+        let command = amplifier_create_command_with_state(
+            "192.168.0.189".parse().unwrap(),
+            9008,
+            "PowerGeniusXL",
+            "EGB-KPA500",
+            "ANT1:PORTA,ANT2:PORTB",
+            "aethersdr_minimal",
+            Some("STANDBY"),
+        );
+        assert_eq!(
+            command,
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY"
+        );
+        validate_amplifier_create_for_profile("aethersdr_minimal", &command).unwrap();
+        assert!(!command.contains("connected="));
+        assert!(!command.contains("configured="));
+        assert!(!command.contains("enabled="));
+        assert!(!command.contains("direct="));
+        assert!(!command.contains("lan="));
+    }
+
+    #[test]
+    fn aethersdr_operational_alias_emits_minimal_state_only() {
         let command = amplifier_create_command_with_state(
             "192.168.0.189".parse().unwrap(),
             9008,
@@ -2702,10 +2778,28 @@ mod tests {
         );
         assert_eq!(
             command,
-            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY connected=1 configured=1 enabled=1 direct=1 lan=1"
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY"
         );
-        assert!(amplifier_create_has_nonstandard_fields(&command));
-        assert!(command.contains("direct=1"));
+        validate_amplifier_create_for_profile("aethersdr_operational", &command).unwrap();
+    }
+
+    #[test]
+    fn create_profile_validation_rejects_extra_fields() {
+        let official_with_state =
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY";
+        assert!(
+            validate_amplifier_create_for_profile("official_pgxl", official_with_state)
+                .unwrap_err()
+                .contains("non-official")
+        );
+
+        let minimal_with_noise =
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY connected=1";
+        assert!(
+            validate_amplifier_create_for_profile("aethersdr_minimal", minimal_with_noise)
+                .unwrap_err()
+                .contains("stripped/noisy")
+        );
     }
 
     #[test]

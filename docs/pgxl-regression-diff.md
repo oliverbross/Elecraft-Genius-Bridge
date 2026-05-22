@@ -20,7 +20,7 @@ Phase 29 removed `state=STANDBY` from direct-connect create profiles to avoid st
 
 ## Current Fix
 
-The AetherSDR operational profile restores create-time `state`, but derives it from live KPA500 shared state:
+The AetherSDR minimal profile now keeps only create-time `state`, derived from live KPA500 shared state:
 
 - `^OS1;` -> `state=OPERATE`
 - `^OS0;` -> `state=STANDBY`
@@ -34,14 +34,14 @@ Use:
 
 ```yaml
 flex_injection:
-  amplifier_status_profile: aethersdr_operational
+  amplifier_status_profile: aethersdr_minimal
   trace_amplifier_advertisements: true
 ```
 
 Then run:
 
 ```powershell
-.\target\release\egb.exe compare-aethersdr-profiles --config .\config.aethersdr-compatible-operational.yaml --duration-seconds 60
+.\target\release\egb.exe compare-create-profiles --config .\config.aethersdr-compatible-operational.yaml --duration-seconds 60
 ```
 
 Inspect:

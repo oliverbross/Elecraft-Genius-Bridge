@@ -28,10 +28,11 @@ m_pgxlConn.connectToPgxl(m_radioModel.ampIp());
 | `pgxl_paired` | same create fields; paired synthetic evidence line logged | default experiment |
 | `pgxl_verbose` | adds `state`, `connected`, `configured`, `enabled` | experimental |
 | `old_good_pgxl` | same direct-connect readiness fields as verbose, without strict-real filtering | AetherSDR regression checks |
-| `aethersdr_operational` | adds live `state`, `connected`, `configured`, `enabled`, `direct`, `lan` | recommended AetherSDR operational profile |
+| `aethersdr_minimal` | adds live `state` only | recommended AetherSDR operational profile |
+| `aethersdr_operational` | alias for `aethersdr_minimal` | compatibility with prior config names |
 | `aethersdr_force_direct` | adds `direct`, `lan` to verbose fields | lab/regression only |
 
-Only `minimal`/`official_pgxl`/`pgxl_paired` should be considered conservative. `aethersdr_operational` is allowed for AetherSDR live use because the strict official create did not trigger AetherSDR direct TCP in latest evidence. The old force/lab profiles remain isolated diagnostics tools.
+Only `minimal`/`official_pgxl`/`pgxl_paired` should be considered conservative. `aethersdr_minimal` is allowed for AetherSDR live use because the strict official create did not trigger AetherSDR direct TCP in latest evidence and Flex echoed back `state` while stripping the older readiness fields. The old force/lab profiles remain isolated diagnostics tools.
 
 ## Reannounce Behaviour
 

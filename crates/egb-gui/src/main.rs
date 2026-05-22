@@ -325,7 +325,7 @@ impl GuiApp {
         self.config.flex_injection.full_pgxl_registration = true;
         self.config.flex_injection.create_meters = true;
         self.config.flex_injection.create_interlock = true;
-        self.config.flex_injection.amplifier_status_profile = "aethersdr_operational".to_string();
+        self.config.flex_injection.amplifier_status_profile = "aethersdr_minimal".to_string();
         self.config.flex_injection.pgxl_connect_assist = false;
         self.config.flex_injection.amplifier_startup_state_policy =
             "wait_for_first_kpa_poll".to_string();
@@ -2592,6 +2592,7 @@ impl GuiApp {
                         "pgxl_paired",
                         "pgxl_verbose",
                         "old_good_pgxl",
+                        "aethersdr_minimal",
                         "aethersdr_operational",
                         "aethersdr_force_direct",
                         "aethersdr_pgxl_direct_lab",

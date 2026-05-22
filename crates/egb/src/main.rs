@@ -116,6 +116,12 @@ enum Commands {
         #[arg(long, default_value_t = 60.0)]
         duration_seconds: f64,
     },
+    CompareCreateProfiles {
+        #[arg(long, default_value = "config.aethersdr-compatible-operational.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 60.0)]
+        duration_seconds: f64,
+    },
     AmplifierOperateLab {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -373,11 +379,22 @@ async fn main() -> Result<()> {
             duration_seconds,
         } => {
             let mut cfg = BridgeConfig::load(&config)?;
-            cfg.flex_injection.amplifier_status_profile = "aethersdr_operational".to_string();
+            cfg.flex_injection.amplifier_status_profile = "aethersdr_minimal".to_string();
             cfg.flex_injection.pgxl_connect_assist = false;
             cfg.validate()?;
             init_logging(&cfg.logging.level);
             compare_aethersdr_profiles(cfg, config, duration_seconds).await
+        }
+        Commands::CompareCreateProfiles {
+            config,
+            duration_seconds,
+        } => {
+            let mut cfg = BridgeConfig::load(&config)?;
+            cfg.flex_injection.amplifier_status_profile = "aethersdr_minimal".to_string();
+            cfg.flex_injection.pgxl_connect_assist = false;
+            cfg.validate()?;
+            init_logging(&cfg.logging.level);
+            compare_create_profiles(cfg, config, duration_seconds).await
         }
         Commands::AmplifierOperateLab {
             config,
@@ -698,9 +715,24 @@ fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) 
             )
         {
             anyhow::bail!(
-                "UNSAFE_LAB_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} is a lab-only profile for operational/evidence runs. Use aethersdr_operational for AetherSDR compatibility or official_pgxl, pgxl_paired, minimal, strict_real_pgxl for strict registration tests.",
+                "UNSAFE_LAB_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} is a lab-only profile for operational/evidence runs. Use aethersdr_minimal for AetherSDR compatibility or official_pgxl, pgxl_paired, minimal, strict_real_pgxl for strict registration tests.",
                 cfg.flex_injection.amplifier_status_profile
             );
+        }
+        let command = flex_injection::amplifier_create_command_with_state(
+            advertised,
+            cfg.flex_injection.amplifier_port,
+            &cfg.flex_injection.amplifier_model,
+            &cfg.flex_injection.serial,
+            &cfg.flex_injection.ant_map,
+            &cfg.flex_injection.amplifier_status_profile,
+            Some("STANDBY"),
+        );
+        if let Err(err) = flex_injection::validate_amplifier_create_for_profile(
+            &cfg.flex_injection.amplifier_status_profile,
+            &command,
+        ) {
+            anyhow::bail!("INVALID_AMPLIFIER_CREATE_PROFILE: {err}");
         }
     }
     Ok(())
@@ -1960,7 +1992,39 @@ async fn compare_aethersdr_profiles(
     evidence.write_status("status-end.json", &state).await?;
     let zip = evidence.finish(&state, Some(started.elapsed())).await?;
     println!(
-        "AetherSDR profile comparison complete; active profile=aethersdr_operational; evidence bundle: {}",
+        "AetherSDR profile comparison complete; active profile=aethersdr_minimal; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
+async fn compare_create_profiles(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    let evidence = EvidenceRun::start(
+        "compare-create-profiles",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    let report = create_profile_analysis_markdown(&cfg, &state).await;
+    tokio::fs::write(evidence.dir().join("create-profile-analysis.md"), report).await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "Create profile comparison complete; active profile=aethersdr_minimal; evidence bundle: {}",
         zip.display()
     );
     Ok(())
@@ -2559,6 +2623,14 @@ impl EvidenceRun {
             startup_advertisement_policy_markdown(state).await,
         )
         .await?;
+        let create_analysis_path = self.dir.join("create-profile-analysis.md");
+        if !create_analysis_path.exists() {
+            tokio::fs::write(
+                create_analysis_path,
+                create_profile_analysis_from_state_markdown(state).await,
+            )
+            .await?;
+        }
         zip_dir(&self.dir, &self.zip_path)?;
         println!("evidence bundle: {}", self.zip_path.display());
         Ok(self.zip_path.clone())
@@ -2967,8 +3039,8 @@ async fn last_known_good_comparison_markdown(state: &SharedState) -> String {
         "official_pgxl" | "strict_real_pgxl" => {
             "Use `config.aethersdr-compatible-operational.yaml` for AetherSDR live testing; strict profiles are retained for protocol audits."
         }
-        "aethersdr_operational" => {
-            "This run used the recommended AetherSDR operational compatibility profile."
+        "aethersdr_minimal" | "aethersdr_operational" => {
+            "This run used the recommended AetherSDR minimal compatibility profile."
         }
         _ => {
             "If PGXL does not open TCP 9008, repeat with `config.aethersdr-compatible-operational.yaml` before changing code."
@@ -3005,7 +3077,7 @@ async fn pgxl_regression_diff_markdown(state: &SharedState) -> String {
         ## Broken-era candidate\n\n\
         Phase 29 removed the create-time `state` field to avoid hard-coded standby. AetherSDR can see the AMP applet from Flex status but may not attempt TCP 9008 when create-time pairing fields are incomplete.\n\n\
         ## Current correction\n\n\
-        `aethersdr_operational` restores the minimum direct-connect readiness fields for AetherSDR, but keeps `pgxl_connect_assist` disabled and generates `state` from live shared KPA500 state instead of hard-coded `STANDBY`.\n\n\
+        `aethersdr_minimal` restores only the suspected trigger field, `state=<live>`, for AetherSDR. It keeps `pgxl_connect_assist` disabled and does not append fields Flex strips (`connected`, `configured`, `enabled`, `direct`, `lan`).\n\n\
         - Active profile: `{}`\n\
         - Live KPA state: `{live_state}`\n\
         - Last Flex advertised state: `{}`\n\
@@ -3789,6 +3861,7 @@ async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedStat
     body.push_str("| Profile | Create command with live state |\n| --- | --- |\n");
     for profile in [
         "official_pgxl",
+        "aethersdr_minimal",
         "aethersdr_operational",
         "strict_real_pgxl",
         "aethersdr_force_direct",
@@ -3807,7 +3880,7 @@ async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedStat
         );
         body.push_str(&format!("| `{profile}` | `{command}` |\n"));
     }
-    body.push_str("\n`aethersdr_operational` is the recommended AetherSDR client profile. `official_pgxl` is intentionally strict for Flex/SmartSDR registration audits and may not trigger AetherSDR direct TCP.\n");
+    body.push_str("\n`aethersdr_minimal` is the recommended AetherSDR client profile. It adds only `state=<live>` to the strict create line. `official_pgxl` is intentionally strict for Flex/SmartSDR registration audits and may not trigger AetherSDR direct TCP.\n");
     body
 }
 
@@ -3837,15 +3910,15 @@ async fn aethersdr_profile_comparison_markdown(cfg: &BridgeConfig, state: &Share
         &cfg.flex_injection.amplifier_model,
         &cfg.flex_injection.serial,
         &cfg.flex_injection.ant_map,
-        "aethersdr_operational",
+        "aethersdr_minimal",
         Some(live_state),
     );
     let observed = &guard.flex_injection;
     let mut body = String::from("# AetherSDR Profile Comparison\n\n");
-    body.push_str("This command runs the bridge with `aethersdr_operational` and records live outcomes. `official_pgxl` is shown as the strict baseline create command for side-by-side comparison.\n\n");
+    body.push_str("This command runs the bridge with `aethersdr_minimal` and records live outcomes. `official_pgxl` is shown as the strict baseline create command for side-by-side comparison.\n\n");
     body.push_str("| Profile | Create command |\n| --- | --- |\n");
     body.push_str(&format!("| `official_pgxl` | `{official}` |\n"));
-    body.push_str(&format!("| `aethersdr_operational` | `{compatible}` |\n\n"));
+    body.push_str(&format!("| `aethersdr_minimal` | `{compatible}` |\n\n"));
     body.push_str(&format!(
         "- Active run profile: `{}`\n- Flex accepted amplifier handle: {}\n- Amplifier removed count: {}\n- Amplifier create count: {}\n- Amplifier handle changes: {}\n- PGXL TCP sessions started: {}\n- TGXL TCP sessions started: {}\n- PGXL TCP attempted after amplifier status: {}\n- Last amplifier removed reason: {}\n",
         observed
@@ -3865,6 +3938,115 @@ async fn aethersdr_profile_comparison_markdown(cfg: &BridgeConfig, state: &Share
             .unwrap_or("none")
     ));
     body
+}
+
+async fn create_profile_analysis_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    let live_state = advertised_amp_state_for_status(&guard.amp);
+    let advertised_ip = cfg
+        .flex_injection
+        .force_advertised_pgxl_ip
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&cfg.flex_injection.amplifier_ip)
+        .parse()
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+    let command_for = |profile: &str| {
+        flex_injection::amplifier_create_command_with_state(
+            advertised_ip,
+            cfg.flex_injection.amplifier_port,
+            &cfg.flex_injection.amplifier_model,
+            &cfg.flex_injection.serial,
+            &cfg.flex_injection.ant_map,
+            profile,
+            Some(live_state),
+        )
+    };
+    let official = command_for("official_pgxl");
+    let minimal = command_for("aethersdr_minimal");
+    let old_operational = format!("{minimal} connected=1 configured=1 enabled=1 direct=1 lan=1");
+    let observed = &guard.flex_injection;
+    format!(
+        "# Create Profile Analysis\n\n\
+        ## Create Lines\n\n\
+        | Profile | Create line |\n\
+        | --- | --- |\n\
+        | `official_pgxl` | `{official}` |\n\
+        | `aethersdr_minimal` | `{minimal}` |\n\
+        | `old aethersdr_operational` | `{old_operational}` |\n\n\
+        ## Live Outcome\n\n\
+        - Active run profile: `{}`\n\
+        - Flex accepted amplifier create: {}\n\
+        - Amplifier handle: `{}`\n\
+        - Amplifier removed count: {}\n\
+        - PGXL sessions started: {}\n\
+        - TGXL sessions started: {}\n\
+        - Active PGXL clients: {}\n\
+        - Active TGXL clients: {}\n\
+        - PGXL direct attempted after amplifier status: {}\n\
+        - Last amplifier status line from Flex: `{}`\n\
+        - Last emitted create/status line: `{}`\n\n\
+        ## Stripped Fields From Phase 52 Evidence\n\n\
+        Flex echoed back `ip`, `model`, `serial_num`, `ant`, and `state`, while stripping `connected`, `configured`, `enabled`, `direct`, and `lan`. `aethersdr_minimal` therefore keeps only `state=<live-state>` as the AetherSDR compatibility field.\n",
+        observed
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        observed.amplifier_create_accepted,
+        observed.amplifier_handle.as_deref().unwrap_or("none"),
+        observed.amplifier_removed_count,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard.clients.tgxl_client_count,
+        observed.amplifier_pgxl_tcp_attempted_after_status,
+        observed
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        observed
+            .last_emitted_amplifier_advertisement_line
+            .as_deref()
+            .unwrap_or("none"),
+    )
+}
+
+async fn create_profile_analysis_from_state_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let observed = &guard.flex_injection;
+    format!(
+        "# Create Profile Analysis\n\n\
+        - Active profile: `{}`\n\
+        - Last emitted create/status line: `{}`\n\
+        - Last Flex amplifier status line: `{}`\n\
+        - Flex accepted amplifier create: {}\n\
+        - Amplifier removed count: {}\n\
+        - PGXL sessions started: {}\n\
+        - TGXL sessions started: {}\n\
+        - Active PGXL clients: {}\n\
+        - Active TGXL clients: {}\n\
+        - PGXL direct attempted after amplifier status: {}\n\n\
+        Latest live evidence showed Flex strips `connected`, `configured`, `enabled`, `direct`, and `lan` from the create/status path while preserving `state`. The normal AetherSDR profile is therefore `aethersdr_minimal`, which adds only `state=<live-kpa-state>` to the strict create line.\n",
+        observed
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        observed
+            .last_emitted_amplifier_advertisement_line
+            .as_deref()
+            .unwrap_or("none"),
+        observed
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        observed.amplifier_create_accepted,
+        observed.amplifier_removed_count,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.clients.pgxl_client_count,
+        guard.clients.tgxl_client_count,
+        observed.amplifier_pgxl_tcp_attempted_after_status,
+    )
 }
 
 async fn pgxl_status_mapping_markdown(state: &SharedState) -> String {
@@ -5596,6 +5778,7 @@ mod tests {
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));
         assert!(names.contains(&"pgxl-direct-trigger-matrix".to_string()));
         assert!(names.contains(&"amplifier-operate-lab".to_string()));
+        assert!(names.contains(&"compare-create-profiles".to_string()));
     }
 
     #[test]
@@ -5749,6 +5932,7 @@ mod tests {
 
         for profile in [
             "official_pgxl",
+            "aethersdr_minimal",
             "aethersdr_operational",
             "pgxl_paired",
             "minimal",
