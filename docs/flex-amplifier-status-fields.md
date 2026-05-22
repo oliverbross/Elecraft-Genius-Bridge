@@ -1,6 +1,6 @@
 # Flex Amplifier Status Fields
 
-EGB currently sends the documented PGXL registration command:
+The strict official profile sends the documented PGXL registration command:
 
 ```text
 amplifier create ip=<egb-ip> port=9008 model=PowerGeniusXL serial_num=<serial> ant=ANT1:PORTA,ANT2:PORTB
@@ -28,9 +28,10 @@ m_pgxlConn.connectToPgxl(m_radioModel.ampIp());
 | `pgxl_paired` | same create fields; paired synthetic evidence line logged | default experiment |
 | `pgxl_verbose` | adds `state`, `connected`, `configured`, `enabled` | experimental |
 | `old_good_pgxl` | same direct-connect readiness fields as verbose, without strict-real filtering | AetherSDR regression checks |
-| `aethersdr_force_direct` | adds `direct`, `lan` to verbose fields | recommended AetherSDR PGXL direct-connect test profile |
+| `aethersdr_operational` | adds live `state`, `connected`, `configured`, `enabled`, `direct`, `lan` | recommended AetherSDR operational profile |
+| `aethersdr_force_direct` | adds `direct`, `lan` to verbose fields | lab/regression only |
 
-Only `minimal`/`pgxl_paired` should be considered conservative. The other profiles may be rejected by the radio and are meant for isolated trigger testing.
+Only `minimal`/`official_pgxl`/`pgxl_paired` should be considered conservative. `aethersdr_operational` is allowed for AetherSDR live use because the strict official create did not trigger AetherSDR direct TCP in latest evidence. The old force/lab profiles remain isolated diagnostics tools.
 
 ## Reannounce Behaviour
 

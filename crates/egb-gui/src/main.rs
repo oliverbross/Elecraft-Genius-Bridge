@@ -12,7 +12,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_CONFIG: &str = "config.aethersdr-real-operational.yaml";
+const DEFAULT_CONFIG: &str = "config.aethersdr-compatible-operational.yaml";
 const LOG_LIMIT: usize = 500;
 const GUI_SETTINGS_PATH: &str = "egb-gui-settings.yaml";
 const GUI_GIT_COMMIT: &str = env!("GIT_HASH");
@@ -325,8 +325,8 @@ impl GuiApp {
         self.config.flex_injection.full_pgxl_registration = true;
         self.config.flex_injection.create_meters = true;
         self.config.flex_injection.create_interlock = true;
-        self.config.flex_injection.amplifier_status_profile = "aethersdr_force_direct".to_string();
-        self.config.flex_injection.pgxl_connect_assist = true;
+        self.config.flex_injection.amplifier_status_profile = "aethersdr_operational".to_string();
+        self.config.flex_injection.pgxl_connect_assist = false;
         self.config.flex_injection.amplifier_startup_state_policy =
             "wait_for_first_kpa_poll".to_string();
         self.config.flex_injection.amplifier_reannounce_interval_ms = self
@@ -2223,7 +2223,7 @@ impl GuiApp {
                 self.save_config();
             }
             let ops_btn = egui::Button::new(
-                egui::RichText::new("Use Real Operational Tune/Standby Config").size(12.0),
+                egui::RichText::new("Use AetherSDR Tune/Standby Config").size(12.0),
             )
             .fill(egui::Color32::from_rgb(35, 55, 95))
             .rounding(egui::Rounding::same(6.0))
@@ -2233,7 +2233,7 @@ impl GuiApp {
                 let saved_kat_com = self.config.kat500.com_port.clone();
                 let saved_radio_ip = self.config.flex_injection.radio_ip.clone();
                 let saved_amp_ip = self.config.flex_injection.amplifier_ip.clone();
-                self.config_path = PathBuf::from("config.aethersdr-real-operational.yaml");
+                self.config_path = PathBuf::from("config.aethersdr-compatible-operational.yaml");
                 self.load_config();
                 self.config.kpa500.com_port = saved_kpa_com;
                 self.config.kat500.com_port = saved_kat_com;
@@ -2242,7 +2242,7 @@ impl GuiApp {
                 self.apply_recommended_aethersdr_setup(true);
                 self.save_config();
                 self.push_log(
-                    "switched to config.aethersdr-real-operational.yaml with current COM/IP values",
+                    "switched to config.aethersdr-compatible-operational.yaml with current COM/IP values",
                 );
             }
             if ui.button("Scan Serial Ports").clicked() {
@@ -2592,6 +2592,7 @@ impl GuiApp {
                         "pgxl_paired",
                         "pgxl_verbose",
                         "old_good_pgxl",
+                        "aethersdr_operational",
                         "aethersdr_force_direct",
                         "aethersdr_pgxl_direct_lab",
                         "strict_real_pgxl",
@@ -4145,6 +4146,7 @@ fn config_profile_label(path: &Path) -> &'static str {
         .unwrap_or_default();
     match name {
         "config.aethersdr-known-good.yaml" => "Monitor / Dry-run known-good",
+        "config.aethersdr-compatible-operational.yaml" => "AetherSDR compatible Tune/Standby",
         "config.aethersdr-real-operational.yaml" => "Real operational Tune/Standby (official PGXL)",
         "config.aethersdr-operational.yaml" => "Legacy operational profile",
         value if value.contains("readonly") => "Read-only / dry-run",
@@ -4732,10 +4734,14 @@ mod tests {
     }
 
     #[test]
-    fn config_profile_label_distinguishes_monitor_and_real_operational() {
+    fn config_profile_label_distinguishes_monitor_and_operational_profiles() {
         assert_eq!(
             config_profile_label(Path::new("config.aethersdr-known-good.yaml")),
             "Monitor / Dry-run known-good"
+        );
+        assert_eq!(
+            config_profile_label(Path::new("config.aethersdr-compatible-operational.yaml")),
+            "AetherSDR compatible Tune/Standby"
         );
         assert_eq!(
             config_profile_label(Path::new("config.aethersdr-real-operational.yaml")),

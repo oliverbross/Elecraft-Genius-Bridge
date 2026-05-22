@@ -1778,7 +1778,7 @@ pub fn amplifier_create_command_with_state(
             }
             command.push_str(" connected=1 configured=1 enabled=1");
         }
-        "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
+        "aethersdr_operational" | "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
             if let Some(state_value) = state_value {
                 command.push_str(&format!(" state={}", sanitize_token(state_value)));
             }
@@ -1857,7 +1857,7 @@ async fn synthetic_amplifier_status_line(
             ]);
             line.push_str(" connected=1 configured=1 enabled=1");
         }
-        "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
+        "aethersdr_operational" | "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab" => {
             candidate_fields.extend([
                 "connected".to_string(),
                 "configured".to_string(),
@@ -2308,7 +2308,7 @@ mod tests {
             serial: "EGB-KPA500".to_string(),
             handle_label: "amp_1".to_string(),
             ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
-            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            amplifier_status_profile: "aethersdr_operational".to_string(),
             trace_amplifier_advertisements: false,
             pgxl_force_operate_advertisement: false,
             flex_force_operate_via_radio: false,
@@ -2684,6 +2684,25 @@ mod tests {
             "ANT1:PORTA,ANT2:PORTB",
             "aethersdr_force_direct",
             Some("STANDBY"),
+        );
+        assert!(amplifier_create_has_nonstandard_fields(&command));
+        assert!(command.contains("direct=1"));
+    }
+
+    #[test]
+    fn aethersdr_operational_profile_emits_compat_create_fields() {
+        let command = amplifier_create_command_with_state(
+            "192.168.0.189".parse().unwrap(),
+            9008,
+            "PowerGeniusXL",
+            "EGB-KPA500",
+            "ANT1:PORTA,ANT2:PORTB",
+            "aethersdr_operational",
+            Some("STANDBY"),
+        );
+        assert_eq!(
+            command,
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY connected=1 configured=1 enabled=1 direct=1 lan=1"
         );
         assert!(amplifier_create_has_nonstandard_fields(&command));
         assert!(command.contains("direct=1"));

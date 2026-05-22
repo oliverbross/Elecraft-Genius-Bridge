@@ -16,9 +16,11 @@ The operational Flex amplifier registration sequence is:
    - `^FL;`
 4. If KPA preflight fails, do not create the Flex amplifier object and do not start a healthy PGXL lifecycle.
 5. Connect to Flex TCP API port 4992 and wait for `H<client-handle>`.
-6. Send one amplifier create command:
+6. Send one amplifier create command. For strict Flex/SmartSDR protocol audit this is:
    - `amplifier create ip=<egb-lan-ip> port=9008 model=PowerGeniusXL serial_num=<serial> ant=ANT1:PORTA,ANT2:PORTB`
-   - Do not include `state`, `connected`, `configured`, `enabled`, `direct`, or `lan` on the create command in operational/evidence runs.
+   For AetherSDR operational testing, `aethersdr_operational` adds the minimum observed direct-connect readiness fields:
+   - `state=<live-kpa-state> connected=1 configured=1 enabled=1 direct=1 lan=1`
+   These fields are explicitly an AetherSDR compatibility profile, not the strict official create path.
 7. Create meters once per Flex session:
    - `meter create name=FWD type=AMP ...`
    - `meter create name=RL type=AMP ...`
@@ -55,7 +57,7 @@ The latest failed evidence showed these violations:
 - KAT500 preflight now blocks TGXL startup when the port is locked or read-only polling fails.
 - Operational/evidence runs reject loopback PGXL advertised IP when the Flex radio path is LAN.
 - Operational/evidence runs reject `pgxl_connect_assist=true`.
-- Operational/evidence runs reject amplifier profiles that add non-standard fields to `amplifier create`.
+- Operational/evidence runs reject old lab amplifier profiles that add broad or unsafe non-standard fields to `amplifier create`. `aethersdr_operational` is allowed because it is the explicit AetherSDR compatibility profile and keeps connect-assist disabled.
 - If Flex sends `amplifier <handle> removed`, EGB marks the lifecycle failed and stops re-registering until restart instead of entering a create/remove loop.
 - Operational configs now advertise `192.168.0.189` and keep connect-assist disabled.
 
@@ -64,12 +66,12 @@ The latest failed evidence showed these violations:
 After rebuilding the current commit, run a short evidence test with KPA500 Remote closed:
 
 ```powershell
-.\target-msvc\release\egb.exe evidence-test --config .\config.aethersdr-real-operational.yaml --duration-minutes 5
+.\target\release\egb.exe evidence-test --config .\config.aethersdr-compatible-operational.yaml --duration-minutes 5
 ```
 
 Expected safe outcomes:
 
 - If COM21 is locked, EGB exits before Flex amplifier create with `KPA500_PORT_LOCKED_OR_UNAVAILABLE`.
 - If COM21 is free, KPA preflight passes before amplifier create.
-- Flex amplifier create uses `ip=192.168.0.189`.
+- Flex amplifier create uses `ip=192.168.0.189` and the `aethersdr_operational` direct-connect readiness fields.
 - No `amplifier set <handle> operate=1` is sent unless an RF-risk user command is received and explicitly enabled.

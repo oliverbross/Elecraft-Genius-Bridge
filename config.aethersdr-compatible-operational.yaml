@@ -1,0 +1,103 @@
+server:
+  bind_ip: 192.168.0.189
+
+pgxl:
+  enabled: true
+  port: 9008
+  aethersdr_compat: true
+  compat_profile: aethersdr
+  strict_emulation: false
+  startup_delay_ms: 0
+  force_direct_connected_test: false
+
+tgxl:
+  enabled: true
+  port: 9010
+  aethersdr_compat: true
+  smartsdr_compat: false
+  control_profile: control_ready
+  strict_emulation: false
+  startup_delay_ms: 0
+  force_presence_test: false
+  experimental_presence_refresh: false
+
+kpa500:
+  enabled: true
+  com_port: COM21
+  baud: 38400
+  polling_interval_ms: 1000
+  mock: false
+  dry_run: false
+  allow_control: true
+  allow_rf_risk: false
+
+kat500:
+  enabled: true
+  com_port: COM8
+  baud: 38400
+  polling_interval_ms: 1000
+  mock: false
+  dry_run: false
+  allow_control: false
+  allow_rf_risk: false
+
+security:
+  token:
+
+logging:
+  level: debug
+  protocol_trace: true
+  protocol_transcript_dir: logs/protocol
+  serial_transcript_dir: logs/serial
+  transcript_rotate_bytes: 1048576
+
+metrics:
+  enabled: true
+  bind_ip: 127.0.0.1
+  port: 9160
+
+control:
+  verify_delay_ms: 200
+
+operational:
+  enable_real_controls: true
+  enable_kat_tune: true
+  enable_kat_bypass: false
+  enable_kat_antenna: false
+  enable_kpa_standby: true
+  enable_kpa_operate: false
+  enable_clear_fault: false
+  persist_rf_risk: false
+  confirm_real_hardware_control: "I understand"
+
+flex_injection:
+  enabled: true
+  radio_ip: 192.168.0.199
+  radio_port: 4992
+  amplifier_ip: 192.168.0.189
+  force_advertised_pgxl_ip: 192.168.0.189
+  amplifier_port: 9008
+  amplifier_model: PowerGeniusXL
+  serial: EGB-KPA500
+  handle: amp_1
+  ant_map: ANT1:PORTA,ANT2:PORTB
+  full_pgxl_registration: true
+  create_meters: true
+  create_interlock: true
+  amplifier_status_profile: aethersdr_operational
+  trace_amplifier_advertisements: true
+  pgxl_force_operate_advertisement: false
+  flex_force_operate_via_radio: false
+  pgxl_connect_assist: false
+  amplifier_startup_state_policy: wait_for_first_kpa_poll
+  wait_first_kpa_poll_timeout_ms: 10000
+  amplifier_reannounce_interval_ms: 30000
+  reconnect_initial_ms: 1000
+  reconnect_max_ms: 30000
+  ping_interval_ms: 30000
+  tuner_refresh_interval_ms: 5000
+
+mock:
+  pgxl_fault: false
+  tgxl_fault: false
+  high_swr: false

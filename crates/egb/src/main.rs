@@ -110,6 +110,12 @@ enum Commands {
         #[arg(long, default_value_t = 60.0)]
         duration_seconds: f64,
     },
+    CompareAethersdrProfiles {
+        #[arg(long, default_value = "config.aethersdr-compatible-operational.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 60.0)]
+        duration_seconds: f64,
+    },
     AmplifierOperateLab {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -361,6 +367,17 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             compare_pgxl_profiles(cfg, config, duration_seconds).await
+        }
+        Commands::CompareAethersdrProfiles {
+            config,
+            duration_seconds,
+        } => {
+            let mut cfg = BridgeConfig::load(&config)?;
+            cfg.flex_injection.amplifier_status_profile = "aethersdr_operational".to_string();
+            cfg.flex_injection.pgxl_connect_assist = false;
+            cfg.validate()?;
+            init_logging(&cfg.logging.level);
+            compare_aethersdr_profiles(cfg, config, duration_seconds).await
         }
         Commands::AmplifierOperateLab {
             config,
@@ -681,7 +698,7 @@ fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) 
             )
         {
             anyhow::bail!(
-                "NONSTANDARD_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} adds non-standard fields to the Flex amplifier create command. Use official_pgxl, pgxl_paired, minimal, or strict_real_pgxl for operational/evidence runs.",
+                "UNSAFE_LAB_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} is a lab-only profile for operational/evidence runs. Use aethersdr_operational for AetherSDR compatibility or official_pgxl, pgxl_paired, minimal, strict_real_pgxl for strict registration tests.",
                 cfg.flex_injection.amplifier_status_profile
             );
         }
@@ -1913,6 +1930,42 @@ async fn compare_pgxl_profiles(
     Ok(())
 }
 
+async fn compare_aethersdr_profiles(
+    mut cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    cfg.flex_injection.trace_amplifier_advertisements = true;
+    let evidence = EvidenceRun::start(
+        "compare-aethersdr-profiles",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    let report = aethersdr_profile_comparison_markdown(&cfg, &state).await;
+    tokio::fs::write(
+        evidence.dir().join("aethersdr-profile-comparison.md"),
+        report,
+    )
+    .await?;
+    evidence.write_status("status-end.json", &state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    println!(
+        "AetherSDR profile comparison complete; active profile=aethersdr_operational; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn run_amplifier_operate_lab(
     mut cfg: BridgeConfig,
     config_path: PathBuf,
@@ -2911,14 +2964,14 @@ async fn last_known_good_comparison_markdown(state: &SharedState) -> String {
         .as_deref()
         .unwrap_or("unknown");
     let recommendation = match profile {
-        "strict_real_pgxl" => {
-            "Use `aethersdr_force_direct` or `old_good_pgxl` for AetherSDR regression checks; `strict_real_pgxl` is retained for protocol experiments only."
+        "official_pgxl" | "strict_real_pgxl" => {
+            "Use `config.aethersdr-compatible-operational.yaml` for AetherSDR live testing; strict profiles are retained for protocol audits."
         }
-        "aethersdr_force_direct" | "old_good_pgxl" => {
-            "This run used the recommended AetherSDR regression profile."
+        "aethersdr_operational" => {
+            "This run used the recommended AetherSDR operational compatibility profile."
         }
         _ => {
-            "If PGXL does not open TCP 9008, repeat with `config.aethersdr-known-good.yaml` before changing code."
+            "If PGXL does not open TCP 9008, repeat with `config.aethersdr-compatible-operational.yaml` before changing code."
         }
     };
     format!(
@@ -2952,7 +3005,7 @@ async fn pgxl_regression_diff_markdown(state: &SharedState) -> String {
         ## Broken-era candidate\n\n\
         Phase 29 removed the create-time `state` field to avoid hard-coded standby. AetherSDR can see the AMP applet from Flex status but may not attempt TCP 9008 when create-time pairing fields are incomplete.\n\n\
         ## Current correction\n\n\
-        Create-time `state` is restored for direct-connect profiles, but it is now generated from live shared KPA500 state instead of hard-coded `STANDBY`.\n\n\
+        `aethersdr_operational` restores the minimum direct-connect readiness fields for AetherSDR, but keeps `pgxl_connect_assist` disabled and generates `state` from live shared KPA500 state instead of hard-coded `STANDBY`.\n\n\
         - Active profile: `{}`\n\
         - Live KPA state: `{live_state}`\n\
         - Last Flex advertised state: `{}`\n\
@@ -3735,6 +3788,8 @@ async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedStat
     ));
     body.push_str("| Profile | Create command with live state |\n| --- | --- |\n");
     for profile in [
+        "official_pgxl",
+        "aethersdr_operational",
         "strict_real_pgxl",
         "aethersdr_force_direct",
         "old_good_pgxl",
@@ -3752,7 +3807,63 @@ async fn pgxl_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedStat
         );
         body.push_str(&format!("| `{profile}` | `{command}` |\n"));
     }
-    body.push_str("\n`aethersdr_force_direct` is the recommended AetherSDR trigger profile. `strict_real_pgxl` is intentionally conservative and may not trigger TCP 9008.\n");
+    body.push_str("\n`aethersdr_operational` is the recommended AetherSDR client profile. `official_pgxl` is intentionally strict for Flex/SmartSDR registration audits and may not trigger AetherSDR direct TCP.\n");
+    body
+}
+
+async fn aethersdr_profile_comparison_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    let live_state = advertised_amp_state_for_status(&guard.amp);
+    let advertised_ip = cfg
+        .flex_injection
+        .force_advertised_pgxl_ip
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&cfg.flex_injection.amplifier_ip)
+        .parse()
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+    let official = flex_injection::amplifier_create_command_with_state(
+        advertised_ip,
+        cfg.flex_injection.amplifier_port,
+        &cfg.flex_injection.amplifier_model,
+        &cfg.flex_injection.serial,
+        &cfg.flex_injection.ant_map,
+        "official_pgxl",
+        Some(live_state),
+    );
+    let compatible = flex_injection::amplifier_create_command_with_state(
+        advertised_ip,
+        cfg.flex_injection.amplifier_port,
+        &cfg.flex_injection.amplifier_model,
+        &cfg.flex_injection.serial,
+        &cfg.flex_injection.ant_map,
+        "aethersdr_operational",
+        Some(live_state),
+    );
+    let observed = &guard.flex_injection;
+    let mut body = String::from("# AetherSDR Profile Comparison\n\n");
+    body.push_str("This command runs the bridge with `aethersdr_operational` and records live outcomes. `official_pgxl` is shown as the strict baseline create command for side-by-side comparison.\n\n");
+    body.push_str("| Profile | Create command |\n| --- | --- |\n");
+    body.push_str(&format!("| `official_pgxl` | `{official}` |\n"));
+    body.push_str(&format!("| `aethersdr_operational` | `{compatible}` |\n\n"));
+    body.push_str(&format!(
+        "- Active run profile: `{}`\n- Flex accepted amplifier handle: {}\n- Amplifier removed count: {}\n- Amplifier create count: {}\n- Amplifier handle changes: {}\n- PGXL TCP sessions started: {}\n- TGXL TCP sessions started: {}\n- PGXL TCP attempted after amplifier status: {}\n- Last amplifier removed reason: {}\n",
+        observed
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        observed.amplifier_handle.as_deref().unwrap_or("none"),
+        observed.amplifier_removed_count,
+        observed.amplifier_create_count,
+        observed.amplifier_handle_change_count,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        observed.amplifier_pgxl_tcp_attempted_after_status,
+        observed
+            .amplifier_recreate_reason
+            .as_deref()
+            .unwrap_or("none")
+    ));
     body
 }
 
@@ -5632,12 +5743,13 @@ mod tests {
             let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("NONSTANDARD_AMPLIFIER_CREATE_PROFILE"));
+            assert!(err.contains("UNSAFE_LAB_AMPLIFIER_CREATE_PROFILE"));
             validate_operational_start_config(&cfg, BridgeStartMode::Lab).unwrap();
         }
 
         for profile in [
             "official_pgxl",
+            "aethersdr_operational",
             "pgxl_paired",
             "minimal",
             "strict_real_pgxl",

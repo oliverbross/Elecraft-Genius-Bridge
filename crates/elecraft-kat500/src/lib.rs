@@ -668,7 +668,7 @@ impl Kat500Driver {
             guard.controls.last_safety_decision = if command.label == "autotune"
                 && decision == "blocked_by_dry_run"
             {
-                Some("Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-real-operational.yaml for live tune testing.".to_string())
+                Some("Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-compatible-operational.yaml for live tune testing.".to_string())
             } else {
                 Some(decision.to_string())
             };
@@ -698,7 +698,7 @@ impl Kat500Driver {
         append_evidence_line(
             "tgxl-control-commands.log",
             if command.label == "autotune" && decision == "blocked_by_dry_run" {
-                "Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-real-operational.yaml for live tune testing.".to_string()
+                "Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-compatible-operational.yaml for live tune testing.".to_string()
             } else {
                 format!("KAT500 {} {} {decision}", command.label, command.wire)
             },

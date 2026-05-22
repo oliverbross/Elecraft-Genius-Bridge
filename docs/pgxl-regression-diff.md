@@ -20,13 +20,13 @@ Phase 29 removed `state=STANDBY` from direct-connect create profiles to avoid st
 
 ## Current Fix
 
-Direct-connect profiles now restore create-time `state`, but derive it from live KPA500 shared state:
+The AetherSDR operational profile restores create-time `state`, but derives it from live KPA500 shared state:
 
 - `^OS1;` -> `state=OPERATE`
 - `^OS0;` -> `state=STANDBY`
 - real KPA fault -> `state=FAULT`
 
-`strict_real_pgxl` stays conservative for protocol audits and may not trigger AetherSDR TCP 9008.
+`official_pgxl`/`strict_real_pgxl` stay conservative for protocol audits and may not trigger AetherSDR TCP 9008.
 
 ## Recommended Profile
 
@@ -34,14 +34,14 @@ Use:
 
 ```yaml
 flex_injection:
-  amplifier_status_profile: aethersdr_force_direct
+  amplifier_status_profile: aethersdr_operational
   trace_amplifier_advertisements: true
 ```
 
 Then run:
 
 ```powershell
-.\target-msvc\debug\egb.exe compare-pgxl-profiles --config .\config.aethersdr-known-good.yaml --duration-seconds 60
+.\target\release\egb.exe compare-aethersdr-profiles --config .\config.aethersdr-compatible-operational.yaml --duration-seconds 60
 ```
 
 Inspect:

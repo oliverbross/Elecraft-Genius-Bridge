@@ -71,7 +71,7 @@ Set `kpa500.allow_rf_risk: true` only for local controlled KPA500 operate testin
 
 ## Operational Mode
 
-Normal profiles stay read-only or dry-run by default. For real AetherSDR Tune/Standby testing, use `config.aethersdr-real-operational.yaml`. It enables KAT500 Tune and KPA500 Standby, while keeping KPA500 Operate and clear fault disabled.
+Normal profiles stay read-only or dry-run by default. For real AetherSDR Tune/Standby testing, use `config.aethersdr-compatible-operational.yaml`. It enables KAT500 Tune and KPA500 Standby, while keeping KPA500 Operate and clear fault disabled.
 
 ```yaml
 operational:
@@ -167,13 +167,13 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
 
-`amplifier_status_profile` controls PGXL trigger experiments. `official_pgxl`, `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative and do not add non-standard fields to `amplifier create`. `config.aethersdr-real-operational.yaml` uses `official_pgxl`. `pgxl_verbose`, `old_good_pgxl`, and `aethersdr_force_direct` add status-like direct-connect fields and are lab/regression profiles only; operational/evidence runs reject them. `aethersdr_pgxl_direct_lab` is a lab-only profile for direct-connect trigger experiments. No normal profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
+`amplifier_status_profile` controls PGXL trigger experiments. `official_pgxl`, `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative and do not add non-standard fields to `amplifier create`; `config.aethersdr-real-operational.yaml` uses `official_pgxl` for strict protocol audit work. `aethersdr_operational` is the recommended AetherSDR operational profile and adds the direct-connect readiness fields `state`, `connected`, `configured`, `enabled`, `direct`, and `lan` to the create command. `pgxl_verbose`, `old_good_pgxl`, `aethersdr_force_direct`, and `aethersdr_pgxl_direct_lab` are lab/regression profiles; operational/evidence runs reject them. No normal profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
 
 `pgxl_force_operate_advertisement` is a lab-only switch. It advertises `state=OPERATE` to AetherSDR without sending any KPA500 command. Use it only to determine whether AetherSDR refuses to open TCP 9008 while the injected amplifier is in `STANDBY`.
 
 `flex_force_operate_via_radio` is also lab-only. It sends `amplifier set <handle> operate=1` to the Flex API after the injected amplifier handle is observed. It does not send `^OS1;` to the KPA500 and is used only to test whether the Flex radio owns and rewrites amplifier operate state.
 
-`pgxl_connect_assist` is the AetherSDR PGXL direct-connect workaround. It sends one Flex-side `amplifier set <handle> operate=1` after the virtual amplifier handle is discovered, which can trigger AetherSDR to open TCP 9008. It does not send `^OS1;` to the KPA500; PGXL direct status remains based on real KPA500 polling. This is not normal lifecycle machinery and should stay disabled unless a specific compatibility test requires it.
+`pgxl_connect_assist` is a lab-only AetherSDR PGXL direct-connect workaround. It sends one Flex-side `amplifier set <handle> operate=1` after the virtual amplifier handle is discovered, which can trigger AetherSDR to open TCP 9008. It does not send `^OS1;` to the KPA500; PGXL direct status remains based on real KPA500 polling. This is not normal lifecycle machinery and must stay disabled for operational/evidence runs.
 
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 

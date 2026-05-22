@@ -24,22 +24,22 @@ Control behaviour:
 Expected blocked Tune message:
 
 ```text
-Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-real-operational.yaml for live tune testing.
+Autotune received but blocked because this config is monitor/dry-run. Use config.aethersdr-compatible-operational.yaml for live tune testing.
 ```
 
-## Real Operational Tune/Standby
+## AetherSDR Compatible Tune/Standby
 
 Config:
 
 ```powershell
-.\config.aethersdr-real-operational.yaml
+.\config.aethersdr-compatible-operational.yaml
 ```
 
 Purpose:
 - Execute AetherSDR Tune against KAT500.
 - Execute KPA500 Standby when requested.
 - Keep KPA500 Operate disabled.
-- Use the official minimal Flex amplifier create command.
+- Add the AetherSDR direct-connect readiness fields needed to trigger PGXL/TGXL direct TCP.
 
 Enabled real commands:
 - KAT500 Tune: `T;`
@@ -53,10 +53,30 @@ Still blocked:
 Flex amplifier create line:
 
 ```text
+amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=<live-kpa-state> connected=1 configured=1 enabled=1 direct=1 lan=1
+```
+
+The extra fields are explicitly isolated in `amplifier_status_profile: aethersdr_operational`. Phase 49 safeguards still apply: KPA/KAT preflight must pass, the advertised IP must be reachable from the radio/client path, and `pgxl_connect_assist` remains off.
+
+## Strict Official PGXL Audit
+
+Config:
+
+```powershell
+.\config.aethersdr-real-operational.yaml
+```
+
+Purpose:
+- Validate the official minimal Flex amplifier create command.
+- Compare strict Flex/SmartSDR behavior against AetherSDR compatibility behavior.
+
+Flex amplifier create line:
+
+```text
 amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB
 ```
 
-Operational/evidence runs reject profiles that add non-standard fields such as `state`, `connected`, `configured`, `enabled`, `direct`, or `lan` to the create command.
+This profile may not trigger AetherSDR direct PGXL/TGXL sockets. It is retained for protocol audit work.
 
 ## RF-Risk Operate
 
@@ -80,5 +100,5 @@ Monitor-only validation:
 Real Tune/Standby validation:
 
 ```powershell
-.\target\release\egb.exe evidence-test --config .\config.aethersdr-real-operational.yaml --duration-minutes 5
+.\target\release\egb.exe evidence-test --config .\config.aethersdr-compatible-operational.yaml --duration-minutes 5
 ```

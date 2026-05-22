@@ -483,11 +483,12 @@ impl FlexInjectionConfig {
             | "pgxl_paired"
             | "pgxl_verbose"
             | "old_good_pgxl"
+            | "aethersdr_operational"
             | "aethersdr_force_direct"
             | "aethersdr_pgxl_direct_lab"
             | "strict_real_pgxl" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "flex_injection.amplifier_status_profile must be one of minimal, official_pgxl, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_force_direct, aethersdr_pgxl_direct_lab, strict_real_pgxl; got {other}"
+                "flex_injection.amplifier_status_profile must be one of minimal, official_pgxl, pgxl_paired, pgxl_verbose, old_good_pgxl, aethersdr_operational, aethersdr_force_direct, aethersdr_pgxl_direct_lab, strict_real_pgxl; got {other}"
             ))),
         }
     }
@@ -645,6 +646,9 @@ pgxl:
         cfg.validate().unwrap();
 
         cfg.flex_injection.amplifier_status_profile = "old_good_pgxl".to_string();
+        cfg.validate().unwrap();
+
+        cfg.flex_injection.amplifier_status_profile = "aethersdr_operational".to_string();
         cfg.validate().unwrap();
 
         cfg.flex_injection.amplifier_status_profile = "aethersdr_pgxl_direct_lab".to_string();
