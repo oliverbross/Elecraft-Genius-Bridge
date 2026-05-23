@@ -171,11 +171,14 @@ impl PgxlConfig {
         }?;
         match self.status_profile.as_str() {
             "status_current"
+            | "status_control_fields"
+            | "status_realistic_operate"
+            | "status_realistic_standby"
             | "status_operate_capable"
             | "status_rich_metered"
             | "status_real_pgxl_like" => Ok(()),
             other => Err(ConfigError::Invalid(format!(
-                "pgxl.status_profile must be one of status_current, status_operate_capable, status_rich_metered, status_real_pgxl_like; got {other}"
+                "pgxl.status_profile must be one of status_current, status_control_fields, status_realistic_operate, status_realistic_standby, status_operate_capable, status_rich_metered, status_real_pgxl_like; got {other}"
             ))),
         }
     }
@@ -660,6 +663,9 @@ pgxl:
         let mut cfg = BridgeConfig::default();
         for profile in [
             "status_current",
+            "status_control_fields",
+            "status_realistic_operate",
+            "status_realistic_standby",
             "status_operate_capable",
             "status_rich_metered",
             "status_real_pgxl_like",

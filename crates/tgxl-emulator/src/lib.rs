@@ -39,6 +39,10 @@ pub async fn run_with_options(
         .await
         .with_context(|| format!("failed to bind TGXL emulator on {bind_addr}"))?;
     info!(%bind_addr, "TGXL emulator listening");
+    {
+        let mut guard = state.write().await;
+        guard.clients.tgxl_listener_ready_at_ms = Some(timestamp_millis());
+    }
     append_evidence_line(
         "listener-startup.log",
         format!("TGXL listener started bind_addr={bind_addr}"),
@@ -81,6 +85,10 @@ async fn handle_client(
         let mut guard = state.write().await;
         guard.clients.tgxl_connected = true;
         guard.clients.tgxl_client_count += 1;
+        let connected_at_ms = timestamp_millis();
+        if guard.clients.tgxl_first_accept_at_ms.is_none() {
+            guard.clients.tgxl_first_accept_at_ms = Some(connected_at_ms);
+        }
         guard.clients.tgxl_session_started_count =
             guard.clients.tgxl_session_started_count.saturating_add(1);
         guard.clients.next_session_id = guard.clients.next_session_id.saturating_add(1);
@@ -89,7 +97,7 @@ async fn handle_client(
             id,
             "TGXL",
             peer,
-            timestamp_millis(),
+            connected_at_ms,
         ));
         guard.lifecycle.tgxl.transition(
             LifecycleState::TcpConnected,

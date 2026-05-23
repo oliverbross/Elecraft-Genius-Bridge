@@ -569,6 +569,9 @@ impl Kat500Driver {
                         Ok(follow) => {
                             let mut guard = self.state.write().await;
                             parse_kat500_response(&follow.response, &mut guard.tuner);
+                            if let Some(response) = &follow.band_response {
+                                parse_kat500_response(response, &mut guard.tuner);
+                            }
                             guard.radio_context.last_kat500_follow_frequency_hz = frequency_hz;
                             guard.radio_context.last_kat500_follow_wire = Some(wire.clone());
                             guard.radio_context.last_kat500_follow_requested_khz =
@@ -595,12 +598,14 @@ impl Kat500Driver {
                             append_evidence_line(
                                 "kat500-tune-sequence.log",
                                 format!(
-                                    "KAT500 frequency context confirmed before tune wire={wire} requested_khz={} confirmed_khz={:?} confirmation_match={} stale_responses={} retries={}",
+                                    "KAT500 frequency context confirmed before tune wire={wire} requested_khz={} confirmed_khz={:?} confirmation_match={} band_response={:?} stale_responses={} retries={} post_quiet_drained={}",
                                     follow.requested_khz,
                                     follow.confirmed_khz,
                                     follow.confirmation_match,
+                                    follow.band_response,
                                     follow.stale_response_count,
-                                    follow.retry_count
+                                    follow.retry_count,
+                                    follow.post_quiet_drained
                                 ),
                             );
                         }
@@ -795,6 +800,9 @@ impl Kat500Driver {
             Ok(follow) => {
                 let mut guard = self.state.write().await;
                 parse_kat500_response(&follow.response, &mut guard.tuner);
+                if let Some(response) = &follow.band_response {
+                    parse_kat500_response(response, &mut guard.tuner);
+                }
                 guard.radio_context.last_kat500_follow_frequency_hz = Some(frequency_hz);
                 guard.radio_context.last_kat500_follow_wire = Some(wire.clone());
                 guard.radio_context.last_kat500_follow_requested_khz = Some(follow.requested_khz);
@@ -818,14 +826,16 @@ impl Kat500Driver {
                 append_evidence_line(
                     "kat500-frequency-follow.log",
                     format!(
-                        "sent {wire} frequency_hz={frequency_hz} band={} response={} requested_khz={} confirmed_khz={:?} confirmation_match={} stale_responses={} retries={}",
+                        "sent {wire} frequency_hz={frequency_hz} band={} response={} requested_khz={} confirmed_khz={:?} confirmation_match={} band_response={:?} stale_responses={} retries={} post_quiet_drained={}",
                         band.as_str(),
                         follow.response,
                         follow.requested_khz,
                         follow.confirmed_khz,
                         follow.confirmation_match,
+                        follow.band_response,
                         follow.stale_response_count,
-                        follow.retry_count
+                        follow.retry_count,
+                        follow.post_quiet_drained
                     ),
                 );
             }
@@ -1518,8 +1528,10 @@ struct FrequencyFollowRead {
     requested_khz: u64,
     confirmed_khz: Option<u64>,
     confirmation_match: bool,
+    band_response: Option<String>,
     stale_response_count: u64,
     retry_count: u64,
+    post_quiet_drained: u64,
 }
 
 async fn send_command_collect(
@@ -1556,13 +1568,22 @@ async fn send_frequency_context_confirmed(
         let confirmed_khz = read.confirmed_khz;
         let confirmation_match = read.confirmation_match;
         if confirmation_match {
+            let post_quiet_drained = wait_for_serial_quiet(
+                port,
+                transcript,
+                Duration::from_millis(100),
+                Duration::from_millis(800),
+            )
+            .await;
             return Ok(FrequencyFollowRead {
                 response: read.response,
                 requested_khz,
                 confirmed_khz,
                 confirmation_match,
+                band_response: read.band_response,
                 stale_response_count,
                 retry_count: attempt,
+                post_quiet_drained,
             });
         }
         stale_response_count = stale_response_count.saturating_add(1);
@@ -1573,18 +1594,27 @@ async fn send_frequency_context_confirmed(
                 read.response
             ),
         );
-        last_response = Some((read.response, confirmed_khz));
+        last_response = Some((read.response, confirmed_khz, read.band_response));
         sleep(Duration::from_millis(150)).await;
     }
-    let (response, confirmed_khz) =
-        last_response.unwrap_or_else(|| ("no_response".to_string(), None));
+    let (response, confirmed_khz, band_response) =
+        last_response.unwrap_or_else(|| ("no_response".to_string(), None, None));
+    let post_quiet_drained = wait_for_serial_quiet(
+        port,
+        transcript,
+        Duration::from_millis(100),
+        Duration::from_millis(800),
+    )
+    .await;
     Ok(FrequencyFollowRead {
         response,
         requested_khz,
         confirmed_khz,
         confirmation_match: false,
+        band_response,
         stale_response_count,
         retry_count: 1,
+        post_quiet_drained,
     })
 }
 
@@ -1606,6 +1636,7 @@ async fn send_frequency_context_once_exact(
 
     let mut stale_response_count = 0_u64;
     let mut last_response = None;
+    let mut band_response = None;
     let result = timeout(wait, async {
         loop {
             let response = read_serial_line(port).await?;
@@ -1624,6 +1655,9 @@ async fn send_frequency_context_once_exact(
                     ),
                 );
             } else if is_unsolicited_response(&response) || response == wire {
+                if response.starts_with("BN") {
+                    band_response = Some(response.clone());
+                }
                 append_evidence_line(
                     "kat500-frequency-follow.log",
                     format!(
@@ -1657,8 +1691,10 @@ async fn send_frequency_context_once_exact(
             requested_khz,
             confirmed_khz,
             confirmation_match: true,
+            band_response,
             stale_response_count,
             retry_count: 0,
+            post_quiet_drained: 0,
         });
     }
 
@@ -1669,8 +1705,10 @@ async fn send_frequency_context_once_exact(
         requested_khz,
         confirmed_khz,
         confirmation_match: false,
+        band_response,
         stale_response_count,
         retry_count: 0,
+        post_quiet_drained: 0,
     })
 }
 
@@ -1678,15 +1716,31 @@ async fn drain_stale_serial_input(
     port: &mut SerialStream,
     transcript: &mut SerialTranscript,
 ) -> u64 {
+    wait_for_serial_quiet(
+        port,
+        transcript,
+        Duration::from_millis(75),
+        Duration::from_millis(1500),
+    )
+    .await
+}
+
+async fn wait_for_serial_quiet(
+    port: &mut SerialStream,
+    transcript: &mut SerialTranscript,
+    quiet: Duration,
+    max_total: Duration,
+) -> u64 {
     let mut drained = 0_u64;
-    while let Ok(Ok(response)) = timeout(Duration::from_millis(75), read_serial_line(port)).await {
+    let started = Instant::now();
+    while let Ok(Ok(response)) = timeout(quiet, read_serial_line(port)).await {
         transcript.write_line("RX_STALE", &response).await;
         append_evidence_line(
             "kat500-frequency-follow.log",
-            format!("drained stale serial response before F command: {response}"),
+            format!("drained serial response while waiting for quiet F window: {response}"),
         );
         drained = drained.saturating_add(1);
-        if drained >= 20 {
+        if drained >= 20 || started.elapsed() >= max_total {
             break;
         }
     }

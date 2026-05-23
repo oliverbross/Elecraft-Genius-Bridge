@@ -194,6 +194,12 @@ enum Commands {
         #[arg(long, value_enum)]
         action: SimulatedControlAction,
     },
+    SimulatePgxlControl {
+        #[arg(long, default_value = "config.yaml")]
+        config: PathBuf,
+        #[arg(long, value_enum)]
+        command: PgxlControlCommand,
+    },
     ListSerial,
     TestKpa {
         #[arg(long, default_value = "config.yaml")]
@@ -230,6 +236,12 @@ enum Commands {
         allow_rf_risk: bool,
     },
     TestPgxlDirect {
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 9008)]
+        port: u16,
+    },
+    PgxlSelfProbe {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 9008)]
@@ -313,6 +325,12 @@ enum SimulatedControlAction {
     Standby,
     Operate,
     FlexOperate,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PgxlControlCommand {
+    Standby,
+    Operate,
 }
 
 #[tokio::main]
@@ -530,6 +548,10 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             simulate_control(&cfg, action)
         }
+        Commands::SimulatePgxlControl { config, command } => {
+            let cfg = BridgeConfig::load(&config)?;
+            simulate_pgxl_control(&cfg, command)
+        }
         Commands::ListSerial => {
             list_serial_ports()?;
             Ok(())
@@ -588,6 +610,10 @@ async fn main() -> Result<()> {
         Commands::TestPgxlDirect { host, port } => {
             init_logging("debug");
             test_pgxl_direct(&host, port).await
+        }
+        Commands::PgxlSelfProbe { host, port } => {
+            init_logging("debug");
+            pgxl_self_probe(&host, port).await
         }
         Commands::PgxlTriggerLab {
             config,
@@ -1238,6 +1264,7 @@ async fn start_bridge(
                     .saturating_add(1);
                 let warning = "pgxl_manual_connect_no_socket_attempt: amplifier is present but no TCP 9008 PGXL session has started".to_string();
                 guard.clients.pgxl_last_no_socket_attempt_warning = Some(warning.clone());
+                guard.clients.pgxl_last_no_socket_warning_at_ms = Some(timestamp_millis());
                 drop(guard);
                 append_evidence_line("warnings-errors.log", warning.clone());
                 append_evidence_json(
@@ -1509,6 +1536,15 @@ fn simulate_control(cfg: &BridgeConfig, action: SimulatedControlAction) -> Resul
     println!("raw_kpa_dry_run={}", policy.raw_kpa_dry_run);
     println!("raw_kat_dry_run={}", policy.raw_kat_dry_run);
     Ok(())
+}
+
+fn simulate_pgxl_control(cfg: &BridgeConfig, command: PgxlControlCommand) -> Result<()> {
+    let action = match command {
+        PgxlControlCommand::Standby => SimulatedControlAction::Standby,
+        PgxlControlCommand::Operate => SimulatedControlAction::Operate,
+    };
+    println!("simulated_pgxl_command={command:?}");
+    simulate_control(cfg, action)
 }
 
 fn operation_mode_label(policy: &EffectiveControlPolicy) -> &'static str {
@@ -2461,6 +2497,49 @@ async fn test_pgxl_direct(host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
+async fn pgxl_self_probe(host: &str, port: u16) -> Result<()> {
+    let log_path = PathBuf::from("logs")
+        .join("tests")
+        .join(format!("{}-pgxl-self-probe.log", timestamp_compact()));
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let addr = format!("{host}:{port}");
+    let mut log = format!("PGXL self-probe target={addr}\n");
+    let stream = TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("failed to connect to PGXL direct endpoint at {addr}"))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let greeting = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+        .await
+        .context("timed out waiting for PGXL greeting")??
+        .context("PGXL closed before greeting")?;
+    log.push_str(&format!("RX {greeting}\n"));
+    if !greeting.starts_with('V') {
+        anyhow::bail!("PGXL greeting did not start with V: {greeting}");
+    }
+    for (seq, command) in [(1_u32, "info"), (2, "status")] {
+        let line = format!("C{seq}|{command}\n");
+        log.push_str(&format!("TX {}", line.trim_end()));
+        log.push('\n');
+        writer.write_all(line.as_bytes()).await?;
+        let response = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
+            .await
+            .with_context(|| format!("timed out waiting for response to {command}"))??
+            .with_context(|| format!("PGXL closed before response to {command}"))?;
+        log.push_str(&format!("RX {response}\n"));
+        if !response.starts_with(&format!("R{seq}|")) {
+            anyhow::bail!("unexpected PGXL response for {command}: {response}");
+        }
+    }
+    tokio::fs::write(&log_path, &log).await?;
+    append_evidence_line("pgxl-self-probe.log", log.clone());
+    println!("PGXL self-probe passed: {addr}");
+    println!("log: {}", log_path.display());
+    Ok(())
+}
+
 async fn write_stability_report(
     state: &SharedState,
     elapsed: Duration,
@@ -2834,8 +2913,29 @@ impl EvidenceRun {
             (Some(tgxl), Some(pgxl)) if pgxl >= tgxl => Some(pgxl - tgxl),
             _ => None,
         };
+        let listener_ready = guard.clients.pgxl_listener_ready_at_ms;
+        let first_accept = guard.clients.pgxl_first_accept_at_ms.or(pgxl_first);
+        let classification = if first_accept.is_none() {
+            "A: AetherSDR did not attempt/complete TCP 9008 during this run."
+        } else if let (Some(ready), Some(accept)) = (listener_ready, first_accept) {
+            if accept > ready + 5_000 {
+                "A: PGXL listener was ready, but AetherSDR did not open TCP until the delayed accept."
+            } else {
+                "B/C not indicated: EGB accepted PGXL TCP promptly; inspect protocol logs for handshake/close details."
+            }
+        } else {
+            "inconclusive: listener or accept timestamp missing."
+        };
         let body = format!(
             "# PGXL Delayed Connect Analysis\n\n\
+            - Classification: **{}**\n\
+            - Listener ready ms: `{}`\n\
+            - Amplifier object seen ms: `{}`\n\
+            - First AetherSDR PGXL TCP accept ms: `{}`\n\
+            - PGXL no-socket warning ms: `{}`\n\
+            - Reannounce count before first accept: `{}`\n\
+            - `sub amplifier all` count before first accept: `{}`\n\
+            - Last amplifier status before first accept: `{}`\n\
             - TGXL first connect timestamp: `{}`\n\
             - PGXL first connect timestamp: `{}`\n\
             - PGXL minus TGXL delta seconds: `{}`\n\
@@ -2851,7 +2951,39 @@ impl EvidenceRun {
             - Registration continued without handle: {}\n\
             - Sub amplifier all accepted: {}\n\
             - PGXL TCP attempted after amplifier status: {}\n\n\
-            Interpretation: if PGXL connects only after post-registration commands appear, the delay correlates with incomplete Flex registration rather than the direct PGXL listener. If no follow-up commands appear after `amplifier create`, the bridge is still blocked before registration completion.\n",
+            Interpretation: if classification is A, the bridge listener was ready and no earlier accepted socket exists; the remaining delay is AetherSDR-side eligibility/retry timing unless packet capture proves SYNs were sent earlier. If classification is B/C, inspect `pgxl-protocol.log` for handshake failures or early closes.\n",
+            classification,
+            listener_ready
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            guard
+                .flex_injection
+                .amplifier_object_seen_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            first_accept
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            guard
+                .clients
+                .pgxl_last_no_socket_warning_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            guard
+                .clients
+                .pgxl_reannounce_count_at_first_accept
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            guard
+                .clients
+                .pgxl_sub_amp_all_count_at_first_accept
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            guard
+                .clients
+                .pgxl_last_amp_status_before_accept
+                .as_deref()
+                .unwrap_or("none"),
             tgxl_first
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".to_string()),
@@ -5321,6 +5453,14 @@ async fn status_json(state: &SharedState) -> String {
             "tgxl_last_disconnect_reason": guard.clients.tgxl_last_disconnect_reason,
             "pgxl_manual_connect_no_socket_attempt_count": guard.clients.pgxl_manual_connect_no_socket_attempt_count,
             "pgxl_last_no_socket_attempt_warning": guard.clients.pgxl_last_no_socket_attempt_warning,
+            "pgxl_listener_ready_at_ms": guard.clients.pgxl_listener_ready_at_ms,
+            "tgxl_listener_ready_at_ms": guard.clients.tgxl_listener_ready_at_ms,
+            "pgxl_first_accept_at_ms": guard.clients.pgxl_first_accept_at_ms,
+            "tgxl_first_accept_at_ms": guard.clients.tgxl_first_accept_at_ms,
+            "pgxl_last_no_socket_warning_at_ms": guard.clients.pgxl_last_no_socket_warning_at_ms,
+            "pgxl_reannounce_count_at_first_accept": guard.clients.pgxl_reannounce_count_at_first_accept,
+            "pgxl_sub_amp_all_count_at_first_accept": guard.clients.pgxl_sub_amp_all_count_at_first_accept,
+            "pgxl_last_amp_status_before_accept": guard.clients.pgxl_last_amp_status_before_accept,
         },
         "flex_injection": guard.flex_injection,
         "lifecycle": guard.lifecycle,
@@ -5348,6 +5488,8 @@ async fn status_json(state: &SharedState) -> String {
             "tuner_presence_expired_count": guard.flex_injection.tuner_presence_expired_count,
             "tuner_reannounce_count": guard.flex_injection.tuner_reannounce_count,
             "amplifier_reannounce_count": guard.flex_injection.amplifier_reannounce_count,
+            "sub_amplifier_all_command_count": guard.flex_injection.sub_amplifier_all_command_count,
+            "amplifier_object_seen_at_ms": guard.flex_injection.amplifier_object_seen_at_ms,
             "amplifier_handle_change_count": guard.flex_injection.amplifier_handle_change_count,
             "amplifier_removed_count": guard.flex_injection.amplifier_removed_count,
             "post_amplifier_registration_sent": guard.flex_injection.post_amplifier_registration_sent,
@@ -6530,6 +6672,8 @@ mod tests {
         assert!(names.contains(&"pgxl-trigger-strategy-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
+        assert!(names.contains(&"simulate-pgxl-control".to_string()));
+        assert!(names.contains(&"pgxl-self-probe".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));
         assert!(names.contains(&"protocol-audit".to_string()));
         assert!(names.contains(&"pgxl-pairing-lab".to_string()));

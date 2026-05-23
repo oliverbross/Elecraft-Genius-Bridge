@@ -50,6 +50,10 @@ pub async fn run_with_options(
         .await
         .with_context(|| format!("failed to bind PGXL emulator on {bind_addr}"))?;
     info!(%bind_addr, "PGXL emulator listening");
+    {
+        let mut guard = state.write().await;
+        guard.clients.pgxl_listener_ready_at_ms = Some(timestamp_millis());
+    }
     append_evidence_line(
         "listener-startup.log",
         format!("PGXL listener started bind_addr={bind_addr}"),
@@ -93,6 +97,16 @@ async fn handle_client(
         let mut guard = state.write().await;
         guard.clients.pgxl_connected = true;
         guard.clients.pgxl_client_count += 1;
+        let connected_at_ms = timestamp_millis();
+        if guard.clients.pgxl_first_accept_at_ms.is_none() {
+            guard.clients.pgxl_first_accept_at_ms = Some(connected_at_ms);
+            guard.clients.pgxl_reannounce_count_at_first_accept =
+                Some(guard.flex_injection.amplifier_reannounce_count);
+            guard.clients.pgxl_sub_amp_all_count_at_first_accept =
+                Some(guard.flex_injection.sub_amplifier_all_command_count);
+            guard.clients.pgxl_last_amp_status_before_accept =
+                guard.flex_injection.last_amplifier_status_line.clone();
+        }
         guard.clients.pgxl_session_started_count =
             guard.clients.pgxl_session_started_count.saturating_add(1);
         let id = guard.clients.next_session_id;
@@ -101,7 +115,7 @@ async fn handle_client(
             id,
             "PGXL",
             peer,
-            timestamp_millis(),
+            connected_at_ms,
         ));
         guard.lifecycle.pgxl.transition(
             LifecycleState::TcpConnected,
@@ -560,7 +574,11 @@ fn status_body_from_amp(
         amp.connection_state,
         ConnectionState::Disconnected | ConnectionState::Degraded | ConnectionState::Error
     );
-    let state = advertised_state_from_amp(amp);
+    let state = match status_profile {
+        "status_realistic_operate" => "OPERATE",
+        "status_realistic_standby" => "STANDBY",
+        _ => advertised_state_from_amp(amp),
+    };
     let peakfwd = watts_to_dbm(amp.forward_power_watts);
     let swr = protocol_swr_value(amp.swr);
     let fault = amp
@@ -576,12 +594,12 @@ fn status_body_from_amp(
         meffa
     );
     match status_profile {
-        "status_operate_capable" => {
+        "status_control_fields" | "status_operate_capable" => {
             native.push_str(" operate_capable=1 standby_capable=1");
         }
-        "status_rich_metered" => {
+        "status_rich_metered" | "status_realistic_operate" | "status_realistic_standby" => {
             native.push_str(&format!(
-                " operate_capable=1 standby_capable=1 fwd={:.1} rl={:.2} drv=0.0 current={:.1} voltage={:.1}",
+                " operate_capable=1 standby_capable=1 control=1 fwd={:.1} rl={:.2} drv=0.0 current={:.1} voltage={:.1}",
                 amp.forward_power_watts,
                 swr,
                 amp.pa_current_amps,

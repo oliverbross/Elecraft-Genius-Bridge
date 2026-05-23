@@ -8,6 +8,22 @@ EGB logs the PGXL listener startup and every accepted PGXL client session. If `p
 
 Rust application code cannot reliably observe raw TCP SYN packets before `accept()` without packet capture. If we need SYN-level proof, capture with Wireshark or Windows `pktmon` while running the same evidence test.
 
+Phase 61 evidence adds these exact fields to `/status` and `pgxl-delayed-connect-analysis.md`:
+
+- `listener_ready_ms`
+- `amplifier_object_seen_ms`
+- `first_aethersdr_pgxl_tcp_accept_ms`
+- `pgxl_no_socket_warning_ms`
+- `reannounce_count_before_accept`
+- `sub_amp_all_count_before_accept`
+- `last_amp_status_before_accept`
+
+Classification is:
+
+- `A`: AetherSDR did not attempt TCP before the delay.
+- `B`: EGB accepted a connection promptly but failed handshake.
+- `C`: EGB rejected or closed an early connection.
+
 ## Evidence Files
 
 Use the evidence bundle from `egb pgxl-trigger-strategy-test` or `egb operational-gap-test`.
@@ -36,3 +52,13 @@ Valid strategies:
 - `no_burst`: no startup burst.
 
 If PGXL still connects only after the same delay and `client-sessions.jsonl` has no earlier PGXL accept, the remaining trigger is AetherSDR-side eligibility/retry timing, not EGB accepting/rejecting TCP.
+
+## Local Self-Probe
+
+While the bridge is already running, use:
+
+```powershell
+.\target\release\egb.exe pgxl-self-probe --host 127.0.0.1 --port 9008
+```
+
+The probe connects locally and sends only `info` and `status`. If it passes immediately while AetherSDR has not yet opened TCP 9008, the PGXL server is ready and the delay is AetherSDR-side trigger timing.

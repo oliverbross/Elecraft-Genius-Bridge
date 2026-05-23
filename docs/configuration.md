@@ -34,7 +34,7 @@ tgxl:
 
 Set `aethersdr_compat: true` while diagnosing AetherSDR direct PGXL/TGXL behaviour. Compatibility mode emits only source-observed fields, removes unverified `capabilities`, `firmware`, `connection_state`, and `fault` fields from protocol bodies, and reports `swr` as return loss dB because AetherSDR converts it back to an SWR ratio.
 
-Set `pgxl.status_profile` only for direct PGXL button-gating experiments. `status_current` preserves the current proven status body. `status_operate_capable`, `status_rich_metered`, and `status_real_pgxl_like` append progressively richer capability/telemetry fields so evidence runs can prove whether AetherSDR begins emitting AMP commands. These profiles do not change Flex amplifier create fields or real KPA500 control gates.
+Set `pgxl.status_profile` only for direct PGXL button-gating experiments. `status_current` preserves the current proven status body. `status_control_fields` and `status_operate_capable` append `operate_capable=1 standby_capable=1`. `status_rich_metered` and `status_real_pgxl_like` append progressively richer capability/telemetry fields. `status_realistic_operate` and `status_realistic_standby` force only the direct PGXL status state for eligibility testing. These profiles do not change Flex amplifier create fields or real KPA500 control gates.
 
 Set `strict_emulation: true` in mock mode to simulate a more realistic device startup sequence. The emulator sends the required `V` greeting immediately, but shared mock state reports transitional readiness until `startup_delay_ms` expires.
 

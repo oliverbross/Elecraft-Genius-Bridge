@@ -595,6 +595,7 @@ pub struct FlexInjectionState {
     pub registration_continued_without_handle: bool,
     pub keepalive_enable_accepted: bool,
     pub sub_amplifier_all_accepted: bool,
+    pub sub_amplifier_all_command_count: u64,
     pub command_success_count: u64,
     pub command_failure_count: u64,
     pub ping_count: u64,
@@ -619,6 +620,7 @@ pub struct FlexInjectionState {
     pub amp_widget_visibility_risk: Option<String>,
     pub amplifier_direct_connect_expected: Option<bool>,
     pub last_amplifier_status_line: Option<String>,
+    pub amplifier_object_seen_at_ms: Option<u128>,
     pub last_emitted_amplifier_advertisement_line: Option<String>,
     pub last_emitted_amplifier_advertisement_kind: Option<String>,
     pub amplifier_pairing_candidate_fields: Vec<String>,
@@ -681,6 +683,10 @@ pub struct ClientState {
     pub tgxl_connected: bool,
     pub pgxl_client_count: usize,
     pub tgxl_client_count: usize,
+    pub pgxl_listener_ready_at_ms: Option<u128>,
+    pub tgxl_listener_ready_at_ms: Option<u128>,
+    pub pgxl_first_accept_at_ms: Option<u128>,
+    pub tgxl_first_accept_at_ms: Option<u128>,
     pub pgxl_session_started_count: u64,
     pub tgxl_session_started_count: u64,
     pub next_session_id: u64,
@@ -690,6 +696,10 @@ pub struct ClientState {
     pub tgxl_last_disconnect_reason: Option<String>,
     pub pgxl_manual_connect_no_socket_attempt_count: u64,
     pub pgxl_last_no_socket_attempt_warning: Option<String>,
+    pub pgxl_last_no_socket_warning_at_ms: Option<u128>,
+    pub pgxl_reannounce_count_at_first_accept: Option<u64>,
+    pub pgxl_sub_amp_all_count_at_first_accept: Option<u64>,
+    pub pgxl_last_amp_status_before_accept: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

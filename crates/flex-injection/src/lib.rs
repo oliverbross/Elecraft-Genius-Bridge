@@ -927,6 +927,12 @@ async fn send_tracked_command(
         let mut guard = state.write().await;
         guard.flex_injection.last_command = Some(pending.command.clone());
         guard.flex_injection.last_tx_line = Some(format!("C{seq}|{}", pending.command));
+        if pending.command == "sub amplifier all" {
+            guard.flex_injection.sub_amplifier_all_command_count = guard
+                .flex_injection
+                .sub_amplifier_all_command_count
+                .saturating_add(1);
+        }
         if pending.kind == PendingKind::AmplifierCreate {
             guard.flex_injection.amplifier_create_sent = true;
             guard.flex_injection.amplifier_create_count = guard
@@ -1289,6 +1295,7 @@ async fn set_amplifier_handle(state: &SharedState, handle: &str) {
     }
     guard.flex_injection.amplifier_handle = Some(handle.to_string());
     guard.flex_injection.amplifier_last_seen_at = Some(SystemTime::now());
+    guard.flex_injection.amplifier_object_seen_at_ms = Some(timestamp_millis());
     guard.lifecycle.amplifier.transition(
         LifecycleState::Active,
         format!("Flex amplifier handle observed: {handle}"),
@@ -1313,6 +1320,10 @@ async fn record_amplifier_pairing_status(
         .find_map(|token| token.strip_prefix("state="))
         .map(str::to_string);
     guard.flex_injection.last_amplifier_status_line = Some(line);
+    guard
+        .flex_injection
+        .amplifier_object_seen_at_ms
+        .get_or_insert_with(timestamp_millis);
     if let Some(observed_state) = observed_state {
         if guard.flex_injection.flex_desired_amp_state.as_deref() == Some("OPERATE")
             && observed_state == "STANDBY"
@@ -2353,6 +2364,13 @@ fn advertised_amp_state_for_settings(
 
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 pub fn registration_command_lines(settings: &FlexInjectionSettings) -> Vec<String> {
