@@ -190,6 +190,8 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 `pgxl_startup_trigger_strategy` controls only the bounded startup burst used to measure PGXL direct-connect timing. `current` preserves the last-known-good behaviour, `rapid_sub_only` sends faster `sub amplifier all` refreshes, `reannounce_status_only` logs/status-reannounces without subscription spam, `reannounce_create_style_status` replays the create-style line into evidence for comparison, and `no_burst` disables the startup burst. Use `egb pgxl-trigger-strategy-test` to compare these; do not change the working AetherSDR profile while measuring.
 
+`aethersdr_open_trigger_variant` is a Phase 62 lab-only field used by `egb aethersdr-open-trigger-test`. It varies only amplifier advertisement/create fields to prove what makes AetherSDR open PGXL TCP. Valid values are `current`, `state_only`, `state_connected`, `state_ip_port`, `state_model_ip_port_serial`, and `availability_fields`.
+
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 
 `flex_injection.amplifier_startup_state_policy` controls whether PGXL/Flex amplifier advertisement can happen before KPA500 telemetry is real:

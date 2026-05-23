@@ -144,6 +144,17 @@ enum Commands {
         #[arg(long, default_value_t = 120.0)]
         duration_seconds: f64,
     },
+    AethersdrOpenTriggerTest {
+        #[arg(
+            long,
+            default_value = "config.aethersdr-last-known-good-real-controls.yaml"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value = "current")]
+        variant: String,
+        #[arg(long, default_value_t = 120.0)]
+        duration_seconds: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -470,6 +481,18 @@ async fn main() -> Result<()> {
                 duration_seconds / 60.0,
             )
             .await
+        }
+        Commands::AethersdrOpenTriggerTest {
+            config,
+            variant,
+            duration_seconds,
+        } => {
+            let mut cfg = BridgeConfig::load(&config)?;
+            cfg.flex_injection.aethersdr_open_trigger_variant = variant;
+            cfg.flex_injection.trace_amplifier_advertisements = true;
+            cfg.validate()?;
+            init_logging(&cfg.logging.level);
+            run_aethersdr_open_trigger_test(cfg, config, duration_seconds).await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -1243,6 +1266,10 @@ async fn start_bridge(
                 cfg.flex_injection.amplifier_reannounce_interval_ms,
             ),
             pgxl_startup_trigger_strategy: cfg.flex_injection.pgxl_startup_trigger_strategy.clone(),
+            aethersdr_open_trigger_variant: cfg
+                .flex_injection
+                .aethersdr_open_trigger_variant
+                .clone(),
         };
         let state = state.clone();
         tokio::spawn(async move {
@@ -2115,6 +2142,48 @@ async fn run_pgxl_pairing_lab(
     let zip = evidence.finish(&state, Some(started.elapsed())).await?;
     println!(
         "PGXL trigger lab complete; evidence bundle: {}",
+        zip.display()
+    );
+    Ok(())
+}
+
+async fn run_aethersdr_open_trigger_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_seconds: f64,
+) -> Result<()> {
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        anyhow::bail!("--duration-seconds must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start(
+        "aethersdr-open-trigger-test",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    append_evidence_line(
+        "aethersdr-open-trigger-test.md",
+        format!(
+            "# AetherSDR Open Trigger Test\n\nVariant: `{}`\n\nThis test varies only the Flex amplifier advertisement/create fields. It does not alter KPA/KAT polling, PGXL/TGXL direct protocol formatting, or real control gates.\n",
+            cfg.flex_injection.aethersdr_open_trigger_variant
+        ),
+    );
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Lab).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_seconds)).await;
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    evidence.write_pgxl_delayed_connect_analysis(&state).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    let guard = state.read().await;
+    println!(
+        "AetherSDR open trigger test complete: variant={} pgxl_sessions={} tgxl_sessions={} first_pgxl_accept_ms={:?} evidence={}",
+        cfg.flex_injection.aethersdr_open_trigger_variant,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.clients.pgxl_first_accept_at_ms,
         zip.display()
     );
     Ok(())
@@ -3644,6 +3713,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
             cfg.flex_injection.amplifier_reannounce_interval_ms,
         ),
         pgxl_startup_trigger_strategy: cfg.flex_injection.pgxl_startup_trigger_strategy.clone(),
+        aethersdr_open_trigger_variant: cfg.flex_injection.aethersdr_open_trigger_variant.clone(),
     }
 }
 
@@ -6670,6 +6740,7 @@ mod tests {
         assert!(names.contains(&"full-aethersdr-functional-test".to_string()));
         assert!(names.contains(&"operational-gap-test".to_string()));
         assert!(names.contains(&"pgxl-trigger-strategy-test".to_string()));
+        assert!(names.contains(&"aethersdr-open-trigger-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"simulate-pgxl-control".to_string()));

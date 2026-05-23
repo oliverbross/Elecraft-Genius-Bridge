@@ -41,6 +41,7 @@ pub struct FlexInjectionSettings {
     pub tuner_refresh_interval: Duration,
     pub amplifier_reannounce_interval: Duration,
     pub pgxl_startup_trigger_strategy: String,
+    pub aethersdr_open_trigger_variant: String,
 }
 
 impl FlexInjectionSettings {
@@ -52,17 +53,19 @@ impl FlexInjectionSettings {
             &self.serial,
             &self.ant_map,
             &self.amplifier_status_profile,
+            &self.aethersdr_open_trigger_variant,
         )
     }
 
     pub fn amplifier_create_command_with_state(&self, state_value: &str) -> String {
-        amplifier_create_command_with_state(
+        amplifier_create_command_with_state_for_variant(
             self.amplifier_ip,
             self.amplifier_port,
             &self.amplifier_model,
             &self.serial,
             &self.ant_map,
             &self.amplifier_status_profile,
+            &self.aethersdr_open_trigger_variant,
             Some(state_value),
         )
     }
@@ -2156,14 +2159,16 @@ pub fn amplifier_create_command(
     serial: &str,
     ant_map: &str,
     profile: &str,
+    open_trigger_variant: &str,
 ) -> String {
-    amplifier_create_command_with_state(
+    amplifier_create_command_with_state_for_variant(
         amplifier_ip,
         amplifier_port,
         model,
         serial,
         ant_map,
         profile,
+        open_trigger_variant,
         None,
     )
 }
@@ -2177,12 +2182,58 @@ pub fn amplifier_create_command_with_state(
     profile: &str,
     state_value: Option<&str>,
 ) -> String {
+    amplifier_create_command_with_state_for_variant(
+        amplifier_ip,
+        amplifier_port,
+        model,
+        serial,
+        ant_map,
+        profile,
+        "current",
+        state_value,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn amplifier_create_command_with_state_for_variant(
+    amplifier_ip: IpAddr,
+    amplifier_port: u16,
+    model: &str,
+    serial: &str,
+    ant_map: &str,
+    profile: &str,
+    open_trigger_variant: &str,
+    state_value: Option<&str>,
+) -> String {
     let mut command = format!(
         "amplifier create ip={amplifier_ip} port={amplifier_port} model={} serial_num={} ant={}",
         sanitize_token(model),
         sanitize_token(serial),
         sanitize_token(ant_map)
     );
+    if open_trigger_variant != "current" {
+        match open_trigger_variant {
+            "state_only" | "state_ip_port" | "state_model_ip_port_serial" => {
+                if let Some(state_value) = state_value {
+                    command.push_str(&format!(" state={}", sanitize_token(state_value)));
+                }
+            }
+            "state_connected" => {
+                if let Some(state_value) = state_value {
+                    command.push_str(&format!(" state={}", sanitize_token(state_value)));
+                }
+                command.push_str(" connected=1");
+            }
+            "availability_fields" => {
+                if let Some(state_value) = state_value {
+                    command.push_str(&format!(" state={}", sanitize_token(state_value)));
+                }
+                command.push_str(" available=1 tx_ready=1 control=1");
+            }
+            _ => {}
+        }
+        return command;
+    }
     match profile {
         "pgxl_verbose" | "old_good_pgxl" => {
             if let Some(state_value) = state_value {
@@ -2270,14 +2321,32 @@ async fn synthetic_amplifier_status_line(
     };
     let state_value = advertised_amp_state_for_settings(settings, &amp);
     let fault = amp.fault.as_deref().unwrap_or("");
-    let mut candidate_fields = vec![
-        "model".to_string(),
-        "ip".to_string(),
-        "port".to_string(),
-        "serial_num".to_string(),
-        "ant".to_string(),
-        "state".to_string(),
-    ];
+    let mut candidate_fields = match settings.aethersdr_open_trigger_variant.as_str() {
+        "state_only" => vec!["state".to_string()],
+        "state_connected" => vec!["state".to_string(), "connected".to_string()],
+        "state_ip_port" => vec!["state".to_string(), "ip".to_string(), "port".to_string()],
+        "state_model_ip_port_serial" => vec![
+            "state".to_string(),
+            "model".to_string(),
+            "ip".to_string(),
+            "port".to_string(),
+            "serial_num".to_string(),
+        ],
+        "availability_fields" => vec![
+            "state".to_string(),
+            "available".to_string(),
+            "tx_ready".to_string(),
+            "control".to_string(),
+        ],
+        _ => vec![
+            "model".to_string(),
+            "ip".to_string(),
+            "port".to_string(),
+            "serial_num".to_string(),
+            "ant".to_string(),
+            "state".to_string(),
+        ],
+    };
     let mut line = if settings.amplifier_status_profile == "strict_real_pgxl" {
         format!(
             "amplifier {handle} model={} ip={} port={} serial_num={} ant={} state={}",
@@ -2303,6 +2372,11 @@ async fn synthetic_amplifier_status_line(
             sanitize_token(fault)
         )
     };
+    if settings.aethersdr_open_trigger_variant == "state_connected" {
+        line.push_str(" connected=1");
+    } else if settings.aethersdr_open_trigger_variant == "availability_fields" {
+        line.push_str(" available=1 tx_ready=1 control=1");
+    }
     match settings.amplifier_status_profile.as_str() {
         "pgxl_verbose" | "old_good_pgxl" => {
             candidate_fields.extend([
@@ -2652,6 +2726,7 @@ mod tests {
             "EGB-KPA500",
             "ANT1:PORTA,ANT2:NONE",
             "minimal",
+            "current",
         );
         assert_eq!(
             cmd,
@@ -2668,6 +2743,7 @@ mod tests {
             "EGB KPA500",
             "ANT1:PORTA, ANT2:NONE",
             "minimal",
+            "current",
         );
         assert!(cmd.contains("model=PowerGeniusXL"));
         assert!(cmd.contains("serial_num=EGBKPA500"));
@@ -2808,6 +2884,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_mock_state();
         let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
@@ -2860,6 +2937,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2909,6 +2987,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2934,6 +3013,7 @@ mod tests {
                 "EGB-KPA500",
                 "ANT1:PORTA,ANT2:PORTB",
                 profile,
+                "current",
             );
             assert!(
                 !cmd.contains("state=STANDBY"),
@@ -2971,6 +3051,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -3014,6 +3095,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -3053,6 +3135,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -3104,6 +3187,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let commands = registration_command_lines(&settings);
         assert_eq!(
@@ -3161,6 +3245,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         let commands = registration_commands_with_state(&settings, &state).await;
@@ -3205,6 +3290,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(30000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -3337,6 +3423,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         let post = post_amplifier_registration_commands(&settings)
             .into_iter()
@@ -3381,6 +3468,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         assert!(settings.flex_force_operate_via_radio);
         assert!(!settings.allow_rf_risk);
@@ -3416,6 +3504,7 @@ mod tests {
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
         };
         assert!(settings.pgxl_connect_assist);
         assert!(!settings.flex_force_operate_via_radio);

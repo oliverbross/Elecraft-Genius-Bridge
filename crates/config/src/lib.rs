@@ -426,6 +426,7 @@ pub struct FlexInjectionConfig {
     pub wait_first_kpa_poll_timeout_ms: u64,
     pub amplifier_reannounce_interval_ms: u64,
     pub pgxl_startup_trigger_strategy: String,
+    pub aethersdr_open_trigger_variant: String,
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
     pub ping_interval_ms: u64,
@@ -486,6 +487,19 @@ impl FlexInjectionConfig {
             other => {
                 return Err(ConfigError::Invalid(format!(
                     "flex_injection.pgxl_startup_trigger_strategy must be one of current, rapid_sub_only, reannounce_status_only, reannounce_create_style_status, no_burst; got {other}"
+                )));
+            }
+        }
+        match self.aethersdr_open_trigger_variant.as_str() {
+            "current"
+            | "state_only"
+            | "state_connected"
+            | "state_ip_port"
+            | "state_model_ip_port_serial"
+            | "availability_fields" => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "flex_injection.aethersdr_open_trigger_variant must be one of current, state_only, state_connected, state_ip_port, state_model_ip_port_serial, availability_fields; got {other}"
                 )));
             }
         }
@@ -557,6 +571,7 @@ impl Default for FlexInjectionConfig {
             wait_first_kpa_poll_timeout_ms: 10000,
             amplifier_reannounce_interval_ms: 5000,
             pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
             reconnect_initial_ms: 1000,
             reconnect_max_ms: 30000,
             ping_interval_ms: 30000,
@@ -736,6 +751,27 @@ pgxl:
             cfg.validate().unwrap();
         }
         cfg.flex_injection.pgxl_startup_trigger_strategy = "invented".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validates_aethersdr_open_trigger_variants() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "192.168.1.100".to_string();
+        cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
+        for variant in [
+            "current",
+            "state_only",
+            "state_connected",
+            "state_ip_port",
+            "state_model_ip_port_serial",
+            "availability_fields",
+        ] {
+            cfg.flex_injection.aethersdr_open_trigger_variant = variant.to_string();
+            cfg.validate().unwrap();
+        }
+        cfg.flex_injection.aethersdr_open_trigger_variant = "invented".to_string();
         assert!(cfg.validate().is_err());
     }
 

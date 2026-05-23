@@ -62,3 +62,22 @@ While the bridge is already running, use:
 ```
 
 The probe connects locally and sends only `info` and `status`. If it passes immediately while AetherSDR has not yet opened TCP 9008, the PGXL server is ready and the delay is AetherSDR-side trigger timing.
+
+## Open Trigger Variants
+
+Phase 62 adds a focused variant runner:
+
+```powershell
+.\target\release\egb.exe aethersdr-open-trigger-test --config .\config.aethersdr-last-known-good-real-controls.yaml --variant state_only --duration-seconds 120
+```
+
+Valid variants are:
+
+- `current`
+- `state_only`
+- `state_connected`
+- `state_ip_port`
+- `state_model_ip_port_serial`
+- `availability_fields`
+
+The command changes only the Flex amplifier advertisement/create field variant for the test run. It does not change KPA/KAT polling, PGXL/TGXL direct protocol formatting, or real control gates.
