@@ -87,6 +87,7 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
+  disable_amp_interlock: false
   amplifier_status_profile: aethersdr_force_direct
   trace_amplifier_advertisements: false
   pgxl_force_operate_advertisement: false

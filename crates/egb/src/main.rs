@@ -1156,6 +1156,7 @@ async fn start_bridge(
             full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
             create_meters: cfg.flex_injection.create_meters,
             create_interlock: cfg.flex_injection.create_interlock,
+            disable_amp_interlock: cfg.flex_injection.disable_amp_interlock,
             allow_rf_risk: kpa_allow_rf_risk,
             reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
             reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
@@ -1796,7 +1797,7 @@ fn print_protocol_audit(_cfg: &BridgeConfig) {
     println!("PGXL partial or intentionally unsupported:");
     println!("  PGXL direct config set/save: blocked; EGB config is managed by YAML/GUI");
     println!("  PGXL direct CAT/Flex set: blocked or read-only; Flex API is the authoritative radio context");
-    println!("  meter value publication: meters are created; live value push path remains evidence-gated");
+    println!("  meter value publication: meters are created; no verified Flex TCP meter-value publish command is implemented");
     println!("  connect-assist: compatibility workaround only, not real KPA500 operate");
 }
 
@@ -3446,6 +3447,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         full_pgxl_registration: cfg.flex_injection.full_pgxl_registration,
         create_meters: cfg.flex_injection.create_meters,
         create_interlock: cfg.flex_injection.create_interlock,
+        disable_amp_interlock: cfg.flex_injection.disable_amp_interlock,
         allow_rf_risk: effective_kpa_allow_rf_risk(cfg),
         reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
         reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
@@ -3453,9 +3455,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         tuner_presence_refresh: cfg.tgxl.experimental_presence_refresh,
         tuner_refresh_interval: Duration::from_millis(cfg.flex_injection.tuner_refresh_interval_ms),
         amplifier_reannounce_interval: Duration::from_millis(
-            cfg.flex_injection
-                .amplifier_reannounce_interval_ms
-                .max(30_000),
+            cfg.flex_injection.amplifier_reannounce_interval_ms,
         ),
     }
 }
@@ -3752,9 +3752,19 @@ async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String 
         - KAT500 frequency-follow sent count: {}\n\
         - KAT500 frequency-follow skipped count: {}\n\
         - Last KAT500 frequency-follow wire: `{}`\n\
+        - Last KAT500 frequency requested kHz: `{:?}`\n\
+        - Last KAT500 frequency confirmed kHz: `{:?}`\n\
+        - KAT500 frequency confirmation match: `{}`\n\
+        - KAT500 stale frequency response count: {}\n\
+        - KAT500 frequency retry count: {}\n\
         - Tune commands executed: {}\n\
+        - Meter publish count: {}\n\
+        - SmartSDR PGXL data status: `{}`\n\
+        - SmartSDR TGXL/tuner status: `{}`\n\
+        - Interlock mode: `{}`\n\
         - Last tune frequency: `{:?}` Hz\n\
         - Last tune band: `{}`\n\
+        - AetherSDR AMP command seen: `{}`\n\
         - Last interlock state: `{}`\n\
         - Last interlock reason: `{}`\n\
         - Last interlock tx_allowed: `{}`\n\
@@ -3783,9 +3793,32 @@ async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String 
             .last_kat500_follow_wire
             .as_deref()
             .unwrap_or("none"),
+        guard.radio_context.last_kat500_follow_requested_khz,
+        guard.radio_context.last_kat500_follow_confirmed_khz,
+        guard
+            .radio_context
+            .last_kat500_follow_confirmation_match
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard.radio_context.kat500_follow_stale_response_count,
+        guard.radio_context.kat500_follow_retry_count,
         guard.controls.tune_executed_count,
+        guard.flex_injection.meter_publish_count,
+        guard
+            .flex_injection
+            .meter_publish_last_result
+            .as_deref()
+            .unwrap_or("not implemented"),
+        "SmartSDR TGXL/tuner registration remains unsupported without a verified Flex tuner object API",
+        if guard.flex_injection.interlock_disabled_for_test {
+            "INTERLOCK_DISABLED_FOR_TEST"
+        } else {
+            "normal"
+        },
         guard.controls.last_tune_frequency_hz,
         guard.controls.last_tune_band.as_deref().unwrap_or("none"),
+        guard.controls.last_flex_amp_set_command.is_some()
+            || guard.controls.last_pgxl_control_command.is_some(),
         guard
             .flex_injection
             .last_interlock_state
@@ -3969,6 +4002,9 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         - Post-amplifier registration sent: {}\n\
         - Continued without amplifier handle: {}\n\
         - Meter handles: {:?}\n\
+        - Meter publish supported: `{}`\n\
+        - Meter publish count: {}\n\
+        - Meter publish last result: `{}`\n\
         - Interlock handle: `{}`\n\
         - Keepalive enable accepted: {}\n\
         - Last interlock status: `{}`\n\
@@ -3996,6 +4032,11 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         flex.post_amplifier_registration_sent,
         flex.registration_continued_without_handle,
         flex.meter_handles,
+        flex.meter_publish_supported
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        flex.meter_publish_count,
+        flex.meter_publish_last_result.as_deref().unwrap_or("none"),
         flex.interlock_handle.as_deref().unwrap_or("none"),
         flex.keepalive_enable_accepted,
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
@@ -4085,6 +4126,7 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
         ## Latest Runtime Evidence\n\n\
         - Amplifier handle: `{}`\n\
         - Interlock handle: `{}`\n\
+        - Interlock disabled for test: {}\n\
         - Registration continued without handle: {}\n\
         - Last interlock status: `{}`\n\
         - Last interlock state: `{}`\n\
@@ -4099,6 +4141,7 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
         If `reason=AMP:PG-XL` still arrives with `amplifier=` empty after this two-stage registration change, the remaining suspect is not command ordering but a hidden radio-side association requirement such as serial format or antenna/source topology.\n",
         flex.amplifier_handle.as_deref().unwrap_or("none"),
         flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.interlock_disabled_for_test,
         flex.registration_continued_without_handle,
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
         flex.last_interlock_state.as_deref().unwrap_or("none"),
@@ -4124,7 +4167,11 @@ async fn flex_registration_health_markdown(state: &SharedState) -> String {
         - Amplifier create accepted: {}\n\
         - Amplifier handle: `{}`\n\
         - Meter handles: {:?}\n\
+        - Meter publish supported: `{}`\n\
+        - Meter publish count: {}\n\
+        - Meter publish last result: `{}`\n\
         - Interlock handle: `{}`\n\
+        - Interlock disabled for test: {}\n\
         - Post-amplifier registration sent: {}\n\
         - Continued without amplifier handle: {}\n\
         - Keepalive enable accepted: {}\n\
@@ -4139,7 +4186,13 @@ async fn flex_registration_health_markdown(state: &SharedState) -> String {
         flex.amplifier_create_accepted,
         flex.amplifier_handle.as_deref().unwrap_or("none"),
         flex.meter_handles,
+        flex.meter_publish_supported
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        flex.meter_publish_count,
+        flex.meter_publish_last_result.as_deref().unwrap_or("none"),
         flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.interlock_disabled_for_test,
         flex.post_amplifier_registration_sent,
         flex.registration_continued_without_handle,
         flex.keepalive_enable_accepted,
@@ -5079,8 +5132,13 @@ async fn status_json(state: &SharedState) -> String {
             "last_tune_band": guard.radio_context.last_tune_band.map(|band| band.as_str()),
             "last_kat500_follow_frequency_hz": guard.radio_context.last_kat500_follow_frequency_hz,
             "last_kat500_follow_wire": guard.radio_context.last_kat500_follow_wire,
+            "last_kat500_follow_requested_khz": guard.radio_context.last_kat500_follow_requested_khz,
+            "last_kat500_follow_confirmed_khz": guard.radio_context.last_kat500_follow_confirmed_khz,
+            "last_kat500_follow_confirmation_match": guard.radio_context.last_kat500_follow_confirmation_match,
             "kat500_follow_sent_count": guard.radio_context.kat500_follow_sent_count,
             "kat500_follow_skipped_count": guard.radio_context.kat500_follow_skipped_count,
+            "kat500_follow_stale_response_count": guard.radio_context.kat500_follow_stale_response_count,
+            "kat500_follow_retry_count": guard.radio_context.kat500_follow_retry_count,
             "context_age_ms": stale_duration_ms(guard.radio_context.updated_at),
             "last_tune_age_ms": stale_duration_ms(guard.radio_context.last_tune_at),
         },
@@ -5133,11 +5191,16 @@ async fn status_json(state: &SharedState) -> String {
             "amp_widget_visibility_risk": amp_widget_visibility_risk(&guard),
             "amplifier_direct_connect_expected": guard.flex_injection.amplifier_direct_connect_expected,
             "last_amplifier_removed_reason": guard.flex_injection.last_amplifier_removed_reason,
+            "meter_publish_count": guard.flex_injection.meter_publish_count,
+            "meter_publish_supported": guard.flex_injection.meter_publish_supported,
+            "meter_publish_last_result": guard.flex_injection.meter_publish_last_result,
             "last_interlock_state": guard.flex_injection.last_interlock_state,
             "last_interlock_reason": guard.flex_injection.last_interlock_reason,
             "last_interlock_tx_allowed": guard.flex_injection.last_interlock_tx_allowed,
             "empty_amplifier_field_count": guard.flex_injection.interlock_empty_amplifier_count,
             "interlock_blocked_count": guard.flex_injection.interlock_blocked_count,
+            "interlock_created": guard.flex_injection.interlock_handle.is_some(),
+            "interlock_disabled_for_test": guard.flex_injection.interlock_disabled_for_test,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
         },

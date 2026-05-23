@@ -149,6 +149,7 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
+  disable_amp_interlock: false
   amplifier_status_profile: pgxl_paired
   pgxl_force_operate_advertisement: false
   flex_force_operate_via_radio: false
@@ -169,6 +170,8 @@ Phase 19 `flex_injection` is a LAN/local-only registration client. It connects t
 The configured `handle` is an EGB log/config label. The real Flex amplifier object handle is assigned by the radio and observed by AetherSDR through normal radio status.
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.
+
+`disable_amp_interlock: true` is a test-only override. It skips AMP interlock creation to isolate whether SmartSDR/AetherSDR TX failures are caused by the virtual PGXL interlock. It does not send KPA500 operate and must not be used for normal operation.
 
 `amplifier_status_profile` controls PGXL trigger experiments. `official_pgxl`, `minimal`, `pgxl_paired`, and `strict_real_pgxl` stay conservative and do not add non-standard fields to `amplifier create`; `config.aethersdr-real-operational.yaml` uses `official_pgxl` for strict protocol audit work. `aethersdr_minimal` adds only `state=<live-kpa-state>` to the create command. `aethersdr_operational` is retained as an alias for the same minimal behavior. `aethersdr_force_direct` is the locked last-known-good AetherSDR regression baseline and is allowed for `config.aethersdr-last-known-good-*.yaml`. `pgxl_verbose`, `old_good_pgxl`, and `aethersdr_pgxl_direct_lab` remain lab-only profiles for operational/evidence runs. No normal profile may hard-code `state=STANDBY`; amplifier status must follow the live KPA500 shared state.
 

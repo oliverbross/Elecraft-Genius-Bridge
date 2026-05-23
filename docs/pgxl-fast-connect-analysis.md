@@ -24,8 +24,9 @@ The last working AetherSDR path depended on repeated radio-side amplifier presen
 1. Send `amplifier create`.
 2. Wait briefly for an amplifier status/handle.
 3. Continue with meters, interlock, keepalive, and subscriptions if the create response was accepted.
-4. Send `sub amplifier all` once quickly after post-registration, then once per second for up to 10 seconds.
-5. Return to the configured `amplifier_reannounce_interval_ms` cadence.
+4. Send `sub amplifier all` once quickly after post-registration, then once per second for up to 10 seconds or until PGXL TCP connects.
+5. Suppress the normal periodic amplifier/tuner refresh while the startup burst is active, preventing duplicate `sub amplifier all` bursts.
+6. Return to the configured `amplifier_reannounce_interval_ms` cadence.
 
 This keeps the known-good AetherSDR profile intact and does not recreate the amplifier object, churn handles, or send the rejected `amplifier set operate=1` connect-assist command.
 

@@ -89,6 +89,7 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
+  disable_amp_interlock: false
   amplifier_status_profile: pgxl_paired
   trace_amplifier_advertisements: false
   # Lab-only: advertises OPERATE to AetherSDR without sending any KPA500 command.

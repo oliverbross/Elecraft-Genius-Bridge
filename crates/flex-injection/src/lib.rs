@@ -32,6 +32,7 @@ pub struct FlexInjectionSettings {
     pub full_pgxl_registration: bool,
     pub create_meters: bool,
     pub create_interlock: bool,
+    pub disable_amp_interlock: bool,
     pub allow_rf_risk: bool,
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
@@ -192,6 +193,15 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         guard.flex_injection.registration_continued_without_handle = false;
         guard.flex_injection.keepalive_enable_accepted = false;
         guard.flex_injection.sub_amplifier_all_accepted = false;
+        guard.flex_injection.interlock_disabled_for_test = settings.disable_amp_interlock;
+        if settings.disable_amp_interlock {
+            guard.flex_injection.last_interlock_reason =
+                Some("INTERLOCK_DISABLED_FOR_TEST".to_string());
+        }
+        guard.flex_injection.meter_publish_supported = Some(false);
+        guard.flex_injection.meter_publish_last_result = Some(
+            "Flex AMP meter objects are created, but no verified client-side meter value publication command is implemented".to_string(),
+        );
         guard.lifecycle.flex_session.transition(
             LifecycleState::Connecting,
             "Flex TCP connected; waiting for handle",
@@ -207,6 +217,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
     let mut amplifier_startup_burst_timer = Box::pin(sleep(Duration::from_secs(86_400)));
     let mut amplifier_startup_burst_count = 0_u8;
+    let mut amplifier_startup_burst_active = false;
     let mut pgxl_connect_assist_retry_timer = Box::pin(sleep(Duration::from_secs(30)));
     let mut post_registration_fallback_timer = Box::pin(sleep(Duration::from_secs(86_400)));
 
@@ -334,9 +345,13 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     .await?;
                     post_amplifier_registration_sent = true;
                     amplifier_startup_burst_count = 0;
+                    amplifier_startup_burst_active = true;
                     amplifier_startup_burst_timer
                         .as_mut()
                         .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+                    amplifier_reannounce_timer.as_mut().reset(
+                        tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
+                    );
                 }
             }
 
@@ -368,9 +383,13 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         .await?;
                         post_amplifier_registration_sent = true;
                         amplifier_startup_burst_count = 0;
+                        amplifier_startup_burst_active = true;
                         amplifier_startup_burst_timer
                             .as_mut()
                             .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+                        amplifier_reannounce_timer.as_mut().reset(
+                            tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
+                        );
                     }
                     if settings.flex_force_operate_via_radio {
                         append_flex_operate_lab_line(format!("RX_STATUS {}", status.raw));
@@ -461,9 +480,13 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 .await?;
                 post_amplifier_registration_sent = true;
                 amplifier_startup_burst_count = 0;
+                amplifier_startup_burst_active = true;
                 amplifier_startup_burst_timer
                     .as_mut()
                     .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+                amplifier_reannounce_timer.as_mut().reset(
+                    tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
+                );
             }
             post_registration_fallback_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
         }
@@ -526,13 +549,17 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     .as_mut()
                     .reset(tokio::time::Instant::now() + Duration::from_secs(1));
             } else {
+                amplifier_startup_burst_active = false;
                 amplifier_startup_burst_timer
                     .as_mut()
                     .reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+                amplifier_reannounce_timer.as_mut().reset(
+                    tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
+                );
             }
         }
         () = &mut amplifier_reannounce_timer => {
-            if post_amplifier_registration_sent {
+            if post_amplifier_registration_sent && !amplifier_startup_burst_active {
                 send_tracked_command(
                     &mut writer,
                     &mut session,
@@ -582,7 +609,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
             amplifier_reannounce_timer.as_mut().reset(tokio::time::Instant::now() + settings.amplifier_reannounce_interval);
         }
         () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
-            if post_amplifier_registration_sent {
+            if post_amplifier_registration_sent && !amplifier_startup_burst_active {
                 send_tracked_command(
                     &mut writer,
                     &mut session,
@@ -1073,6 +1100,12 @@ impl FlexSession {
                 if let Some(handle) = response_object_id(body) {
                     upsert_meter_handle(state, name, handle).await;
                 }
+                let mut guard = state.write().await;
+                guard.flex_injection.meter_publish_supported = Some(false);
+                guard.flex_injection.meter_publish_last_result = Some(
+                    "meter create accepted; live value publication command remains unverified"
+                        .to_string(),
+                );
             }
             PendingKind::InterlockCreate => {
                 if let Some(handle) = response_object_id(body) {
@@ -2293,7 +2326,10 @@ fn registration_commands_inner(
             ));
         }
     }
-    if settings.full_pgxl_registration && settings.create_interlock {
+    if settings.full_pgxl_registration
+        && settings.create_interlock
+        && !settings.disable_amp_interlock
+    {
         commands.push(PendingCommand::new(
             "interlock_create",
             interlock_create_command(&settings.serial),
@@ -2336,12 +2372,20 @@ fn post_amplifier_registration_commands(settings: &FlexInjectionSettings) -> Vec
             ));
         }
     }
-    if settings.full_pgxl_registration && settings.create_interlock {
+    if settings.full_pgxl_registration
+        && settings.create_interlock
+        && !settings.disable_amp_interlock
+    {
         commands.push(PendingCommand::new(
             "interlock_create",
             interlock_create_command(&settings.serial),
             PendingKind::InterlockCreate,
         ));
+    } else if settings.full_pgxl_registration && settings.disable_amp_interlock {
+        append_evidence_line(
+            "flex-registration-health.md",
+            "AMP interlock creation skipped because flex_injection.disable_amp_interlock=true (TEST ONLY).",
+        );
     }
     if settings.full_pgxl_registration {
         commands.push(PendingCommand::new(
@@ -2650,6 +2694,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2700,6 +2745,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2747,6 +2793,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2807,6 +2854,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2848,6 +2896,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2885,6 +2934,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2934,6 +2984,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -2989,6 +3040,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3031,6 +3083,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3161,6 +3214,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3203,6 +3257,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3236,6 +3291,7 @@ mod tests {
             full_pgxl_registration: true,
             create_meters: true,
             create_interlock: true,
+            disable_amp_interlock: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),

@@ -558,21 +558,51 @@ impl Kat500Driver {
                         "kat500-tune-sequence.log",
                         format!("KAT500 frequency context TX {wire} before T;"),
                     );
-                    match send_wire_command(
+                    match send_frequency_context_confirmed(
                         port,
-                        CMD_FREQUENCY_CONTEXT.label,
                         &wire,
-                        &["F "],
                         Duration::from_millis(1000),
                         transcript,
                     )
                     .await
                     {
-                        Ok(read) => {
+                        Ok(follow) => {
                             let mut guard = self.state.write().await;
-                            parse_kat500_response(&read.response, &mut guard.tuner);
+                            parse_kat500_response(&follow.response, &mut guard.tuner);
+                            guard.radio_context.last_kat500_follow_frequency_hz = frequency_hz;
+                            guard.radio_context.last_kat500_follow_wire = Some(wire.clone());
+                            guard.radio_context.last_kat500_follow_requested_khz =
+                                Some(follow.requested_khz);
+                            guard.radio_context.last_kat500_follow_confirmed_khz =
+                                follow.confirmed_khz;
+                            guard.radio_context.last_kat500_follow_confirmation_match =
+                                Some(follow.confirmation_match);
+                            guard.radio_context.kat500_follow_stale_response_count = guard
+                                .radio_context
+                                .kat500_follow_stale_response_count
+                                .saturating_add(follow.stale_response_count);
+                            guard.radio_context.kat500_follow_retry_count = guard
+                                .radio_context
+                                .kat500_follow_retry_count
+                                .saturating_add(follow.retry_count);
+                            guard.radio_context.kat500_follow_sent_count = guard
+                                .radio_context
+                                .kat500_follow_sent_count
+                                .saturating_add(1);
                             guard.controls.last_safety_decision =
                                 Some("kat500_frequency_context_applied".to_string());
+                            drop(guard);
+                            append_evidence_line(
+                                "kat500-tune-sequence.log",
+                                format!(
+                                    "KAT500 frequency context confirmed before tune wire={wire} requested_khz={} confirmed_khz={:?} confirmation_match={} stale_responses={} retries={}",
+                                    follow.requested_khz,
+                                    follow.confirmed_khz,
+                                    follow.confirmation_match,
+                                    follow.stale_response_count,
+                                    follow.retry_count
+                                ),
+                            );
                         }
                         Err(err) => {
                             let mut guard = self.state.write().await;
@@ -745,6 +775,8 @@ impl Kat500Driver {
             }
             let previous = guard.radio_context.last_kat500_follow_frequency_hz;
             let band = guard.radio_context.band;
+            guard.radio_context.last_kat500_follow_requested_khz =
+                Some(frequency_hz_to_khz(frequency_hz));
             append_evidence_line(
                 "kat500-frequency-follow.log",
                 format!(
@@ -756,21 +788,26 @@ impl Kat500Driver {
         };
 
         let (frequency_hz, band, wire) = decision;
-        match send_wire_command(
-            port,
-            CMD_FREQUENCY_CONTEXT.label,
-            &wire,
-            &["F "],
-            Duration::from_millis(1000),
-            transcript,
-        )
-        .await
+        match send_frequency_context_confirmed(port, &wire, Duration::from_millis(1000), transcript)
+            .await
         {
-            Ok(read) => {
+            Ok(follow) => {
                 let mut guard = self.state.write().await;
-                parse_kat500_response(&read.response, &mut guard.tuner);
+                parse_kat500_response(&follow.response, &mut guard.tuner);
                 guard.radio_context.last_kat500_follow_frequency_hz = Some(frequency_hz);
                 guard.radio_context.last_kat500_follow_wire = Some(wire.clone());
+                guard.radio_context.last_kat500_follow_requested_khz = Some(follow.requested_khz);
+                guard.radio_context.last_kat500_follow_confirmed_khz = follow.confirmed_khz;
+                guard.radio_context.last_kat500_follow_confirmation_match =
+                    Some(follow.confirmation_match);
+                guard.radio_context.kat500_follow_stale_response_count = guard
+                    .radio_context
+                    .kat500_follow_stale_response_count
+                    .saturating_add(follow.stale_response_count);
+                guard.radio_context.kat500_follow_retry_count = guard
+                    .radio_context
+                    .kat500_follow_retry_count
+                    .saturating_add(follow.retry_count);
                 guard.radio_context.kat500_follow_sent_count = guard
                     .radio_context
                     .kat500_follow_sent_count
@@ -780,9 +817,14 @@ impl Kat500Driver {
                 append_evidence_line(
                     "kat500-frequency-follow.log",
                     format!(
-                        "sent {wire} frequency_hz={frequency_hz} band={} response={}",
+                        "sent {wire} frequency_hz={frequency_hz} band={} response={} requested_khz={} confirmed_khz={:?} confirmation_match={} stale_responses={} retries={}",
                         band.as_str(),
-                        read.response
+                        follow.response,
+                        follow.requested_khz,
+                        follow.confirmed_khz,
+                        follow.confirmation_match,
+                        follow.stale_response_count,
+                        follow.retry_count
                     ),
                 );
             }
@@ -1362,6 +1404,15 @@ struct SerialRead {
     unsolicited: Vec<String>,
 }
 
+struct FrequencyFollowRead {
+    response: String,
+    requested_khz: u64,
+    confirmed_khz: Option<u64>,
+    confirmation_match: bool,
+    stale_response_count: u64,
+    retry_count: u64,
+}
+
 async fn send_command_collect(
     port: &mut SerialStream,
     command: ElecraftCommand,
@@ -1377,6 +1428,89 @@ async fn send_command_collect(
         transcript,
     )
     .await
+}
+
+async fn send_frequency_context_confirmed(
+    port: &mut SerialStream,
+    wire: &str,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<FrequencyFollowRead> {
+    let requested_khz = requested_khz_from_frequency_wire(wire)
+        .with_context(|| format!("invalid KAT500 frequency context wire {wire}"))?;
+    let mut stale_response_count = drain_stale_serial_input(port, transcript).await;
+    let mut last_response = None;
+    for attempt in 0..=1_u64 {
+        let read = send_wire_command(
+            port,
+            CMD_FREQUENCY_CONTEXT.label,
+            wire,
+            &["F "],
+            wait,
+            transcript,
+        )
+        .await?;
+        let confirmed_khz = confirmed_khz_from_frequency_response(&read.response);
+        let confirmation_match = confirmed_khz == Some(requested_khz);
+        stale_response_count = stale_response_count.saturating_add(
+            read.unsolicited
+                .iter()
+                .filter(|line| {
+                    confirmed_khz_from_frequency_response(line)
+                        .is_some_and(|khz| khz != requested_khz)
+                })
+                .count() as u64,
+        );
+        if confirmation_match {
+            return Ok(FrequencyFollowRead {
+                response: read.response,
+                requested_khz,
+                confirmed_khz,
+                confirmation_match,
+                stale_response_count,
+                retry_count: attempt,
+            });
+        }
+        stale_response_count = stale_response_count.saturating_add(1);
+        append_evidence_line(
+            "kat500-frequency-follow.log",
+            format!(
+                "stale frequency response requested_khz={requested_khz} response={} confirmed_khz={confirmed_khz:?} attempt={attempt}",
+                read.response
+            ),
+        );
+        last_response = Some((read.response, confirmed_khz));
+        sleep(Duration::from_millis(150)).await;
+    }
+    let (response, confirmed_khz) =
+        last_response.unwrap_or_else(|| ("no_response".to_string(), None));
+    Ok(FrequencyFollowRead {
+        response,
+        requested_khz,
+        confirmed_khz,
+        confirmation_match: false,
+        stale_response_count,
+        retry_count: 1,
+    })
+}
+
+async fn drain_stale_serial_input(
+    port: &mut SerialStream,
+    transcript: &mut SerialTranscript,
+) -> u64 {
+    let mut drained = 0_u64;
+    while let Ok(Ok(response)) = timeout(Duration::from_millis(25), read_serial_line(port)).await {
+        transcript.write_line("RX_STALE", &response).await;
+        append_evidence_line(
+            "kat500-frequency-follow.log",
+            format!("drained stale serial response before F command: {response}"),
+        );
+        drained = drained.saturating_add(1);
+        if drained >= 8 {
+            break;
+        }
+    }
+    drained
 }
 
 async fn wake_kat500(
@@ -1540,7 +1674,25 @@ fn frequency_context_wire(frequency_hz: Option<u64>) -> Option<String> {
     if !(1_800_000..=54_000_000).contains(&frequency_hz) {
         return None;
     }
-    Some(format!("F {};", (frequency_hz + 500) / 1000))
+    Some(format!("F {};", frequency_hz_to_khz(frequency_hz)))
+}
+
+fn frequency_hz_to_khz(frequency_hz: u64) -> u64 {
+    (frequency_hz + 500) / 1000
+}
+
+fn requested_khz_from_frequency_wire(wire: &str) -> Option<u64> {
+    wire.trim()
+        .strip_prefix('F')?
+        .trim()
+        .trim_end_matches(';')
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+fn confirmed_khz_from_frequency_response(response: &str) -> Option<u64> {
+    requested_khz_from_frequency_wire(response)
 }
 
 struct SerialTranscript {
