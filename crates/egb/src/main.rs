@@ -2232,6 +2232,7 @@ async fn run_band_follow_test(
         guard.radio_context.last_kpa500_follow_confirmation_match,
         zip.display()
     );
+    println!("{}", zip.display());
     Ok(())
 }
 
@@ -2780,6 +2781,8 @@ impl EvidenceRun {
             "pgxl-control-commands.log",
             "flex-control-commands.log",
             "kat500-frequency-follow.log",
+            "kpa500-band-follow-confirmation.log",
+            "band-follow-summary.md",
             "advertised-state-history.jsonl",
             "state-mismatch-events.jsonl",
             "profile-summary.md",

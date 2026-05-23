@@ -289,6 +289,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
     let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
+    let mut amplifier_requested_reannounce_timer = Box::pin(sleep(Duration::from_millis(250)));
     let mut amplifier_startup_burst_timer = Box::pin(sleep(Duration::from_secs(86_400)));
     let mut amplifier_startup_burst_count = 0_u8;
     let mut amplifier_startup_burst_active = false;
@@ -697,6 +698,76 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 );
             }
             amplifier_reannounce_timer.as_mut().reset(tokio::time::Instant::now() + settings.amplifier_reannounce_interval);
+        }
+        () = &mut amplifier_requested_reannounce_timer => {
+            if post_amplifier_registration_sent && !amplifier_startup_burst_active {
+                let requested_reason = {
+                    let mut guard = state.write().await;
+                    if guard.flex_injection.amplifier_reannounce_requested {
+                        guard.flex_injection.amplifier_reannounce_requested = false;
+                        guard
+                            .flex_injection
+                            .last_amplifier_reannounce_request_reason
+                            .clone()
+                            .or_else(|| Some("kpa_telemetry_changed".to_string()))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(reason) = requested_reason {
+                    send_tracked_command(
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                        PendingCommand::new(
+                            "amplifier_requested_reannounce",
+                            "sub amplifier all",
+                            PendingKind::AmplifierReannounce,
+                        ),
+                    )
+                    .await?;
+                    let line = synthetic_amplifier_status_line(
+                        settings,
+                        &state,
+                        session.amplifier_handle.as_deref(),
+                    )
+                    .await;
+                    trace_amplifier_advertisement(
+                        settings,
+                        &state,
+                        "amplifier_status",
+                        &reason,
+                        &line,
+                    )
+                    .await;
+                    append_flex_log_line("amplifier-status-lines.log", &line);
+                    append_evidence_line(
+                        "amplifier-reannounce.log",
+                        format!("requested_reannounce reason={reason} {line}"),
+                    );
+                    append_evidence_line("amplifier-status-lines.log", line);
+                    {
+                        let mut guard = state.write().await;
+                        guard.flex_injection.amplifier_reannounce_count =
+                            guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
+                        guard.flex_injection.amplifier_direct_connect_expected =
+                            Some(!settings.amplifier_ip.is_loopback());
+                        guard.flex_injection.last_amplifier_reannounce_reason =
+                            Some(format!("requested_{reason}"));
+                        guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
+                            guard.clients.pgxl_session_started_count > 0;
+                    }
+                    info!(
+                        event_id = "amplifier_presence_requested_refresh",
+                        reason = %reason,
+                        "Flex amplifier presence refresh requested by KPA500 telemetry change"
+                    );
+                }
+            }
+            amplifier_requested_reannounce_timer
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_millis(250));
         }
         () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
             if post_amplifier_registration_sent && !amplifier_startup_burst_active {

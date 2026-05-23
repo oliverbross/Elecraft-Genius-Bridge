@@ -4,7 +4,7 @@ use bridge_core::{
     ConnectionState, SharedState,
 };
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs::{create_dir_all, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
@@ -948,13 +948,17 @@ impl Kpa500Driver {
             for outcome in &outcomes {
                 for unsolicited in &outcome.unsolicited {
                     guard.amp.last_raw_response = Some(unsolicited.clone());
+                    let before = guard.amp.clone();
                     parse_kpa500_response(unsolicited, &mut guard.amp);
+                    record_amp_poll_change(&mut guard, &before, unsolicited);
                 }
                 if let Some(response) = &outcome.response {
                     push_capability(&mut guard.amp.capabilities, outcome.command.label);
                     guard.amp.last_raw_response = Some(response.clone());
                     guard.amp.last_successful_command = Some(outcome.command.label.to_string());
+                    let before = guard.amp.clone();
                     parse_kpa500_response(response, &mut guard.amp);
+                    record_amp_poll_change(&mut guard, &before, response);
                 }
             }
             let required = [
@@ -1099,6 +1103,112 @@ fn parse_kpa500_response(response: &str, amp: &mut bridge_core::AmpState) {
     {
         parse_fault(raw, response, amp);
     }
+}
+
+fn record_amp_poll_change(
+    guard: &mut bridge_core::BridgeState,
+    before: &bridge_core::AmpState,
+    response: &str,
+) {
+    let response = response.trim();
+    if !is_kpa_poll_telemetry_response(response) {
+        return;
+    }
+    let state_changed = before.state != guard.amp.state || before.operate != guard.amp.operate;
+    let telemetry_changed = state_changed
+        || changed_f32(
+            before.forward_power_watts,
+            guard.amp.forward_power_watts,
+            0.1,
+        )
+        || changed_f32(before.swr, guard.amp.swr, 0.01)
+        || changed_f32(before.temperature_c, guard.amp.temperature_c, 0.1)
+        || changed_f32(before.pa_voltage_volts, guard.amp.pa_voltage_volts, 0.1)
+        || changed_f32(before.pa_current_amps, guard.amp.pa_current_amps, 0.05)
+        || before.fault != guard.amp.fault
+        || before.meffa != guard.amp.meffa;
+    if !telemetry_changed {
+        return;
+    }
+
+    guard.flex_injection.amplifier_reannounce_requested = true;
+    guard.flex_injection.amplifier_reannounce_request_count = guard
+        .flex_injection
+        .amplifier_reannounce_request_count
+        .saturating_add(1);
+    let reason = if state_changed {
+        "kpa_state_changed"
+    } else {
+        "kpa_telemetry_changed"
+    };
+    guard
+        .flex_injection
+        .last_amplifier_reannounce_request_reason = Some(reason.to_string());
+    guard.flex_injection.last_advertised_pgxl_state =
+        Some(guard.amp.state.pgxl_state().to_string());
+
+    if state_changed {
+        info!(
+            event_id = "kpa_state_changed",
+            old_state = ?before.state,
+            new_state = ?guard.amp.state,
+            old_operate = before.operate,
+            new_operate = guard.amp.operate,
+            reannounce_sent = true,
+            pgxl_status_updated = true,
+            "KPA500 operate state changed; requested immediate Flex amplifier reannounce"
+        );
+        append_evidence_json(
+            "control-events.jsonl",
+            &serde_json::json!({
+                "event": "kpa_state_changed",
+                "timestamp_ms": unix_timestamp_ms(),
+                "old_state": format!("{:?}", before.state),
+                "new_state": format!("{:?}", guard.amp.state),
+                "old_operate": before.operate,
+                "new_operate": guard.amp.operate,
+                "reannounce_sent": true,
+                "pgxl_status_updated": true,
+                "source_response": response,
+            }),
+        );
+        append_evidence_line(
+            "amplifier-reannounce.log",
+            format!(
+                "kpa_state_changed old_state={:?} new_state={:?} reannounce_sent=true pgxl_status_updated=true source_response={response}",
+                before.state, guard.amp.state
+            ),
+        );
+    } else {
+        debug!(
+            event_id = "kpa_telemetry_changed",
+            source_response = response,
+            reannounce_sent = true,
+            pgxl_status_updated = true,
+            "KPA500 telemetry changed; requested immediate PGXL/Flex update"
+        );
+        append_evidence_line(
+            "amplifier-reannounce.log",
+            format!("kpa_telemetry_changed reannounce_sent=true pgxl_status_updated=true source_response={response}"),
+        );
+    }
+}
+
+fn is_kpa_poll_telemetry_response(response: &str) -> bool {
+    ["^OS", "^WS", "^TM", "^VI", "^FL"]
+        .iter()
+        .any(|prefix| response.starts_with(prefix))
+}
+
+fn changed_f32(before: f32, after: f32, threshold: f32) -> bool {
+    (before - after).abs() > threshold
+}
+
+fn unix_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn parse_power_swr(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
