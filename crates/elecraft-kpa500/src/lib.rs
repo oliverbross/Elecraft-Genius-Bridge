@@ -639,28 +639,65 @@ impl Kpa500Driver {
             (band, wire)
         };
         let (band, wire) = decision;
-        let response = send_dynamic_command(
-            port,
-            "set_band_follow",
-            &wire,
-            &["^BN"],
-            Duration::from_millis(750),
-            transcript,
-        )
-        .await;
+        let confirmation =
+            send_band_follow_confirmed(port, &wire, Duration::from_millis(1000), transcript).await;
         let mut guard = self.state.write().await;
-        match response {
-            Ok(response) => {
+        match confirmation {
+            Ok(confirmation) => {
                 guard.radio_context.last_kpa500_follow_band = Some(band);
                 guard.radio_context.last_kpa500_follow_wire = Some(wire.clone());
-                guard.radio_context.last_kpa500_follow_result = Some(response.clone());
+                guard.radio_context.last_kpa500_follow_result = Some(format!(
+                    "response={} requested_bn={} confirmed_bn={:?} confirmation_match={} stale_count={} retry_count={}",
+                    confirmation.response,
+                    confirmation.requested_bn,
+                    confirmation.confirmed_bn,
+                    confirmation.confirmation_match,
+                    confirmation.stale_response_count,
+                    confirmation.retry_count
+                ));
+                guard.radio_context.last_kpa500_follow_requested_bn =
+                    Some(confirmation.requested_bn);
+                guard.radio_context.last_kpa500_follow_confirmed_bn = confirmation.confirmed_bn;
+                guard.radio_context.last_kpa500_follow_confirmation_match =
+                    Some(confirmation.confirmation_match);
+                guard.radio_context.kpa500_follow_stale_response_count = guard
+                    .radio_context
+                    .kpa500_follow_stale_response_count
+                    .saturating_add(confirmation.stale_response_count);
+                guard.radio_context.kpa500_follow_retry_count = guard
+                    .radio_context
+                    .kpa500_follow_retry_count
+                    .saturating_add(confirmation.retry_count);
                 guard.radio_context.kpa500_follow_sent_count = guard
                     .radio_context
                     .kpa500_follow_sent_count
                     .saturating_add(1);
                 append_evidence_line(
                     "kpa500-band-follow.log",
-                    format!("sent {wire} band={} response={response}", band.as_str()),
+                    format!(
+                        "sent {wire} band={} response={} requested_bn={} confirmed_bn={:?} confirmation_match={} stale_count={} retry_count={}",
+                        band.as_str(),
+                        confirmation.response,
+                        confirmation.requested_bn,
+                        confirmation.confirmed_bn,
+                        confirmation.confirmation_match,
+                        confirmation.stale_response_count,
+                        confirmation.retry_count
+                    ),
+                );
+                append_evidence_line(
+                    "kpa500-band-follow-confirmation.log",
+                    format!(
+                        "band={} wire={} response={} requested_bn={} confirmed_bn={:?} confirmation_match={} stale_count={} retry_count={}",
+                        band.as_str(),
+                        wire,
+                        confirmation.response,
+                        confirmation.requested_bn,
+                        confirmation.confirmed_bn,
+                        confirmation.confirmation_match,
+                        confirmation.stale_response_count,
+                        confirmation.retry_count
+                    ),
                 );
             }
             Err(err) => {
@@ -1163,42 +1200,6 @@ async fn send_command(
         .response)
 }
 
-async fn send_dynamic_command(
-    port: &mut SerialStream,
-    label: &str,
-    wire: &str,
-    expected_prefixes: &[&str],
-    wait: Duration,
-    transcript: &mut SerialTranscript,
-) -> Result<String> {
-    transcript.write_line("TX", wire).await;
-    port.write_all(wire.as_bytes())
-        .await
-        .with_context(|| format!("failed to write serial command {label}"))?;
-    port.flush().await.context("failed to flush serial port")?;
-    let response = timeout(wait, async {
-        loop {
-            let response = read_serial_line(port).await?;
-            transcript.write_line("RX", &response).await;
-            if matches_expected_response(&response, expected_prefixes) {
-                break Ok::<String, std::io::Error>(response);
-            }
-            trace!(
-                device = "KPA500",
-                command = label,
-                expected_prefix = ?expected_prefixes,
-                received = %response,
-                classification = "mismatched_or_unsolicited",
-                "KPA500 dynamic serial response did not match current command"
-            );
-        }
-    })
-    .await
-    .context("serial response timed out")?
-    .context("failed reading serial response")?;
-    Ok(response)
-}
-
 struct SerialRead {
     response: String,
     unsolicited: Vec<String>,
@@ -1314,6 +1315,16 @@ fn is_unsolicited_response(response: &str) -> bool {
         .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
 }
 
+#[derive(Debug, Clone)]
+struct BandFollowConfirmation {
+    response: String,
+    requested_bn: u8,
+    confirmed_bn: Option<u8>,
+    confirmation_match: bool,
+    stale_response_count: u64,
+    retry_count: u64,
+}
+
 fn kpa_band_follow_wire(band: Band) -> Option<String> {
     let band_number = match band {
         Band::M160 => "00",
@@ -1330,6 +1341,151 @@ fn kpa_band_follow_wire(band: Band) -> Option<String> {
         Band::Unknown => return None,
     };
     Some(format!("^BN{band_number};"))
+}
+
+async fn send_band_follow_confirmed(
+    port: &mut SerialStream,
+    wire: &str,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<BandFollowConfirmation> {
+    let requested_bn = requested_bn_from_band_wire(wire)
+        .with_context(|| format!("invalid KPA500 band-follow wire {wire}"))?;
+    let mut stale_response_count = drain_stale_serial_input(port, transcript).await;
+    let mut last_response = None;
+    for attempt in 0..=1_u64 {
+        let read = send_band_follow_once_exact(port, wire, requested_bn, wait, transcript).await?;
+        stale_response_count = stale_response_count.saturating_add(read.stale_response_count);
+        if read.confirmation_match {
+            return Ok(BandFollowConfirmation {
+                response: read.response,
+                requested_bn,
+                confirmed_bn: read.confirmed_bn,
+                confirmation_match: true,
+                stale_response_count,
+                retry_count: attempt,
+            });
+        }
+        stale_response_count = stale_response_count.saturating_add(1);
+        append_evidence_line(
+            "kpa500-band-follow-confirmation.log",
+            format!(
+                "stale BN response requested_bn={requested_bn:02} response={} confirmed_bn={:?} attempt={attempt}",
+                read.response, read.confirmed_bn
+            ),
+        );
+        last_response = Some((read.response, read.confirmed_bn));
+        sleep(Duration::from_millis(150)).await;
+    }
+    let (response, confirmed_bn) =
+        last_response.unwrap_or_else(|| ("no_response".to_string(), None));
+    Ok(BandFollowConfirmation {
+        response,
+        requested_bn,
+        confirmed_bn,
+        confirmation_match: false,
+        stale_response_count,
+        retry_count: 1,
+    })
+}
+
+async fn send_band_follow_once_exact(
+    port: &mut SerialStream,
+    wire: &str,
+    requested_bn: u8,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<BandFollowConfirmation> {
+    transcript.write_line("TX", wire).await;
+    port.write_all(wire.as_bytes())
+        .await
+        .context("failed to write KPA500 band-follow command")?;
+    port.flush()
+        .await
+        .context("failed to flush KPA500 band-follow command")?;
+
+    let mut stale_response_count = 0_u64;
+    let mut last_response = None;
+    let result = timeout(wait, async {
+        loop {
+            let response = read_serial_line(port).await?;
+            transcript.write_line("RX", &response).await;
+            let confirmed_bn = confirmed_bn_from_band_response(&response);
+            if confirmed_bn == Some(requested_bn) {
+                last_response = Some((response, confirmed_bn));
+                break Ok::<(), std::io::Error>(());
+            }
+            if let Some(bn) = confirmed_bn {
+                stale_response_count = stale_response_count.saturating_add(1);
+                append_evidence_line(
+                    "kpa500-band-follow-confirmation.log",
+                    format!(
+                        "ignored stale BN response requested_bn={requested_bn:02} response={response} confirmed_bn={bn:02}"
+                    ),
+                );
+            } else if is_unsolicited_response(&response) || response == wire {
+                append_evidence_line(
+                    "kpa500-band-follow-confirmation.log",
+                    format!(
+                        "ignored non-band response while waiting for exact BN echo requested_bn={requested_bn:02} response={response}"
+                    ),
+                );
+            } else {
+                append_evidence_line(
+                    "kpa500-band-follow-confirmation.log",
+                    format!(
+                        "ignored mismatched response while waiting for exact BN echo requested_bn={requested_bn:02} response={response}"
+                    ),
+                );
+            }
+            last_response = Some((response, confirmed_bn));
+        }
+    })
+    .await;
+    if let Ok(Err(err)) = result {
+        return Err(err).context("failed reading KPA500 band-follow confirmation");
+    }
+
+    let (response, confirmed_bn) =
+        last_response.unwrap_or_else(|| ("timeout_waiting_for_exact_bn_echo".to_string(), None));
+    Ok(BandFollowConfirmation {
+        confirmation_match: confirmed_bn == Some(requested_bn),
+        response,
+        requested_bn,
+        confirmed_bn,
+        stale_response_count,
+        retry_count: 0,
+    })
+}
+
+async fn drain_stale_serial_input(
+    port: &mut SerialStream,
+    transcript: &mut SerialTranscript,
+) -> u64 {
+    let mut drained = 0_u64;
+    let started = Instant::now();
+    while let Ok(Ok(response)) = timeout(Duration::from_millis(75), read_serial_line(port)).await {
+        transcript.write_line("RX_STALE", &response).await;
+        append_evidence_line(
+            "kpa500-band-follow-confirmation.log",
+            format!("drained stale serial response before BN command: {response}"),
+        );
+        drained = drained.saturating_add(1);
+        if drained >= 20 || started.elapsed() >= Duration::from_millis(1500) {
+            break;
+        }
+    }
+    drained
+}
+
+fn requested_bn_from_band_wire(wire: &str) -> Option<u8> {
+    wire.strip_prefix("^BN")
+        .and_then(|value| value.strip_suffix(';'))
+        .and_then(|value| value.parse::<u8>().ok())
+}
+
+fn confirmed_bn_from_band_response(response: &str) -> Option<u8> {
+    requested_bn_from_band_wire(response)
 }
 
 async fn send_no_ack_command(

@@ -754,6 +754,8 @@ impl Kat500Driver {
                     .radio_context
                     .kat500_follow_skipped_count
                     .saturating_add(1);
+                guard.radio_context.last_kat500_follow_requested_khz =
+                    Some(frequency_hz_to_khz(frequency_hz));
                 append_evidence_line(
                     "kat500-frequency-follow.log",
                     format!("skip {wire} reason=tuner_currently_tuning"),
@@ -762,6 +764,26 @@ impl Kat500Driver {
             }
             if guard.radio_context.last_kat500_follow_wire.as_deref() == Some(wire.as_str()) {
                 return Ok(());
+            }
+            if let Some(requested) = guard.radio_context.last_kat500_follow_requested_khz {
+                let khz = frequency_hz_to_khz(frequency_hz);
+                if requested != khz
+                    && guard
+                        .radio_context
+                        .last_kat500_follow_confirmation_match
+                        .is_none()
+                {
+                    guard.radio_context.last_kat500_follow_requested_khz = Some(khz);
+                    guard.radio_context.kat500_follow_skipped_count = guard
+                        .radio_context
+                        .kat500_follow_skipped_count
+                        .saturating_add(1);
+                    append_evidence_line(
+                        "kat500-frequency-follow.log",
+                        format!("coalesced rapid Flex frequency change wire={wire} khz={khz}"),
+                    );
+                    return Ok(());
+                }
             }
             if !self.command_allowed(CMD_FREQUENCY_CONTEXT) && !self.command_allowed(CMD_AUTOTUNE) {
                 guard.radio_context.kat500_follow_skipped_count = guard

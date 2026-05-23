@@ -155,6 +155,12 @@ enum Commands {
         #[arg(long, default_value_t = 120.0)]
         duration_seconds: f64,
     },
+    BandFollowTest {
+        #[arg(long, default_value = "config.aethersdr-kpa-band-follow-test.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        duration_minutes: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -493,6 +499,14 @@ async fn main() -> Result<()> {
             cfg.validate()?;
             init_logging(&cfg.logging.level);
             run_aethersdr_open_trigger_test(cfg, config, duration_seconds).await
+        }
+        Commands::BandFollowTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_band_follow_test(cfg, config, duration_minutes).await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -2189,6 +2203,38 @@ async fn run_aethersdr_open_trigger_test(
     Ok(())
 }
 
+async fn run_band_follow_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start("band-follow-test", &config_path, &cfg, std::env::args())?;
+    print_mode_banner(&cfg, "band-follow-test");
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs_f64(duration_minutes * 60.0)).await;
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let summary = band_follow_summary_markdown(&cfg, &state).await;
+    tokio::fs::write(evidence.dir().join("band-follow-summary.md"), summary).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    let guard = state.read().await;
+    println!(
+        "band-follow test complete: kat_sent={} kat_exact_match={:?} kpa_sent={} kpa_exact_match={:?} evidence={}",
+        guard.radio_context.kat500_follow_sent_count,
+        guard.radio_context.last_kat500_follow_confirmation_match,
+        guard.radio_context.kpa500_follow_sent_count,
+        guard.radio_context.last_kpa500_follow_confirmation_match,
+        zip.display()
+    );
+    Ok(())
+}
+
 async fn compare_pgxl_profiles(
     mut cfg: BridgeConfig,
     config_path: PathBuf,
@@ -3783,6 +3829,64 @@ async fn radio_stripped_amplifier_fields_markdown(state: &SharedState) -> String
         emitted_fields,
         observed_fields,
         stripped,
+    )
+}
+
+async fn band_follow_summary_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Band Follow Test Summary\n\n\
+        - Flex frequency Hz: `{:?}`\n\
+        - Flex band: `{}`\n\
+        - KAT follow enabled: `{}`\n\
+        - KAT F sent count: `{}`\n\
+        - KAT F stale response count: `{}`\n\
+        - KAT F retry count: `{}`\n\
+        - Last KAT F wire: `{}`\n\
+        - Last KAT requested kHz: `{:?}`\n\
+        - Last KAT confirmed kHz: `{:?}`\n\
+        - Last KAT confirmation match: `{:?}`\n\
+        - KPA band-follow enabled: `{}`\n\
+        - KPA BN sent count: `{}`\n\
+        - KPA BN stale response count: `{}`\n\
+        - KPA BN retry count: `{}`\n\
+        - Last KPA BN wire: `{}`\n\
+        - Last KPA requested BN: `{:?}`\n\
+        - Last KPA confirmed BN: `{:?}`\n\
+        - Last KPA confirmation match: `{:?}`\n\
+        - Last KPA result: `{}`\n\n\
+        KPA500 supports verified band-follow through `^BNnn;`, not direct frequency follow. KAT500 remains the device that receives the Flex transmit frequency with `F <kHz>;`.\n",
+        guard.radio_context.frequency_hz,
+        guard.radio_context.band.as_str(),
+        cfg.kat500.follow_flex_frequency,
+        guard.radio_context.kat500_follow_sent_count,
+        guard.radio_context.kat500_follow_stale_response_count,
+        guard.radio_context.kat500_follow_retry_count,
+        guard
+            .radio_context
+            .last_kat500_follow_wire
+            .as_deref()
+            .unwrap_or("none"),
+        guard.radio_context.last_kat500_follow_requested_khz,
+        guard.radio_context.last_kat500_follow_confirmed_khz,
+        guard.radio_context.last_kat500_follow_confirmation_match,
+        cfg.kpa500.follow_flex_band,
+        guard.radio_context.kpa500_follow_sent_count,
+        guard.radio_context.kpa500_follow_stale_response_count,
+        guard.radio_context.kpa500_follow_retry_count,
+        guard
+            .radio_context
+            .last_kpa500_follow_wire
+            .as_deref()
+            .unwrap_or("none"),
+        guard.radio_context.last_kpa500_follow_requested_bn,
+        guard.radio_context.last_kpa500_follow_confirmed_bn,
+        guard.radio_context.last_kpa500_follow_confirmation_match,
+        guard
+            .radio_context
+            .last_kpa500_follow_result
+            .as_deref()
+            .unwrap_or("none"),
     )
 }
 
@@ -5505,6 +5609,11 @@ async fn status_json(state: &SharedState) -> String {
             "last_kpa500_follow_band": guard.radio_context.last_kpa500_follow_band.map(|band| band.as_str()),
             "last_kpa500_follow_wire": guard.radio_context.last_kpa500_follow_wire,
             "last_kpa500_follow_result": guard.radio_context.last_kpa500_follow_result,
+            "last_kpa500_follow_requested_bn": guard.radio_context.last_kpa500_follow_requested_bn,
+            "last_kpa500_follow_confirmed_bn": guard.radio_context.last_kpa500_follow_confirmed_bn,
+            "last_kpa500_follow_confirmation_match": guard.radio_context.last_kpa500_follow_confirmation_match,
+            "kpa500_follow_stale_response_count": guard.radio_context.kpa500_follow_stale_response_count,
+            "kpa500_follow_retry_count": guard.radio_context.kpa500_follow_retry_count,
             "kpa500_follow_sent_count": guard.radio_context.kpa500_follow_sent_count,
             "kpa500_follow_skipped_count": guard.radio_context.kpa500_follow_skipped_count,
             "context_age_ms": stale_duration_ms(guard.radio_context.updated_at),
@@ -6741,6 +6850,7 @@ mod tests {
         assert!(names.contains(&"operational-gap-test".to_string()));
         assert!(names.contains(&"pgxl-trigger-strategy-test".to_string()));
         assert!(names.contains(&"aethersdr-open-trigger-test".to_string()));
+        assert!(names.contains(&"band-follow-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"simulate-pgxl-control".to_string()));

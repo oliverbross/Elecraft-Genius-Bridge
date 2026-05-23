@@ -2,6 +2,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    if std::env::var("CARGO_CFG_WINDOWS").is_ok() {
+        println!("cargo:rustc-link-arg-bin=egb=/STACK:8388608");
+    }
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     if let Some(head_ref) = Command::new("git")
         .args(["symbolic-ref", "-q", "HEAD"])

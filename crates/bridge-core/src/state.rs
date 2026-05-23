@@ -351,6 +351,11 @@ pub struct RadioContext {
     pub last_kpa500_follow_band: Option<Band>,
     pub last_kpa500_follow_wire: Option<String>,
     pub last_kpa500_follow_result: Option<String>,
+    pub last_kpa500_follow_requested_bn: Option<u8>,
+    pub last_kpa500_follow_confirmed_bn: Option<u8>,
+    pub last_kpa500_follow_confirmation_match: Option<bool>,
+    pub kpa500_follow_stale_response_count: u64,
+    pub kpa500_follow_retry_count: u64,
     pub kpa500_follow_sent_count: u64,
     pub kpa500_follow_skipped_count: u64,
     #[serde(skip)]

@@ -17,6 +17,7 @@ Behaviour:
 
 - Flex TX slice band changes are mapped to KPA500 band numbers.
 - EGB sends `^BNnn;` only when the derived band changes.
+- EGB drains stale serial input and waits for an exact `^BNnn;` echo. Stale previous `^BN` responses are ignored and counted.
 - EGB does not send KPA500 `^OS1;`.
 - KPA500 operate remains disabled unless a separate RF-risk profile explicitly enables it.
 
@@ -25,6 +26,11 @@ Evidence fields:
 - `/status.radio_context.last_kpa500_follow_band`
 - `/status.radio_context.last_kpa500_follow_wire`
 - `/status.radio_context.last_kpa500_follow_result`
+- `/status.radio_context.last_kpa500_follow_requested_bn`
+- `/status.radio_context.last_kpa500_follow_confirmed_bn`
+- `/status.radio_context.last_kpa500_follow_confirmation_match`
+- `/status.radio_context.kpa500_follow_stale_response_count`
+- `/status.radio_context.kpa500_follow_retry_count`
 - `/status.radio_context.kpa500_follow_sent_count`
 - `/status.radio_context.kpa500_follow_skipped_count`
 
