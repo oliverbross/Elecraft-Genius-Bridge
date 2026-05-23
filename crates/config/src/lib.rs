@@ -108,6 +108,7 @@ impl Default for BridgeConfig {
                 dry_run: true,
                 allow_control: false,
                 allow_rf_risk: false,
+                follow_flex_frequency: false,
             },
             kat500: SerialDeviceConfig {
                 enabled: true,
@@ -118,6 +119,7 @@ impl Default for BridgeConfig {
                 dry_run: true,
                 allow_control: false,
                 allow_rf_risk: false,
+                follow_flex_frequency: false,
             },
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
@@ -245,6 +247,7 @@ pub struct SerialDeviceConfig {
     pub dry_run: bool,
     pub allow_control: bool,
     pub allow_rf_risk: bool,
+    pub follow_flex_frequency: bool,
 }
 
 impl SerialDeviceConfig {
@@ -277,6 +280,7 @@ impl Default for SerialDeviceConfig {
             dry_run: true,
             allow_control: false,
             allow_rf_risk: false,
+            follow_flex_frequency: false,
         }
     }
 }

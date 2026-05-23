@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use anyhow::{Context, Result};
 use bridge_core::state::{shared_default_state, shared_mock_state};
 use bridge_core::{
@@ -112,6 +114,15 @@ enum Commands {
         config: PathBuf,
         #[arg(long, default_value_t = 180.0)]
         duration_seconds: f64,
+    },
+    FullAethersdrFunctionalTest {
+        #[arg(
+            long,
+            default_value = "config.aethersdr-last-known-good-real-controls.yaml"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        duration_minutes: f64,
     },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
@@ -382,6 +393,20 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_full_operational_test(cfg, config, duration_seconds).await
+        }
+        Commands::FullAethersdrFunctionalTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test(
+                "full-aethersdr-functional-test",
+                cfg,
+                config,
+                duration_minutes,
+            )
+            .await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -892,6 +917,7 @@ async fn run_kat_startup_preflight(
             dry_run: policy.effective_kat_dry_run,
             allow_control: policy.effective_kat_allow_control,
             allow_rf_risk: policy.effective_kat_allow_rf_risk,
+            follow_flex_frequency: cfg.kat500.follow_flex_frequency,
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
                 .logging
@@ -1014,6 +1040,7 @@ async fn start_bridge(
                 dry_run: kat_dry_run,
                 allow_control: kat_allow_control,
                 allow_rf_risk: kat_allow_rf_risk,
+                follow_flex_frequency: cfg.kat500.follow_flex_frequency,
                 transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
                     .logging
@@ -1138,9 +1165,7 @@ async fn start_bridge(
                 cfg.flex_injection.tuner_refresh_interval_ms,
             ),
             amplifier_reannounce_interval: Duration::from_millis(
-                cfg.flex_injection
-                    .amplifier_reannounce_interval_ms
-                    .max(30_000),
+                cfg.flex_injection.amplifier_reannounce_interval_ms,
             ),
         };
         let state = state.clone();
@@ -2510,6 +2535,7 @@ impl EvidenceRun {
             "tgxl-control-commands.log",
             "pgxl-control-commands.log",
             "flex-control-commands.log",
+            "kat500-frequency-follow.log",
             "advertised-state-history.jsonl",
             "state-mismatch-events.jsonl",
             "profile-summary.md",
@@ -2526,6 +2552,7 @@ impl EvidenceRun {
             "pgxl-connect-assist.md",
             "real-vs-ui-amp-state.md",
             "aethersdr-operational-test.md",
+            "full-aethersdr-functional-test.md",
             "operational-readiness.md",
             "operational-readiness-verdict.md",
             "effective-control-policy.md",
@@ -2636,6 +2663,11 @@ impl EvidenceRun {
         tokio::fs::write(self.dir.join("pgxl-status-mapping.md"), pgxl_mapping).await?;
         let flex_mapping = flex_state_mapping_markdown(state).await;
         tokio::fs::write(self.dir.join("flex-state-mapping.md"), flex_mapping).await?;
+        tokio::fs::write(
+            self.dir.join("full-aethersdr-functional-test.md"),
+            full_aethersdr_functional_test_markdown(state).await,
+        )
+        .await?;
         tokio::fs::write(
             self.dir.join("latest-kpa-telemetry.json"),
             serde_json::to_string_pretty(&latest_kpa_telemetry_json(state).await)?,
@@ -3688,6 +3720,103 @@ async fn aethersdr_operational_test_markdown(state: &SharedState) -> String {
     )
 }
 
+async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let tgxl_first = guard
+        .clients
+        .tgxl_sessions
+        .iter()
+        .map(|session| session.connected_at_ms)
+        .min();
+    let pgxl_first = guard
+        .clients
+        .pgxl_sessions
+        .iter()
+        .map(|session| session.connected_at_ms)
+        .min();
+    let delay = match (tgxl_first, pgxl_first) {
+        (Some(tgxl), Some(pgxl)) if pgxl >= tgxl => {
+            format!("{:.3}s", (pgxl - tgxl) as f64 / 1000.0)
+        }
+        _ => "n/a".to_string(),
+    };
+    format!(
+        "# Full AetherSDR Functional Test\n\n\
+        - TGXL first connect timestamp: `{}`\n\
+        - PGXL first connect timestamp: `{}`\n\
+        - PGXL connect delay after TGXL: `{delay}`\n\
+        - KPA health: `{}` polls={} failures={}\n\
+        - KAT health: `{}` polls={} failures={}\n\
+        - Current Flex TX frequency: `{:?}` Hz\n\
+        - Current Flex band: `{}`\n\
+        - KAT500 frequency-follow sent count: {}\n\
+        - KAT500 frequency-follow skipped count: {}\n\
+        - Last KAT500 frequency-follow wire: `{}`\n\
+        - Tune commands executed: {}\n\
+        - Last tune frequency: `{:?}` Hz\n\
+        - Last tune band: `{}`\n\
+        - Last interlock state: `{}`\n\
+        - Last interlock reason: `{}`\n\
+        - Last interlock tx_allowed: `{}`\n\
+        - Interlock blocked count: {}\n\
+        - Amplifier removed count: {}\n\
+        - Amplifier handle change count: {}\n\
+        - Readiness verdict: `{}`\n",
+        tgxl_first
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        pgxl_first
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        guard.amp.connection_state.as_str(),
+        guard.amp.runtime.poll_success_count,
+        guard.amp.runtime.poll_failure_count,
+        guard.tuner.connection_state.as_str(),
+        guard.tuner.runtime.poll_success_count,
+        guard.tuner.runtime.poll_failure_count,
+        guard.radio_context.frequency_hz,
+        guard.radio_context.band.as_str(),
+        guard.radio_context.kat500_follow_sent_count,
+        guard.radio_context.kat500_follow_skipped_count,
+        guard
+            .radio_context
+            .last_kat500_follow_wire
+            .as_deref()
+            .unwrap_or("none"),
+        guard.controls.tune_executed_count,
+        guard.controls.last_tune_frequency_hz,
+        guard.controls.last_tune_band.as_deref().unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_interlock_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_interlock_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard.flex_injection.interlock_blocked_count,
+        guard.flex_injection.amplifier_removed_count,
+        guard.flex_injection.amplifier_handle_change_count,
+        if guard.clients.pgxl_session_started_count > 0
+            && guard.clients.tgxl_session_started_count > 0
+            && guard.flex_injection.amplifier_removed_count == 0
+            && guard.amp.runtime.poll_failure_count == 0
+            && guard.tuner.runtime.poll_failure_count == 0
+        {
+            "PASS_OR_LIVE_VERIFY_CONTROLS"
+        } else {
+            "WARN"
+        },
+    )
+}
+
 async fn operational_readiness_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
     let guard = state.read().await;
     format!(
@@ -3843,8 +3972,12 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         - Interlock handle: `{}`\n\
         - Keepalive enable accepted: {}\n\
         - Last interlock status: `{}`\n\
+        - Last interlock state: `{}`\n\
+        - Last interlock reason: `{}`\n\
+        - Last interlock tx_allowed: `{}`\n\
         - Empty interlock amplifier field: {}\n\
         - Empty interlock amplifier count: {}\n\
+        - Interlock blocked count: {}\n\
         - `sub amplifier all` accepted: {}\n\
         - Last Flex TX: `{}`\n\
         - Last Flex RX: `{}`\n\n\
@@ -3866,8 +3999,14 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         flex.interlock_handle.as_deref().unwrap_or("none"),
         flex.keepalive_enable_accepted,
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
+        flex.last_interlock_state.as_deref().unwrap_or("none"),
+        flex.last_interlock_reason.as_deref().unwrap_or("none"),
+        flex.last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         flex.interlock_amplifier_field_empty,
         flex.interlock_empty_amplifier_count,
+        flex.interlock_blocked_count,
         flex.sub_amplifier_all_accepted,
         flex.last_tx_line.as_deref().unwrap_or("none"),
         flex.last_rx_line.as_deref().unwrap_or("none"),
@@ -3948,8 +4087,12 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
         - Interlock handle: `{}`\n\
         - Registration continued without handle: {}\n\
         - Last interlock status: `{}`\n\
+        - Last interlock state: `{}`\n\
+        - Last interlock reason: `{}`\n\
+        - Last interlock tx_allowed: `{}`\n\
         - Empty `amplifier=` observed: {}\n\
         - Empty `amplifier=` count: {}\n\
+        - Interlock blocked count: {}\n\
         - Last amplifier status: `{}`\n\
         - Last Flex TX: `{}`\n\
         - Last Flex RX: `{}`\n\n\
@@ -3958,8 +4101,14 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
         flex.interlock_handle.as_deref().unwrap_or("none"),
         flex.registration_continued_without_handle,
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
+        flex.last_interlock_state.as_deref().unwrap_or("none"),
+        flex.last_interlock_reason.as_deref().unwrap_or("none"),
+        flex.last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         flex.interlock_amplifier_field_empty,
         flex.interlock_empty_amplifier_count,
+        flex.interlock_blocked_count,
         flex.last_amplifier_status_line.as_deref().unwrap_or("none"),
         flex.last_tx_line.as_deref().unwrap_or("none"),
         flex.last_rx_line.as_deref().unwrap_or("none"),
@@ -3985,7 +4134,7 @@ async fn flex_registration_health_markdown(state: &SharedState) -> String {
         - Sub amplifier all accepted: {}\n\
         - Connection state: `{}`\n\
         - Degraded reason: `{}`\n\n\
-        Registration is healthy if the amplifier handle is stable, or if Flex accepted `amplifier create` and post-registration completed through the serial/name fallback. Meter/interlock handles should be present when enabled, `amplifier_removed_count` must remain zero, and the interlock status must not report `reason=AMP:PG-XL amplifier=` with an empty amplifier field.\n",
+        Registration is healthy if the amplifier handle is stable, or if Flex accepted `amplifier create` and post-registration completed through the serial/name fallback. Meter/interlock handles should be present when enabled, `amplifier_removed_count` must remain zero, and interlock `tx_allowed=0` with `reason=AMP:PG-XL` is a blocker. Empty `amplifier=` with `tx_allowed=1` is tracked as a warning only.\n",
         flex.amplifier_create_sent,
         flex.amplifier_create_accepted,
         flex.amplifier_handle.as_deref().unwrap_or("none"),
@@ -4043,9 +4192,17 @@ async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &Shar
         if guard.flex_injection.duplicate_amplifier_create_count > 0 {
             failures.push("Duplicate amplifier create attempts occurred".to_string());
         }
-        if guard.flex_injection.interlock_amplifier_field_empty {
-            failures
-                .push("Flex interlock reports AMP:PG-XL with an empty amplifier field".to_string());
+        if guard.flex_injection.interlock_blocked_count > 0
+            || guard.flex_injection.last_interlock_tx_allowed == Some(false)
+        {
+            failures.push(
+                "INTERLOCK_BLOCKED: Flex interlock reports AMP:PG-XL with tx_allowed=0".to_string(),
+            );
+        } else if guard.flex_injection.interlock_amplifier_field_empty {
+            warnings.push(
+                "Flex interlock reports AMP:PG-XL with an empty amplifier field while TX is allowed"
+                    .to_string(),
+            );
         }
     }
     if let Some(head) = git_head_commit() {
@@ -4920,6 +5077,10 @@ async fn status_json(state: &SharedState) -> String {
             "source": guard.radio_context.source,
             "last_tune_frequency_hz": guard.radio_context.last_tune_frequency_hz,
             "last_tune_band": guard.radio_context.last_tune_band.map(|band| band.as_str()),
+            "last_kat500_follow_frequency_hz": guard.radio_context.last_kat500_follow_frequency_hz,
+            "last_kat500_follow_wire": guard.radio_context.last_kat500_follow_wire,
+            "kat500_follow_sent_count": guard.radio_context.kat500_follow_sent_count,
+            "kat500_follow_skipped_count": guard.radio_context.kat500_follow_skipped_count,
             "context_age_ms": stale_duration_ms(guard.radio_context.updated_at),
             "last_tune_age_ms": stale_duration_ms(guard.radio_context.last_tune_at),
         },
@@ -4972,6 +5133,11 @@ async fn status_json(state: &SharedState) -> String {
             "amp_widget_visibility_risk": amp_widget_visibility_risk(&guard),
             "amplifier_direct_connect_expected": guard.flex_injection.amplifier_direct_connect_expected,
             "last_amplifier_removed_reason": guard.flex_injection.last_amplifier_removed_reason,
+            "last_interlock_state": guard.flex_injection.last_interlock_state,
+            "last_interlock_reason": guard.flex_injection.last_interlock_reason,
+            "last_interlock_tx_allowed": guard.flex_injection.last_interlock_tx_allowed,
+            "empty_amplifier_field_count": guard.flex_injection.interlock_empty_amplifier_count,
+            "interlock_blocked_count": guard.flex_injection.interlock_blocked_count,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
         },
@@ -5793,6 +5959,7 @@ async fn test_kat(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             dry_run: cfg.kat500.dry_run,
             allow_control: cfg.kat500.allow_control || allow_control,
             allow_rf_risk: cfg.kat500.allow_rf_risk || allow_rf_risk,
+            follow_flex_frequency: cfg.kat500.follow_flex_frequency,
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
                 .logging
@@ -6127,6 +6294,7 @@ mod tests {
         assert!(names.contains(&"aethersdr-operational-test".to_string()));
         assert!(names.contains(&"ecosystem-soak-test".to_string()));
         assert!(names.contains(&"full-operational-test".to_string()));
+        assert!(names.contains(&"full-aethersdr-functional-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));

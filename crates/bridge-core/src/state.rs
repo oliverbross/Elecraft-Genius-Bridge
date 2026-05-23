@@ -339,6 +339,10 @@ pub struct RadioContext {
     pub source: Option<String>,
     pub last_tune_frequency_hz: Option<u64>,
     pub last_tune_band: Option<Band>,
+    pub last_kat500_follow_frequency_hz: Option<u64>,
+    pub last_kat500_follow_wire: Option<String>,
+    pub kat500_follow_sent_count: u64,
+    pub kat500_follow_skipped_count: u64,
     #[serde(skip)]
     pub updated_at: Option<SystemTime>,
     #[serde(skip)]
@@ -557,6 +561,10 @@ pub struct FlexInjectionState {
     pub meter_handles: Vec<FlexMeterHandle>,
     pub interlock_handle: Option<String>,
     pub last_interlock_status_line: Option<String>,
+    pub last_interlock_state: Option<String>,
+    pub last_interlock_reason: Option<String>,
+    pub last_interlock_tx_allowed: Option<bool>,
+    pub interlock_blocked_count: u64,
     pub interlock_amplifier_field_empty: bool,
     pub interlock_empty_amplifier_count: u64,
     pub last_command: Option<String>,

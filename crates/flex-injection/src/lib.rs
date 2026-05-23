@@ -205,6 +205,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
     let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
+    let mut amplifier_startup_burst_timer = Box::pin(sleep(Duration::from_secs(86_400)));
+    let mut amplifier_startup_burst_count = 0_u8;
     let mut pgxl_connect_assist_retry_timer = Box::pin(sleep(Duration::from_secs(30)));
     let mut post_registration_fallback_timer = Box::pin(sleep(Duration::from_secs(86_400)));
 
@@ -331,6 +333,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     )
                     .await?;
                     post_amplifier_registration_sent = true;
+                    amplifier_startup_burst_count = 0;
+                    amplifier_startup_burst_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_millis(250));
                 }
             }
 
@@ -361,6 +367,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         )
                         .await?;
                         post_amplifier_registration_sent = true;
+                        amplifier_startup_burst_count = 0;
+                        amplifier_startup_burst_timer
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + Duration::from_millis(250));
                     }
                     if settings.flex_force_operate_via_radio {
                         append_flex_operate_lab_line(format!("RX_STATUS {}", status.raw));
@@ -450,8 +460,76 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 )
                 .await?;
                 post_amplifier_registration_sent = true;
+                amplifier_startup_burst_count = 0;
+                amplifier_startup_burst_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(250));
             }
             post_registration_fallback_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+        }
+        () = &mut amplifier_startup_burst_timer => {
+            let pgxl_connected = {
+                let guard = state.read().await;
+                guard.clients.pgxl_session_started_count > 0
+            };
+            if post_amplifier_registration_sent && !pgxl_connected && amplifier_startup_burst_count < 10 {
+                amplifier_startup_burst_count = amplifier_startup_burst_count.saturating_add(1);
+                send_tracked_command(
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                    PendingCommand::new(
+                        "amplifier_startup_burst_refresh",
+                        "sub amplifier all",
+                        PendingKind::AmplifierReannounce,
+                    ),
+                )
+                .await?;
+                let line = synthetic_amplifier_status_line(
+                    settings,
+                    &state,
+                    session.amplifier_handle.as_deref(),
+                )
+                .await;
+                trace_amplifier_advertisement(
+                    settings,
+                    &state,
+                    "amplifier_status",
+                    "startup_burst",
+                    &line,
+                )
+                .await;
+                append_flex_log_line("amplifier-status-lines.log", &line);
+                append_evidence_line(
+                    "amplifier-reannounce.log",
+                    format!("startup_burst#{} {line}", amplifier_startup_burst_count),
+                );
+                append_evidence_line("amplifier-status-lines.log", line);
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.amplifier_reannounce_count =
+                        guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
+                    guard.flex_injection.amplifier_direct_connect_expected =
+                        Some(!settings.amplifier_ip.is_loopback());
+                    guard.flex_injection.last_amplifier_reannounce_reason =
+                        Some(format!("startup_burst_{}", amplifier_startup_burst_count));
+                    guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
+                        guard.clients.pgxl_session_started_count > 0;
+                }
+                info!(
+                    event_id = "amplifier_startup_burst_refresh",
+                    burst_count = amplifier_startup_burst_count,
+                    "Flex amplifier startup burst refresh query sent"
+                );
+                amplifier_startup_burst_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(1));
+            } else {
+                amplifier_startup_burst_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+            }
         }
         () = &mut amplifier_reannounce_timer => {
             if post_amplifier_registration_sent {
@@ -1143,26 +1221,65 @@ async fn record_amplifier_candidate_fields(state: &SharedState, candidate_fields
 async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) {
     let reason = status.value("reason").unwrap_or_default();
     let amplifier = status.value("amplifier").unwrap_or_default();
+    let interlock_state = status.value("state").unwrap_or_default();
+    let tx_allowed = status
+        .value("tx_allowed")
+        .map(|value| matches!(value, "1" | "true" | "True" | "TRUE"));
     let mut guard = state.write().await;
     guard.flex_injection.last_interlock_status_line = Some(status.raw.clone());
+    guard.flex_injection.last_interlock_state = if interlock_state.is_empty() {
+        None
+    } else {
+        Some(interlock_state.to_string())
+    };
+    guard.flex_injection.last_interlock_reason = if reason.is_empty() {
+        None
+    } else {
+        Some(reason.to_string())
+    };
+    guard.flex_injection.last_interlock_tx_allowed = tx_allowed;
     if reason == "AMP:PG-XL" && amplifier.is_empty() {
         guard.flex_injection.interlock_amplifier_field_empty = true;
         guard.flex_injection.interlock_empty_amplifier_count = guard
             .flex_injection
             .interlock_empty_amplifier_count
             .saturating_add(1);
-        guard.flex_injection.degraded_reason =
-            Some("Flex interlock status reports AMP:PG-XL with empty amplifier field".to_string());
-        warn!(
-            event_id = "flex_interlock_empty_amplifier",
-            raw = %status.raw,
-            "Flex interlock is not associated with an amplifier"
-        );
+        if tx_allowed == Some(false) {
+            guard.flex_injection.interlock_blocked_count = guard
+                .flex_injection
+                .interlock_blocked_count
+                .saturating_add(1);
+            guard.flex_injection.degraded_reason = Some(
+                "INTERLOCK_BLOCKED: Flex interlock reports AMP:PG-XL with tx_allowed=0".to_string(),
+            );
+            warn!(
+                event_id = "flex_interlock_blocked",
+                raw = %status.raw,
+                "Flex interlock blocks TX for AMP:PG-XL"
+            );
+        } else {
+            if guard
+                .flex_injection
+                .degraded_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("INTERLOCK_BLOCKED"))
+            {
+                guard.flex_injection.degraded_reason = None;
+            }
+            warn!(
+                event_id = "flex_interlock_empty_amplifier_warn",
+                raw = %status.raw,
+                "Flex interlock has empty amplifier field but TX is allowed; treating as warning"
+            );
+        }
         append_evidence_json(
             "lifecycle-events.jsonl",
             &serde_json::json!({
                 "event": "flex_interlock_empty_amplifier",
                 "raw": status.raw,
+                "state": interlock_state,
+                "reason": reason,
+                "tx_allowed": tx_allowed,
             }),
         );
     } else if !amplifier.is_empty() {

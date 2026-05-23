@@ -183,6 +183,7 @@ pub struct Kat500Settings {
     pub dry_run: bool,
     pub allow_control: bool,
     pub allow_rf_risk: bool,
+    pub follow_flex_frequency: bool,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
 }
@@ -276,6 +277,17 @@ impl Kat500Driver {
                     }
                     self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
+                        if let Err(err) = self
+                            .process_frequency_follow(&mut port, &mut transcript)
+                            .await
+                        {
+                            warn!(
+                                event_id = "kat500_frequency_follow_failed",
+                                device = "KAT500",
+                                error = %err,
+                                "KAT500 Flex frequency follow was not applied"
+                            );
+                        }
                         if let Err(err) = self
                             .process_desired_control(&mut port, &mut transcript)
                             .await
@@ -451,7 +463,7 @@ impl Kat500Driver {
         };
 
         if autotune {
-            let (suppress_duplicate, frequency_hz, band_label, frequency_wire) = {
+            let (suppress_duplicate, frequency_hz, band_label, frequency_wire, already_followed) = {
                 let mut guard = self.state.write().await;
                 let now = SystemTime::now();
                 let suppress_duplicate = guard
@@ -463,6 +475,9 @@ impl Kat500Driver {
                 let band = guard.radio_context.band;
                 let band_label = band.as_str().to_string();
                 let frequency_wire = frequency_context_wire(frequency_hz);
+                let already_followed = frequency_wire.as_deref().is_some_and(|wire| {
+                    guard.radio_context.last_kat500_follow_wire.as_deref() == Some(wire)
+                });
                 if suppress_duplicate {
                     guard.controls.duplicate_autotune_suppressed_count = guard
                         .controls
@@ -485,7 +500,13 @@ impl Kat500Driver {
                         "KAT500 T; accepted for execution",
                     );
                 }
-                (suppress_duplicate, frequency_hz, band_label, frequency_wire)
+                (
+                    suppress_duplicate,
+                    frequency_hz,
+                    band_label,
+                    frequency_wire,
+                    already_followed,
+                )
             };
             if suppress_duplicate {
                 append_evidence_json(
@@ -523,7 +544,15 @@ impl Kat500Driver {
                     frequency_wire.as_deref().unwrap_or("none")
                 ),
             );
-            if let Some(wire) = frequency_wire {
+            if already_followed {
+                append_evidence_line(
+                    "kat500-tune-sequence.log",
+                    format!(
+                        "KAT500 frequency context already follows latest Flex frequency; not resending before T; frequency_hz={:?} band={}",
+                        frequency_hz, band_label
+                    ),
+                );
+            } else if let Some(wire) = frequency_wire {
                 if self.command_allowed(CMD_AUTOTUNE) {
                     append_evidence_line(
                         "kat500-tune-sequence.log",
@@ -644,6 +673,136 @@ impl Kat500Driver {
                     manual.relay, manual.movement
                 ),
             );
+        }
+        Ok(())
+    }
+
+    async fn process_frequency_follow(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) -> Result<()> {
+        if !self.settings.follow_flex_frequency {
+            return Ok(());
+        }
+        let decision = {
+            let mut guard = self.state.write().await;
+            let frequency_hz = match guard.radio_context.frequency_hz {
+                Some(value) => value,
+                None => {
+                    guard.radio_context.kat500_follow_skipped_count = guard
+                        .radio_context
+                        .kat500_follow_skipped_count
+                        .saturating_add(1);
+                    return Ok(());
+                }
+            };
+            let wire = match frequency_context_wire(Some(frequency_hz)) {
+                Some(value) => value,
+                None => {
+                    guard.radio_context.kat500_follow_skipped_count = guard
+                        .radio_context
+                        .kat500_follow_skipped_count
+                        .saturating_add(1);
+                    append_evidence_line(
+                        "kat500-frequency-follow.log",
+                        format!(
+                            "skip frequency_hz={frequency_hz} reason=outside_kat500_frequency_context_range"
+                        ),
+                    );
+                    return Ok(());
+                }
+            };
+            if guard.tuner.tuning {
+                guard.radio_context.kat500_follow_skipped_count = guard
+                    .radio_context
+                    .kat500_follow_skipped_count
+                    .saturating_add(1);
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!("skip {wire} reason=tuner_currently_tuning"),
+                );
+                return Ok(());
+            }
+            if guard.radio_context.last_kat500_follow_wire.as_deref() == Some(wire.as_str()) {
+                return Ok(());
+            }
+            if !self.command_allowed(CMD_FREQUENCY_CONTEXT) && !self.command_allowed(CMD_AUTOTUNE) {
+                guard.radio_context.kat500_follow_skipped_count = guard
+                    .radio_context
+                    .kat500_follow_skipped_count
+                    .saturating_add(1);
+                guard.controls.last_safety_decision =
+                    Some("kat500_frequency_follow_blocked_by_control_policy".to_string());
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!(
+                        "skip {wire} frequency_hz={frequency_hz} band={} reason=control_policy",
+                        guard.radio_context.band.as_str()
+                    ),
+                );
+                return Ok(());
+            }
+            let previous = guard.radio_context.last_kat500_follow_frequency_hz;
+            let band = guard.radio_context.band;
+            append_evidence_line(
+                "kat500-frequency-follow.log",
+                format!(
+                    "detected Flex frequency change previous_hz={previous:?} new_hz={frequency_hz} band={} wire={wire}",
+                    band.as_str()
+                ),
+            );
+            (frequency_hz, band, wire)
+        };
+
+        let (frequency_hz, band, wire) = decision;
+        match send_wire_command(
+            port,
+            CMD_FREQUENCY_CONTEXT.label,
+            &wire,
+            &["F "],
+            Duration::from_millis(1000),
+            transcript,
+        )
+        .await
+        {
+            Ok(read) => {
+                let mut guard = self.state.write().await;
+                parse_kat500_response(&read.response, &mut guard.tuner);
+                guard.radio_context.last_kat500_follow_frequency_hz = Some(frequency_hz);
+                guard.radio_context.last_kat500_follow_wire = Some(wire.clone());
+                guard.radio_context.kat500_follow_sent_count = guard
+                    .radio_context
+                    .kat500_follow_sent_count
+                    .saturating_add(1);
+                guard.controls.last_safety_decision =
+                    Some("kat500_frequency_follow_applied".to_string());
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!(
+                        "sent {wire} frequency_hz={frequency_hz} band={} response={}",
+                        band.as_str(),
+                        read.response
+                    ),
+                );
+            }
+            Err(err) => {
+                let mut guard = self.state.write().await;
+                guard.radio_context.kat500_follow_skipped_count = guard
+                    .radio_context
+                    .kat500_follow_skipped_count
+                    .saturating_add(1);
+                guard.controls.last_safety_decision =
+                    Some(format!("kat500_frequency_follow_failed: {err}"));
+                drop(guard);
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!(
+                        "failed {wire} frequency_hz={frequency_hz} band={} error={err}",
+                        band.as_str()
+                    ),
+                );
+            }
         }
         Ok(())
     }

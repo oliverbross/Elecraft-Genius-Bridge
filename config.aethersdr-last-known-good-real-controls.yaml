@@ -42,6 +42,7 @@ kat500:
   dry_run: false
   allow_control: false
   allow_rf_risk: false
+  follow_flex_frequency: true
 
 security:
   token:

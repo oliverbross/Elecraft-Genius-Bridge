@@ -61,4 +61,9 @@ If Flex emits an interlock status with `reason=AMP:PG-XL` and an empty `amplifie
 - `interlock_amplifier_field_empty=true`
 - `interlock_empty_amplifier_count`
 
-Operational readiness is marked FAIL until the association is correct or the remaining hidden requirement is identified.
+Phase 57 changes the readiness classification:
+
+- Empty `amplifier=` with `tx_allowed=1` is a warning only.
+- Empty `amplifier=` with `tx_allowed=0` is classified as `INTERLOCK_BLOCKED`.
+
+This reflects current evidence: the empty field is suspicious, but not proven fatal when the radio explicitly reports TX allowed.

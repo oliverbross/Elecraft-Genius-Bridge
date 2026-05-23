@@ -55,6 +55,7 @@ Purpose:
 
 Enabled real commands:
 - KAT500 Tune: `T;`
+- KAT500 Flex frequency follow: `F <kHz>;`
 - KPA500 Standby: `^OS0;`
 
 Still blocked:
@@ -113,4 +114,10 @@ Real Tune/Standby validation:
 
 ```powershell
 .\target\release\egb.exe evidence-test --config .\config.aethersdr-last-known-good-real-controls.yaml --duration-minutes 5
+```
+
+Full AetherSDR functional validation with PGXL delay and frequency-follow reporting:
+
+```powershell
+.\target\release\egb.exe full-aethersdr-functional-test --config .\config.aethersdr-last-known-good-real-controls.yaml --duration-minutes 5
 ```
