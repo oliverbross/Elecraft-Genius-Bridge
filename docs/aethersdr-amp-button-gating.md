@@ -19,3 +19,15 @@ Current EGB diagnostics:
 - `/status.controls.last_pgxl_control_command`
 
 If no command appears in these files after a button press, the button is gated client-side. The next live test should compare normal interlock mode vs `flex_injection.disable_amp_interlock=true` to determine whether the Flex interlock is suppressing the control path.
+
+## Simulator
+
+Use EGB's simulator to prove the internal command path independent of AetherSDR UI gating:
+
+```powershell
+.\target\release\egb.exe simulate-control --config .\config.aethersdr-last-known-good-real-controls.yaml --action standby
+.\target\release\egb.exe simulate-control --config .\config.aethersdr-last-known-good-real-controls.yaml --action operate
+.\target\release\egb.exe simulate-control --config .\config.aethersdr-last-known-good-real-controls.yaml --action flex-operate
+```
+
+If the simulator maps and blocks/executes correctly but AetherSDR still produces no `last_flex_amp_set_command` or `last_pgxl_control_command`, the remaining issue is AetherSDR-side enablement, not EGB's KPA command mapping.

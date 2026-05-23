@@ -31,6 +31,7 @@ kpa500:
   dry_run: true
   allow_control: false
   allow_rf_risk: false
+  follow_flex_band: false
 
 kat500:
   enabled: true
@@ -41,6 +42,7 @@ kat500:
   dry_run: true
   allow_control: false
   allow_rf_risk: false
+  follow_flex_frequency: false
 
 security:
   # Reserved for a later authenticated API/control plane.

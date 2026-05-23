@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use bridge_core::{
-    append_evidence_json, append_evidence_line, push_capability, AmpOperatingState,
+    append_evidence_json, append_evidence_line, push_capability, AmpOperatingState, Band,
     ConnectionState, SharedState,
 };
 use std::path::{Path, PathBuf};
@@ -178,6 +178,7 @@ pub struct Kpa500Settings {
     pub dry_run: bool,
     pub allow_control: bool,
     pub allow_rf_risk: bool,
+    pub follow_flex_band: bool,
     pub control_verify_delay: Duration,
     pub transcript_dir: Option<PathBuf>,
     pub transcript_rotate_bytes: u64,
@@ -277,6 +278,15 @@ impl Kpa500Driver {
                     }
                     self.discover_capabilities(&mut port, &mut transcript).await;
                     loop {
+                        if let Err(err) = self.process_band_follow(&mut port, &mut transcript).await
+                        {
+                            warn!(
+                                event_id = "kpa500_band_follow_failed",
+                                device = "KPA500",
+                                error = %err,
+                                "KPA500 Flex band follow was not applied"
+                            );
+                        }
                         if let Err(err) = self
                             .process_desired_control(&mut port, &mut transcript)
                             .await
@@ -557,6 +567,114 @@ impl Kpa500Driver {
             final_state = ?result.final_state,
             "KPA500 mapped control completed"
         );
+        Ok(())
+    }
+
+    async fn process_band_follow(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) -> Result<()> {
+        if !self.settings.follow_flex_band {
+            return Ok(());
+        }
+        let decision = {
+            let mut guard = self.state.write().await;
+            let band = guard.radio_context.band;
+            let Some(wire) = kpa_band_follow_wire(band) else {
+                guard.radio_context.kpa500_follow_skipped_count = guard
+                    .radio_context
+                    .kpa500_follow_skipped_count
+                    .saturating_add(1);
+                return Ok(());
+            };
+            if guard.radio_context.last_kpa500_follow_wire.as_deref() == Some(wire.as_str()) {
+                return Ok(());
+            }
+            if guard.amp.state == AmpOperatingState::TransmitA
+                || guard.amp.state == AmpOperatingState::TransmitB
+                || guard.tuner.tuning
+            {
+                guard.radio_context.kpa500_follow_skipped_count = guard
+                    .radio_context
+                    .kpa500_follow_skipped_count
+                    .saturating_add(1);
+                let reason = if guard.tuner.tuning {
+                    "tuner_tuning"
+                } else {
+                    "amplifier_transmitting"
+                };
+                guard.radio_context.last_kpa500_follow_result = Some(format!("skipped: {reason}"));
+                append_evidence_line(
+                    "kpa500-band-follow.log",
+                    format!("skip {wire} band={} reason={reason}", band.as_str()),
+                );
+                return Ok(());
+            }
+            if self.settings.dry_run || !self.settings.allow_control {
+                guard.radio_context.kpa500_follow_skipped_count = guard
+                    .radio_context
+                    .kpa500_follow_skipped_count
+                    .saturating_add(1);
+                guard.radio_context.last_kpa500_follow_result =
+                    Some("skipped: dry_run or allow_control disabled".to_string());
+                append_evidence_line(
+                    "kpa500-band-follow.log",
+                    format!(
+                        "skip {wire} band={} reason=dry_run_or_control_disabled dry_run={} allow_control={}",
+                        band.as_str(),
+                        self.settings.dry_run,
+                        self.settings.allow_control
+                    ),
+                );
+                return Ok(());
+            }
+            append_evidence_line(
+                "kpa500-band-follow.log",
+                format!(
+                    "detected Flex band change band={} wire={wire}",
+                    band.as_str()
+                ),
+            );
+            (band, wire)
+        };
+        let (band, wire) = decision;
+        let response = send_dynamic_command(
+            port,
+            "set_band_follow",
+            &wire,
+            &["^BN"],
+            Duration::from_millis(750),
+            transcript,
+        )
+        .await;
+        let mut guard = self.state.write().await;
+        match response {
+            Ok(response) => {
+                guard.radio_context.last_kpa500_follow_band = Some(band);
+                guard.radio_context.last_kpa500_follow_wire = Some(wire.clone());
+                guard.radio_context.last_kpa500_follow_result = Some(response.clone());
+                guard.radio_context.kpa500_follow_sent_count = guard
+                    .radio_context
+                    .kpa500_follow_sent_count
+                    .saturating_add(1);
+                append_evidence_line(
+                    "kpa500-band-follow.log",
+                    format!("sent {wire} band={} response={response}", band.as_str()),
+                );
+            }
+            Err(err) => {
+                guard.radio_context.kpa500_follow_skipped_count = guard
+                    .radio_context
+                    .kpa500_follow_skipped_count
+                    .saturating_add(1);
+                guard.radio_context.last_kpa500_follow_result = Some(format!("failed: {err}"));
+                append_evidence_line(
+                    "kpa500-band-follow.log",
+                    format!("failed {wire} band={} error={err}", band.as_str()),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1045,6 +1163,42 @@ async fn send_command(
         .response)
 }
 
+async fn send_dynamic_command(
+    port: &mut SerialStream,
+    label: &str,
+    wire: &str,
+    expected_prefixes: &[&str],
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<String> {
+    transcript.write_line("TX", wire).await;
+    port.write_all(wire.as_bytes())
+        .await
+        .with_context(|| format!("failed to write serial command {label}"))?;
+    port.flush().await.context("failed to flush serial port")?;
+    let response = timeout(wait, async {
+        loop {
+            let response = read_serial_line(port).await?;
+            transcript.write_line("RX", &response).await;
+            if matches_expected_response(&response, expected_prefixes) {
+                break Ok::<String, std::io::Error>(response);
+            }
+            trace!(
+                device = "KPA500",
+                command = label,
+                expected_prefix = ?expected_prefixes,
+                received = %response,
+                classification = "mismatched_or_unsolicited",
+                "KPA500 dynamic serial response did not match current command"
+            );
+        }
+    })
+    .await
+    .context("serial response timed out")?
+    .context("failed reading serial response")?;
+    Ok(response)
+}
+
 struct SerialRead {
     response: String,
     unsolicited: Vec<String>,
@@ -1154,10 +1308,28 @@ fn matches_expected_response(response: &str, expected_prefixes: &[&str]) -> bool
 }
 
 fn is_unsolicited_response(response: &str) -> bool {
-    const PREFIXES: &[&str] = &["^RVM", "^SN", "^OS", "^WS", "^TM", "^VI", "^FL"];
+    const PREFIXES: &[&str] = &["^RVM", "^SN", "^OS", "^WS", "^TM", "^VI", "^FL", "^BN"];
     PREFIXES
         .iter()
         .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
+}
+
+fn kpa_band_follow_wire(band: Band) -> Option<String> {
+    let band_number = match band {
+        Band::M160 => "00",
+        Band::M80 => "01",
+        Band::M60 => "02",
+        Band::M40 => "03",
+        Band::M30 => "04",
+        Band::M20 => "05",
+        Band::M17 => "06",
+        Band::M15 => "07",
+        Band::M12 => "08",
+        Band::M10 => "09",
+        Band::M6 => "10",
+        Band::Unknown => return None,
+    };
+    Some(format!("^BN{band_number};"))
 }
 
 async fn send_no_ack_command(

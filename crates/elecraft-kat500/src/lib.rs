@@ -715,6 +715,7 @@ impl Kat500Driver {
         if !self.settings.follow_flex_frequency {
             return Ok(());
         }
+        self.refresh_tuning_state_if_needed(port, transcript).await;
         let decision = {
             let mut guard = self.state.write().await;
             let frequency_hz = match guard.radio_context.frequency_hz {
@@ -847,6 +848,61 @@ impl Kat500Driver {
             }
         }
         Ok(())
+    }
+
+    async fn refresh_tuning_state_if_needed(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) {
+        let should_refresh = {
+            let guard = self.state.read().await;
+            guard.tuner.tuning || guard.lifecycle.tune.state == TuneLifecycleState::Tuning
+        };
+        if !should_refresh {
+            return;
+        }
+        match send_command(port, CMD_TUNE_POLL, Duration::from_millis(500), transcript).await {
+            Ok(response) => {
+                let mut guard = self.state.write().await;
+                parse_kat500_response(&response, &mut guard.tuner);
+                if !guard.tuner.tuning {
+                    guard.lifecycle.tune.transition(
+                        TuneLifecycleState::Idle,
+                        "TP0 cleared stale KAT500 tuning state",
+                    );
+                    append_evidence_line(
+                        "kat500_tune_lifecycle.log",
+                        format!(
+                            "TP poll cleared tuning before frequency follow response={response}"
+                        ),
+                    );
+                }
+            }
+            Err(err) => {
+                let mut guard = self.state.write().await;
+                let stale = guard
+                    .lifecycle
+                    .tune
+                    .entered_at_ms
+                    .and_then(|entered| timestamp_millis().checked_sub(entered))
+                    .is_some_and(|age| age > 30_000);
+                if stale {
+                    guard.tuner.tuning = false;
+                    guard.lifecycle.tune.mark_failure(format!(
+                        "stale KAT500 tuning state expired after TP poll failed: {err}"
+                    ));
+                    guard.lifecycle.tune.transition(
+                        TuneLifecycleState::Idle,
+                        "stale KAT500 tuning state expired",
+                    );
+                    append_evidence_line(
+                        "kat500_tune_lifecycle.log",
+                        format!("expired stale tuning state after TP poll failed: {err}"),
+                    );
+                }
+            }
+        }
     }
 
     async fn apply_desired_command(
@@ -1441,26 +1497,11 @@ async fn send_frequency_context_confirmed(
     let mut stale_response_count = drain_stale_serial_input(port, transcript).await;
     let mut last_response = None;
     for attempt in 0..=1_u64 {
-        let read = send_wire_command(
-            port,
-            CMD_FREQUENCY_CONTEXT.label,
-            wire,
-            &["F "],
-            wait,
-            transcript,
-        )
-        .await?;
-        let confirmed_khz = confirmed_khz_from_frequency_response(&read.response);
-        let confirmation_match = confirmed_khz == Some(requested_khz);
-        stale_response_count = stale_response_count.saturating_add(
-            read.unsolicited
-                .iter()
-                .filter(|line| {
-                    confirmed_khz_from_frequency_response(line)
-                        .is_some_and(|khz| khz != requested_khz)
-                })
-                .count() as u64,
-        );
+        let read =
+            send_frequency_context_once_exact(port, wire, requested_khz, wait, transcript).await?;
+        stale_response_count = stale_response_count.saturating_add(read.stale_response_count);
+        let confirmed_khz = read.confirmed_khz;
+        let confirmation_match = read.confirmation_match;
         if confirmation_match {
             return Ok(FrequencyFollowRead {
                 response: read.response,
@@ -1491,6 +1532,92 @@ async fn send_frequency_context_confirmed(
         confirmation_match: false,
         stale_response_count,
         retry_count: 1,
+    })
+}
+
+async fn send_frequency_context_once_exact(
+    port: &mut SerialStream,
+    wire: &str,
+    requested_khz: u64,
+    wait: Duration,
+    transcript: &mut SerialTranscript,
+) -> Result<FrequencyFollowRead> {
+    transcript.write_line("TX", wire).await;
+    port.write_all(wire.as_bytes()).await.with_context(|| {
+        format!(
+            "failed to write serial command {}",
+            CMD_FREQUENCY_CONTEXT.label
+        )
+    })?;
+    port.flush().await.context("failed to flush serial port")?;
+
+    let mut stale_response_count = 0_u64;
+    let mut last_response = None;
+    let result = timeout(wait, async {
+        loop {
+            let response = read_serial_line(port).await?;
+            transcript.write_line("RX", &response).await;
+            let confirmed_khz = confirmed_khz_from_frequency_response(&response);
+            if confirmed_khz == Some(requested_khz) {
+                last_response = Some((response, confirmed_khz));
+                break Ok::<(), std::io::Error>(());
+            }
+            if let Some(khz) = confirmed_khz {
+                stale_response_count = stale_response_count.saturating_add(1);
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!(
+                        "ignored stale F response requested_khz={requested_khz} response={response} confirmed_khz={khz}"
+                    ),
+                );
+            } else if is_unsolicited_response(&response) || response == wire {
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!(
+                        "ignored non-frequency response while waiting for exact F echo requested_khz={requested_khz} response={response}"
+                    ),
+                );
+            } else {
+                append_evidence_line(
+                    "kat500-frequency-follow.log",
+                    format!(
+                        "ignored mismatched response while waiting for exact F echo requested_khz={requested_khz} response={response}"
+                    ),
+                );
+            }
+            last_response = Some((response, confirmed_khz));
+        }
+    })
+    .await;
+    if let Ok(Err(err)) = result {
+        return Err(err).context("failed reading KAT500 frequency confirmation");
+    }
+
+    if last_response
+        .as_ref()
+        .is_some_and(|(_, khz)| *khz == Some(requested_khz))
+    {
+        let (response, confirmed_khz) =
+            last_response.unwrap_or_else(|| (wire.to_string(), Some(requested_khz)));
+        return Ok(FrequencyFollowRead {
+            response,
+            requested_khz,
+            confirmed_khz,
+            confirmation_match: true,
+            stale_response_count,
+            retry_count: 0,
+        });
+    }
+
+    let (response, confirmed_khz) =
+        last_response.unwrap_or_else(|| ("timeout_waiting_for_exact_f_echo".to_string(), None));
+    Ok(FrequencyFollowRead {
+        response,
+        requested_khz,
+        confirmed_khz,
+        confirmation_match: false,
+        stale_response_count,
+        retry_count: 0,
     })
 }
 

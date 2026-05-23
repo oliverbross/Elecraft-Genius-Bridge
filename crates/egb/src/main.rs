@@ -124,6 +124,15 @@ enum Commands {
         #[arg(long, default_value_t = 5.0)]
         duration_minutes: f64,
     },
+    OperationalGapTest {
+        #[arg(
+            long,
+            default_value = "config.aethersdr-last-known-good-real-controls.yaml"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        duration_minutes: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -407,6 +416,14 @@ async fn main() -> Result<()> {
                 duration_minutes,
             )
             .await
+        }
+        Commands::OperationalGapTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test("operational-gap-test", cfg, config, duration_minutes).await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -841,6 +858,7 @@ async fn run_kpa_startup_preflight(
             dry_run: policy.effective_kpa_dry_run,
             allow_control: policy.effective_kpa_allow_control,
             allow_rf_risk: policy.effective_kpa_allow_rf_risk,
+            follow_flex_band: cfg.kpa500.follow_flex_band,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
@@ -1017,6 +1035,7 @@ async fn start_bridge(
                 dry_run: kpa_dry_run,
                 allow_control: kpa_allow_control,
                 allow_rf_risk: kpa_allow_rf_risk,
+                follow_flex_band: cfg.kpa500.follow_flex_band,
                 control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
                 transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
                 transcript_dir: cfg
@@ -2670,6 +2689,11 @@ impl EvidenceRun {
         )
         .await?;
         tokio::fs::write(
+            self.dir.join("operational-gap-test.md"),
+            operational_gap_test_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
             self.dir.join("latest-kpa-telemetry.json"),
             serde_json::to_string_pretty(&latest_kpa_telemetry_json(state).await)?,
         )
@@ -3757,6 +3781,10 @@ async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String 
         - KAT500 frequency confirmation match: `{}`\n\
         - KAT500 stale frequency response count: {}\n\
         - KAT500 frequency retry count: {}\n\
+        - KPA500 band-follow sent count: {}\n\
+        - KPA500 band-follow skipped count: {}\n\
+        - Last KPA500 band-follow wire: `{}`\n\
+        - Last KPA500 band-follow result: `{}`\n\
         - Tune commands executed: {}\n\
         - Meter publish count: {}\n\
         - SmartSDR PGXL data status: `{}`\n\
@@ -3802,6 +3830,18 @@ async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String 
             .unwrap_or_else(|| "unknown".to_string()),
         guard.radio_context.kat500_follow_stale_response_count,
         guard.radio_context.kat500_follow_retry_count,
+        guard.radio_context.kpa500_follow_sent_count,
+        guard.radio_context.kpa500_follow_skipped_count,
+        guard
+            .radio_context
+            .last_kpa500_follow_wire
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .radio_context
+            .last_kpa500_follow_result
+            .as_deref()
+            .unwrap_or("none"),
         guard.controls.tune_executed_count,
         guard.flex_injection.meter_publish_count,
         guard
@@ -3847,6 +3887,96 @@ async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String 
         } else {
             "WARN"
         },
+    )
+}
+
+async fn operational_gap_test_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let tgxl_first = guard
+        .clients
+        .tgxl_sessions
+        .iter()
+        .map(|session| session.connected_at_ms)
+        .min();
+    let pgxl_first = guard
+        .clients
+        .pgxl_sessions
+        .iter()
+        .map(|session| session.connected_at_ms)
+        .min();
+    let delay = match (tgxl_first, pgxl_first) {
+        (Some(tgxl), Some(pgxl)) if pgxl >= tgxl => {
+            format!("{:.3}s", (pgxl - tgxl) as f64 / 1000.0)
+        }
+        _ => "n/a".to_string(),
+    };
+    let kat_match = guard
+        .radio_context
+        .last_kat500_follow_confirmation_match
+        .unwrap_or(false);
+    let tuning_stuck = guard.tuner.tuning
+        && guard
+            .lifecycle
+            .tune
+            .entered_at_ms
+            .and_then(|entered| timestamp_millis().checked_sub(entered))
+            .is_some_and(|age| age > 30_000);
+    format!(
+        "# Operational Gap Test\n\n\
+        - PGXL connection delay: `{delay}`\n\
+        - PGXL direct session: {}\n\
+        - TGXL direct session: {}\n\
+        - AMP command received: {}\n\
+        - KAT500 F exact confirmation match: {}\n\
+        - KAT500 F requested kHz: `{:?}`\n\
+        - KAT500 F confirmed kHz: `{:?}`\n\
+        - KAT500 stale F responses: {}\n\
+        - KAT500 F retries: {}\n\
+        - KAT500 tuning stuck: {}\n\
+        - KPA500 band-follow enabled by config/effective runtime: {}\n\
+        - KPA500 band-follow sent count: {}\n\
+        - KPA500 band-follow skipped count: {}\n\
+        - Last KPA500 band-follow result: `{}`\n\
+        - SmartSDR PGXL meter status: `{}`\n\
+        - SmartSDR TGXL/tuner status: `unsupported without verified Flex tuner/accessory registration API`\n\
+        - Amplifier removed count: {}\n\
+        - Interlock mode: `{}`\n\
+        - Last interlock tx_allowed: `{}`\n",
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        guard.controls.last_flex_amp_set_command.is_some()
+            || guard.controls.last_pgxl_control_command.is_some(),
+        kat_match,
+        guard.radio_context.last_kat500_follow_requested_khz,
+        guard.radio_context.last_kat500_follow_confirmed_khz,
+        guard.radio_context.kat500_follow_stale_response_count,
+        guard.radio_context.kat500_follow_retry_count,
+        tuning_stuck,
+        guard.radio_context.kpa500_follow_sent_count > 0
+            || guard.radio_context.kpa500_follow_skipped_count > 0,
+        guard.radio_context.kpa500_follow_sent_count,
+        guard.radio_context.kpa500_follow_skipped_count,
+        guard
+            .radio_context
+            .last_kpa500_follow_result
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .meter_publish_last_result
+            .as_deref()
+            .unwrap_or("not implemented"),
+        guard.flex_injection.amplifier_removed_count,
+        if guard.flex_injection.interlock_disabled_for_test {
+            "INTERLOCK_DISABLED_FOR_TEST"
+        } else {
+            "normal"
+        },
+        guard
+            .flex_injection
+            .last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
     )
 }
 
@@ -5139,6 +5269,11 @@ async fn status_json(state: &SharedState) -> String {
             "kat500_follow_skipped_count": guard.radio_context.kat500_follow_skipped_count,
             "kat500_follow_stale_response_count": guard.radio_context.kat500_follow_stale_response_count,
             "kat500_follow_retry_count": guard.radio_context.kat500_follow_retry_count,
+            "last_kpa500_follow_band": guard.radio_context.last_kpa500_follow_band.map(|band| band.as_str()),
+            "last_kpa500_follow_wire": guard.radio_context.last_kpa500_follow_wire,
+            "last_kpa500_follow_result": guard.radio_context.last_kpa500_follow_result,
+            "kpa500_follow_sent_count": guard.radio_context.kpa500_follow_sent_count,
+            "kpa500_follow_skipped_count": guard.radio_context.kpa500_follow_skipped_count,
             "context_age_ms": stale_duration_ms(guard.radio_context.updated_at),
             "last_tune_age_ms": stale_duration_ms(guard.radio_context.last_tune_at),
         },
@@ -5868,6 +6003,7 @@ async fn test_kpa(cfg: &BridgeConfig, allow_control: bool, allow_rf_risk: bool) 
             dry_run: cfg.kpa500.dry_run,
             allow_control: cfg.kpa500.allow_control || allow_control,
             allow_rf_risk: cfg.kpa500.allow_rf_risk || allow_rf_risk,
+            follow_flex_band: cfg.kpa500.follow_flex_band,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
@@ -5964,6 +6100,7 @@ async fn test_kpa_operate(cfg: &BridgeConfig, allow_rf_risk: bool) -> Result<()>
             dry_run: cfg.kpa500.dry_run,
             allow_control: true,
             allow_rf_risk: cfg.kpa500.allow_rf_risk || allow_rf_risk,
+            follow_flex_band: cfg.kpa500.follow_flex_band,
             control_verify_delay: Duration::from_millis(cfg.control.verify_delay_ms),
             transcript_rotate_bytes: cfg.logging.transcript_rotate_bytes,
             transcript_dir: cfg
@@ -6358,6 +6495,7 @@ mod tests {
         assert!(names.contains(&"ecosystem-soak-test".to_string()));
         assert!(names.contains(&"full-operational-test".to_string()));
         assert!(names.contains(&"full-aethersdr-functional-test".to_string()));
+        assert!(names.contains(&"operational-gap-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));

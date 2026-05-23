@@ -30,6 +30,17 @@ The last working AetherSDR path depended on repeated radio-side amplifier presen
 
 This keeps the known-good AetherSDR profile intact and does not recreate the amplifier object, churn handles, or send the rejected `amplifier set operate=1` connect-assist command.
 
+## Connection Attempt Detection
+
+EGB logs:
+
+- `PGXL listener started ...` in `listener-startup.log`
+- `PGXL accept peer=...` in `listener-startup.log`
+- PGXL session start and disconnect events in the protocol logs
+- every `sub amplifier all` and amplifier reannounce in `flex-tx.log`
+
+Rust's normal `TcpListener` API sees accepted sockets, not raw TCP SYN packets. If `PGXL accept` is absent, EGB did not receive an accepted TCP connection; use Windows `netstat -ano`, Packet Monitor, or Wireshark on port `9008` to prove whether AetherSDR attempted a SYN before the delayed accept.
+
 ## Success Target
 
 PGXL direct TCP should start within 5 seconds of TGXL/direct listener readiness and without repeated manual AetherSDR connect clicks.

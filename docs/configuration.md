@@ -51,6 +51,7 @@ kpa500:
   dry_run: true
   allow_control: false
   allow_rf_risk: false
+  follow_flex_band: false
 
 kat500:
   enabled: true
@@ -69,6 +70,8 @@ Set `mock: false` only when real hardware is connected and command mappings have
 Set `dry_run: true` for first hardware tests. Dry-run opens the configured COM port and permits read-only status queries, but blocks control-changing commands such as operate, tune, antenna change, bypass, relay move, and clear fault.
 
 Set `kpa500.allow_rf_risk: true` only for local controlled KPA500 operate testing after dummy-load / no-RF checks. It is required before EGB will translate a Flex/PGXL operate request to `^OS1;`. Standby still uses `^OS0;` and remains state-change-safe, but it is blocked when `dry_run: true`.
+
+Set `kpa500.follow_flex_band: true` only for experimental local testing. It sends KPA500 `^BNnn;` on Flex band changes when dry-run is off and KPA control is allowed. This changes amplifier band context, so it stays disabled by default.
 
 Set `kat500.follow_flex_frequency: true` only in real operational profiles where KAT tune control is intentionally enabled. When enabled, EGB sends `F <kHz>;` whenever the Flex TX frequency changes and the KAT is not already tuning, then avoids resending the same frequency before `T;`.
 
