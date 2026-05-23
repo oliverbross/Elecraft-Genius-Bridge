@@ -188,6 +188,9 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         guard.flex_injection.client_handle_received = false;
         guard.flex_injection.amplifier_create_sent = false;
         guard.flex_injection.amplifier_create_accepted = false;
+        guard.flex_injection.post_amplifier_registration_sent = false;
+        guard.flex_injection.registration_continued_without_handle = false;
+        guard.flex_injection.keepalive_enable_accepted = false;
         guard.flex_injection.sub_amplifier_all_accepted = false;
         guard.lifecycle.flex_session.transition(
             LifecycleState::Connecting,
@@ -203,6 +206,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
     let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
     let mut pgxl_connect_assist_retry_timer = Box::pin(sleep(Duration::from_secs(30)));
+    let mut post_registration_fallback_timer = Box::pin(sleep(Duration::from_secs(86_400)));
 
     loop {
         tokio::select! {
@@ -297,9 +301,23 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 if settings.flex_force_operate_via_radio {
                     append_flex_operate_lab_line(format!("RX_RESPONSE R{seq}|{code}|{body}"));
                 }
-                session
+                let observed_response = session
                     .observe_response(settings, &state, seq, &code, &body)
                     .await;
+                if matches!(
+                    observed_response,
+                    Some((PendingKind::AmplifierCreate, true))
+                ) && !post_amplifier_registration_sent
+                    && session.amplifier_handle.is_none()
+                {
+                    post_registration_fallback_timer.as_mut().reset(
+                        tokio::time::Instant::now() + Duration::from_millis(2_000),
+                    );
+                    append_evidence_line(
+                        "flex-registration-health.md",
+                        "Amplifier create accepted; waiting briefly for amplifier status/handle before post-registration fallback.",
+                    );
+                }
                 if amplifier_create_sent
                     && !post_amplifier_registration_sent
                     && session.amplifier_handle.is_some()
@@ -400,6 +418,40 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 log_amp_snapshot(&state).await;
             }
             ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
+        }
+        () = &mut post_registration_fallback_timer => {
+            if amplifier_create_sent
+                && !post_amplifier_registration_sent
+                && session.amplifier_handle.is_none()
+            {
+                warn!(
+                    event_id = "flex_registration_serial_fallback",
+                    "amplifier create accepted but no amplifier status handle received; continuing registration using serial/name fallback"
+                );
+                append_evidence_line(
+                    "flex-registration-health.md",
+                    "amplifier create accepted but no amplifier status handle received; continuing registration using serial/name fallback",
+                );
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.registration_continued_without_handle = true;
+                    guard.flex_injection.degraded_reason = None;
+                    guard
+                        .lifecycle
+                        .flex_session
+                        .transition(LifecycleState::Subscribed, "post-amplifier registration fallback after create accepted");
+                }
+                send_post_amplifier_registration_commands(
+                    settings,
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                )
+                .await?;
+                post_amplifier_registration_sent = true;
+            }
+            post_registration_fallback_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
         }
         () = &mut amplifier_reannounce_timer => {
             if post_amplifier_registration_sent {
@@ -719,10 +771,16 @@ async fn send_post_amplifier_registration_commands(
     }
     {
         let mut guard = state.write().await;
-        guard.lifecycle.flex_session.transition(
-            LifecycleState::Subscribed,
-            "post-amplifier registration commands sent after amplifier handle observed",
-        );
+        guard.flex_injection.post_amplifier_registration_sent = true;
+        let reason = if session.amplifier_handle.is_some() {
+            "post-amplifier registration commands sent after amplifier handle observed"
+        } else {
+            "post-amplifier registration commands sent after create-accepted fallback"
+        };
+        guard
+            .lifecycle
+            .flex_session
+            .transition(LifecycleState::Subscribed, reason);
     }
     Ok(())
 }
@@ -860,7 +918,7 @@ impl FlexSession {
         seq: u32,
         code: &str,
         body: &str,
-    ) {
+    ) -> Option<(PendingKind, bool)> {
         let pending = self.pending.remove(&seq);
         let label = pending
             .as_ref()
@@ -888,9 +946,8 @@ impl FlexSession {
             }
         }
 
-        let Some(pending) = pending else {
-            return;
-        };
+        let pending = pending?;
+        let observed = Some((pending.kind.clone(), code == "0"));
         if code != "0" {
             if matches!(pending.kind, PendingKind::PgxlConnectAssist) {
                 let mut guard = state.write().await;
@@ -904,7 +961,7 @@ impl FlexSession {
                 guard.flex_injection.degraded_reason =
                     Some(format!("Flex ping rejected: {code} {body}"));
             }
-            return;
+            return observed;
         }
         match pending.kind {
             PendingKind::AmplifierCreate => {
@@ -955,9 +1012,11 @@ impl FlexSession {
                         .transition(LifecycleState::Subscribed, "sub amplifier all accepted");
                 }
             }
-            PendingKind::KeepaliveEnable
-            | PendingKind::AmplifierReannounce
-            | PendingKind::TunerPresenceRefresh => {}
+            PendingKind::KeepaliveEnable => {
+                let mut guard = state.write().await;
+                guard.flex_injection.keepalive_enable_accepted = true;
+            }
+            PendingKind::AmplifierReannounce | PendingKind::TunerPresenceRefresh => {}
             PendingKind::Ping => {
                 let mut guard = state.write().await;
                 if code == "0" {
@@ -975,6 +1034,7 @@ impl FlexSession {
                 }
             }
         }
+        observed
     }
 
     fn observe_amplifier_status(

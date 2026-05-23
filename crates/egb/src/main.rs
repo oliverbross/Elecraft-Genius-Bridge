@@ -732,7 +732,7 @@ fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) 
             )
         {
             anyhow::bail!(
-                "UNSAFE_LAB_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} is a lab-only profile for operational/evidence runs. Use aethersdr_minimal for AetherSDR compatibility or official_pgxl, pgxl_paired, minimal, strict_real_pgxl for strict registration tests.",
+                "UNSAFE_LAB_AMPLIFIER_CREATE_PROFILE: flex_injection.amplifier_status_profile={} is a lab-only profile for operational/evidence runs. Use aethersdr_force_direct for the locked AetherSDR regression baseline, aethersdr_minimal for minimal AetherSDR compatibility, or official_pgxl/pgxl_paired/minimal/strict_real_pgxl for strict registration tests.",
                 cfg.flex_injection.amplifier_status_profile
             );
         }
@@ -758,7 +758,7 @@ fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) 
 fn amplifier_create_profile_emits_nonstandard_fields(profile: &str) -> bool {
     matches!(
         profile,
-        "pgxl_verbose" | "old_good_pgxl" | "aethersdr_force_direct" | "aethersdr_pgxl_direct_lab"
+        "pgxl_verbose" | "old_good_pgxl" | "aethersdr_pgxl_direct_lab"
     )
 }
 
@@ -2543,6 +2543,7 @@ impl EvidenceRun {
             "startup-advertisement-policy.md",
             "serial-port-open-errors.log",
             "connection-regression-test.md",
+            "pgxl-delayed-connect-analysis.md",
         ] {
             let path = dir.join(file);
             if !path.exists() {
@@ -2630,6 +2631,7 @@ impl EvidenceRun {
         tokio::fs::write(self.dir.join("profile-summary.md"), profile_summary).await?;
         let comparison = last_known_good_comparison_markdown(state).await;
         tokio::fs::write(self.dir.join("last-known-good-comparison.md"), comparison).await?;
+        self.write_pgxl_delayed_connect_analysis(state).await?;
         let pgxl_mapping = pgxl_status_mapping_markdown(state).await;
         tokio::fs::write(self.dir.join("pgxl-status-mapping.md"), pgxl_mapping).await?;
         let flex_mapping = flex_state_mapping_markdown(state).await;
@@ -2726,6 +2728,88 @@ impl EvidenceRun {
         println!("evidence bundle: {}", self.zip_path.display());
         Ok(self.zip_path.clone())
     }
+
+    async fn write_pgxl_delayed_connect_analysis(&self, state: &SharedState) -> Result<()> {
+        let guard = state.read().await;
+        let tgxl_first = guard
+            .clients
+            .tgxl_sessions
+            .iter()
+            .map(|session| session.connected_at_ms)
+            .min();
+        let pgxl_first = guard
+            .clients
+            .pgxl_sessions
+            .iter()
+            .map(|session| session.connected_at_ms)
+            .min();
+        let delta = match (tgxl_first, pgxl_first) {
+            (Some(tgxl), Some(pgxl)) if pgxl >= tgxl => Some(pgxl - tgxl),
+            _ => None,
+        };
+        let body = format!(
+            "# PGXL Delayed Connect Analysis\n\n\
+            - TGXL first connect timestamp: `{}`\n\
+            - PGXL first connect timestamp: `{}`\n\
+            - PGXL minus TGXL delta seconds: `{}`\n\
+            - PGXL listener ready: `{}`\n\
+            - TGXL listener ready: `{}`\n\
+            - Amplifier create TX: `{}`\n\
+            - First meter create TX: `{}`\n\
+            - Interlock create TX: `{}`\n\
+            - Keepalive enable TX: `{}`\n\
+            - `sub amplifier all` TX: `{}`\n\
+            - Amplifier create accepted: {}\n\
+            - Amplifier handle observed: `{}`\n\
+            - Registration continued without handle: {}\n\
+            - Sub amplifier all accepted: {}\n\
+            - PGXL TCP attempted after amplifier status: {}\n\n\
+            Interpretation: if PGXL connects only after post-registration commands appear, the delay correlates with incomplete Flex registration rather than the direct PGXL listener. If no follow-up commands appear after `amplifier create`, the bridge is still blocked before registration completion.\n",
+            tgxl_first
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            pgxl_first
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            delta
+                .map(|value| format!("{:.3}", value as f64 / 1000.0))
+                .unwrap_or_else(|| "n/a".to_string()),
+            first_line_containing(&self.dir.join("listener-startup.log"), "PGXL listener started")
+                .unwrap_or_else(|| "none".to_string()),
+            first_line_containing(&self.dir.join("listener-startup.log"), "TGXL listener started")
+                .unwrap_or_else(|| "none".to_string()),
+            first_line_containing(&self.dir.join("flex-tx.log"), "amplifier create")
+                .unwrap_or_else(|| "none".to_string()),
+            first_line_containing(&self.dir.join("flex-tx.log"), "meter create")
+                .unwrap_or_else(|| "none".to_string()),
+            first_line_containing(&self.dir.join("flex-tx.log"), "interlock create")
+                .unwrap_or_else(|| "none".to_string()),
+            first_line_containing(&self.dir.join("flex-tx.log"), "keepalive enable")
+                .unwrap_or_else(|| "none".to_string()),
+            first_line_containing(&self.dir.join("flex-tx.log"), "sub amplifier all")
+                .unwrap_or_else(|| "none".to_string()),
+            guard.flex_injection.amplifier_create_accepted,
+            guard
+                .flex_injection
+                .amplifier_handle
+                .as_deref()
+                .unwrap_or("none"),
+            guard.flex_injection.registration_continued_without_handle,
+            guard.flex_injection.sub_amplifier_all_accepted,
+            guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status,
+        );
+        drop(guard);
+        tokio::fs::write(self.dir.join("pgxl-delayed-connect-analysis.md"), body).await?;
+        Ok(())
+    }
+}
+
+fn first_line_containing(path: &Path, needle: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find(|line| line.contains(needle))
+        .map(str::to_string)
 }
 
 async fn run_test_with_evidence<F>(
@@ -3623,6 +3707,7 @@ async fn operational_readiness_markdown(cfg: &BridgeConfig, state: &SharedState)
         - Effective KAT allow_rf_risk: {}\n\
         - PGXL connected: {}\n\
         - TGXL connected: {}\n\
+        - Control path ready: {}\n\
         - Final KPA state: `{}`\n\
         - Final KAT antenna: {:?}, SWR {:.2}\n\
         - Last control safety decision: `{}`\n",
@@ -3641,6 +3726,7 @@ async fn operational_readiness_markdown(cfg: &BridgeConfig, state: &SharedState)
         effective_kat_allow_rf_risk(cfg),
         guard.clients.pgxl_session_started_count > 0,
         guard.clients.tgxl_session_started_count > 0,
+        control_path_ready(&guard),
         guard.amp.state.pgxl_state(),
         guard.tuner.selected_antenna,
         guard.tuner.swr,
@@ -3662,6 +3748,7 @@ async fn operational_readiness_from_state_markdown(state: &SharedState) -> Strin
         - KPA polls: success={} failure={}\n\
         - KAT polls: success={} failure={}\n\
         - Controls seen: {}\n\
+        - Control path ready: {}\n\
         - Last safety decision: `{}`\n",
         guard.clients.pgxl_session_started_count > 0,
         guard.clients.tgxl_session_started_count > 0,
@@ -3671,12 +3758,25 @@ async fn operational_readiness_from_state_markdown(state: &SharedState) -> Strin
         guard.tuner.runtime.poll_success_count,
         guard.tuner.runtime.poll_failure_count,
         guard.controls.control_requested_count,
+        control_path_ready(&guard),
         guard
             .controls
             .last_safety_decision
             .as_deref()
             .unwrap_or("none"),
     )
+}
+
+fn control_path_ready(guard: &bridge_core::state::BridgeState) -> bool {
+    let direct_clients_ready = guard.clients.pgxl_session_started_count > 0
+        && guard.clients.tgxl_session_started_count > 0;
+    let hardware_ready = guard.amp.is_connected() && guard.tuner.is_connected();
+    let effective_controls_ready = guard.effective_controls.effective_kat_tune_enabled
+        || guard.effective_controls.effective_kpa_standby_enabled
+        || guard.effective_controls.effective_kpa_operate_enabled;
+    let flex_ready = guard.flex_injection.amplifier_create_accepted
+        && guard.flex_injection.sub_amplifier_all_accepted;
+    direct_clients_ready && hardware_ready && effective_controls_ready && flex_ready
 }
 
 async fn effective_control_policy_markdown(state: &SharedState) -> String {
@@ -3737,8 +3837,11 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         - Amplifier create sent: {}\n\
         - Amplifier create accepted: {}\n\
         - Amplifier handle: `{}`\n\
+        - Post-amplifier registration sent: {}\n\
+        - Continued without amplifier handle: {}\n\
         - Meter handles: {:?}\n\
         - Interlock handle: `{}`\n\
+        - Keepalive enable accepted: {}\n\
         - Last interlock status: `{}`\n\
         - Empty interlock amplifier field: {}\n\
         - Empty interlock amplifier count: {}\n\
@@ -3757,8 +3860,11 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         flex.amplifier_create_sent,
         flex.amplifier_create_accepted,
         flex.amplifier_handle.as_deref().unwrap_or("none"),
+        flex.post_amplifier_registration_sent,
+        flex.registration_continued_without_handle,
         flex.meter_handles,
         flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.keepalive_enable_accepted,
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
         flex.interlock_amplifier_field_empty,
         flex.interlock_empty_amplifier_count,
@@ -3831,7 +3937,7 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
     format!(
         "# Interlock Registration Audit\n\n\
         ## Current Command\n\n\
-        EGB creates the AMP interlock after the Flex radio has accepted and broadcast the amplifier object handle.\n\n\
+        EGB creates the AMP interlock after the Flex radio accepts `amplifier create`. If a radio-side amplifier handle/status is not observed within the fallback window, EGB continues with meter/interlock/keepalive/subscription registration using the documented serial/name association.\n\n\
         ```text\n\
         interlock create type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial=EGB-KPA500\n\
         ```\n\n\
@@ -3840,6 +3946,7 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
         ## Latest Runtime Evidence\n\n\
         - Amplifier handle: `{}`\n\
         - Interlock handle: `{}`\n\
+        - Registration continued without handle: {}\n\
         - Last interlock status: `{}`\n\
         - Empty `amplifier=` observed: {}\n\
         - Empty `amplifier=` count: {}\n\
@@ -3849,6 +3956,7 @@ async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
         If `reason=AMP:PG-XL` still arrives with `amplifier=` empty after this two-stage registration change, the remaining suspect is not command ordering but a hidden radio-side association requirement such as serial format or antenna/source topology.\n",
         flex.amplifier_handle.as_deref().unwrap_or("none"),
         flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.registration_continued_without_handle,
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
         flex.interlock_amplifier_field_empty,
         flex.interlock_empty_amplifier_count,
@@ -3868,18 +3976,24 @@ async fn flex_registration_health_markdown(state: &SharedState) -> String {
         - Amplifier handle: `{}`\n\
         - Meter handles: {:?}\n\
         - Interlock handle: `{}`\n\
+        - Post-amplifier registration sent: {}\n\
+        - Continued without amplifier handle: {}\n\
+        - Keepalive enable accepted: {}\n\
         - Interlock amplifier field empty: {}\n\
         - Amplifier removed count: {}\n\
         - Duplicate amplifier create count: {}\n\
         - Sub amplifier all accepted: {}\n\
         - Connection state: `{}`\n\
         - Degraded reason: `{}`\n\n\
-        Registration is healthy only if the amplifier handle is stable, meter/interlock handles are present when enabled, `amplifier_removed_count` remains zero, and the interlock status does not report `reason=AMP:PG-XL amplifier=` with an empty amplifier field.\n",
+        Registration is healthy if the amplifier handle is stable, or if Flex accepted `amplifier create` and post-registration completed through the serial/name fallback. Meter/interlock handles should be present when enabled, `amplifier_removed_count` must remain zero, and the interlock status must not report `reason=AMP:PG-XL amplifier=` with an empty amplifier field.\n",
         flex.amplifier_create_sent,
         flex.amplifier_create_accepted,
         flex.amplifier_handle.as_deref().unwrap_or("none"),
         flex.meter_handles,
         flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.post_amplifier_registration_sent,
+        flex.registration_continued_without_handle,
+        flex.keepalive_enable_accepted,
         flex.interlock_amplifier_field_empty,
         flex.amplifier_removed_count,
         flex.duplicate_amplifier_create_count,
@@ -3912,8 +4026,16 @@ async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &Shar
         if guard.flex_injection.connection_state != ConnectionState::Connected {
             failures.push("Flex injection is not connected".to_string());
         }
-        if guard.flex_injection.amplifier_handle.is_none() {
+        if guard.flex_injection.amplifier_handle.is_none()
+            && !guard.flex_injection.sub_amplifier_all_accepted
+        {
             failures.push("Flex amplifier handle was not created".to_string());
+        } else if guard.flex_injection.amplifier_handle.is_none()
+            && guard.flex_injection.sub_amplifier_all_accepted
+        {
+            warnings.push(
+                "Flex did not broadcast an amplifier handle, but registration completed via create-accepted fallback".to_string(),
+            );
         }
         if guard.flex_injection.amplifier_removed_count > 0 {
             failures.push("Flex removed the amplifier object".to_string());
@@ -4843,6 +4965,10 @@ async fn status_json(state: &SharedState) -> String {
             "amplifier_reannounce_count": guard.flex_injection.amplifier_reannounce_count,
             "amplifier_handle_change_count": guard.flex_injection.amplifier_handle_change_count,
             "amplifier_removed_count": guard.flex_injection.amplifier_removed_count,
+            "post_amplifier_registration_sent": guard.flex_injection.post_amplifier_registration_sent,
+            "registration_continued_without_handle": guard.flex_injection.registration_continued_without_handle,
+            "keepalive_enable_accepted": guard.flex_injection.keepalive_enable_accepted,
+            "sub_amplifier_all_accepted": guard.flex_injection.sub_amplifier_all_accepted,
             "amp_widget_visibility_risk": amp_widget_visibility_risk(&guard),
             "amplifier_direct_connect_expected": guard.flex_injection.amplifier_direct_connect_expected,
             "last_amplifier_removed_reason": guard.flex_injection.last_amplifier_removed_reason,
@@ -4865,6 +4991,9 @@ fn amp_widget_visibility_risk(guard: &bridge_core::state::BridgeState) -> Option
         ));
     }
     if guard.flex_injection.amplifier_handle.is_none() {
+        if guard.flex_injection.sub_amplifier_all_accepted {
+            return None;
+        }
         return Some("No Flex amplifier handle observed".to_string());
     }
     if guard.flex_injection.amplifier_handle_change_count > 1 {
@@ -4896,10 +5025,15 @@ fn pgxl_lifecycle_json(guard: &bridge_core::state::BridgeState) -> serde_json::V
     let (state, reason) = if !guard.flex_injection.enabled {
         ("NOT_STARTED", "Flex amplifier injection is disabled")
     } else if guard.flex_injection.amplifier_handle.is_none() {
-        if guard.flex_injection.amplifier_create_accepted {
+        if guard.flex_injection.sub_amplifier_all_accepted {
+            (
+                "PGXL_TCP_PENDING",
+                "Flex accepted amplifier create and subscriptions; waiting for AetherSDR PGXL TCP connection",
+            )
+        } else if guard.flex_injection.amplifier_create_accepted {
             (
                 "FLEX_ACCEPTED",
-                "Flex accepted amplifier create; waiting for amplifier handle/status",
+                "Flex accepted amplifier create; waiting for amplifier handle/status or fallback registration",
             )
         } else if guard.flex_injection.amplifier_create_sent {
             (
@@ -6138,12 +6272,7 @@ mod tests {
         cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
         cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
 
-        for profile in [
-            "pgxl_verbose",
-            "old_good_pgxl",
-            "aethersdr_force_direct",
-            "aethersdr_pgxl_direct_lab",
-        ] {
+        for profile in ["pgxl_verbose", "old_good_pgxl", "aethersdr_pgxl_direct_lab"] {
             cfg.flex_injection.amplifier_status_profile = profile.to_string();
             let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
                 .unwrap_err()
@@ -6156,6 +6285,7 @@ mod tests {
             "official_pgxl",
             "aethersdr_minimal",
             "aethersdr_operational",
+            "aethersdr_force_direct",
             "pgxl_paired",
             "minimal",
             "strict_real_pgxl",

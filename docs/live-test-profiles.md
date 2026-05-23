@@ -10,6 +10,12 @@ Config:
 .\config.aethersdr-known-good.yaml
 ```
 
+Locked regression equivalent:
+
+```powershell
+.\config.aethersdr-last-known-good-operational.yaml
+```
+
 Purpose:
 - Validate KPA500/KAT500 polling.
 - Validate Flex amplifier registration.
@@ -35,6 +41,12 @@ Config:
 .\config.aethersdr-compatible-operational.yaml
 ```
 
+Locked last-known-good real-control equivalent:
+
+```powershell
+.\config.aethersdr-last-known-good-real-controls.yaml
+```
+
 Purpose:
 - Execute AetherSDR Tune against KAT500.
 - Execute KPA500 Standby when requested.
@@ -56,7 +68,7 @@ Flex amplifier create line:
 amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=<live-kpa-state>
 ```
 
-The single extra field is explicitly isolated in `amplifier_status_profile: aethersdr_minimal`. Phase 49 safeguards still apply: KPA/KAT preflight must pass, the advertised IP must be reachable from the radio/client path, and `pgxl_connect_assist` remains off.
+The current compatibility profile uses `amplifier_status_profile: aethersdr_minimal`. The locked last-known-good profile uses `aethersdr_force_direct` because that is the most recent evidence-backed path where PGXL and TGXL both connected. Phase 49 safeguards still apply: KPA/KAT preflight must pass, the advertised IP must be reachable from the radio/client path, and `pgxl_connect_assist` remains off.
 
 ## Strict Official PGXL Audit
 
@@ -94,11 +106,11 @@ Required future conditions:
 Monitor-only validation:
 
 ```powershell
-.\target\release\egb.exe evidence-test --config .\config.aethersdr-known-good.yaml --duration-minutes 5
+.\target\release\egb.exe connection-regression-test --config .\config.aethersdr-last-known-good-operational.yaml --duration-minutes 5
 ```
 
 Real Tune/Standby validation:
 
 ```powershell
-.\target\release\egb.exe evidence-test --config .\config.aethersdr-compatible-operational.yaml --duration-minutes 5
+.\target\release\egb.exe evidence-test --config .\config.aethersdr-last-known-good-real-controls.yaml --duration-minutes 5
 ```

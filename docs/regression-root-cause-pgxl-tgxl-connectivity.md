@@ -98,6 +98,14 @@ It restores the last-good connection path exactly for regression testing:
 
 This config is intentionally not a new protocol design. It is a rollback baseline so we can prove when PGXL/TGXL direct TCP comes back before resuming interlock/control work.
 
+After the connection-regression test passes, the matching real-control profile is:
+
+```text
+config.aethersdr-last-known-good-real-controls.yaml
+```
+
+It keeps the same AetherSDR direct-connect profile and refresh cadence, but enables only KAT500 Tune and KPA500 Standby through the normal operational confirmation gate. KPA500 Operate remains disabled.
+
 ## Test Command
 
 ```powershell

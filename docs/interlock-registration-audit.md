@@ -43,6 +43,16 @@ EGB now uses a two-stage Flex registration sequence:
 
 The interlock create line itself is unchanged because the public PGXL API does not document an amplifier handle parameter.
 
+## Phase 56 Fallback
+
+Live evidence showed that some Flex sessions accept `amplifier create` but do not promptly broadcast an amplifier status/handle. EGB now waits briefly for that status and then continues registration using the documented serial/name association:
+
+```text
+amplifier create accepted but no amplifier status handle received; continuing registration using serial/name fallback
+```
+
+The fallback does not change the interlock command syntax. It only prevents meters, interlock, keepalive, and subscriptions from being blocked forever.
+
 ## Readiness Rule
 
 If Flex emits an interlock status with `reason=AMP:PG-XL` and an empty `amplifier=` field, EGB records:

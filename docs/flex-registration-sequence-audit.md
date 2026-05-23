@@ -21,23 +21,24 @@ The operational Flex amplifier registration sequence is:
    For AetherSDR operational testing, `aethersdr_minimal` adds only the suspected trigger field:
    - `state=<live-kpa-state>`
    This field is explicitly an AetherSDR compatibility profile, not the strict official create path.
-7. Wait for the Flex radio to accept and/or broadcast the amplifier object handle.
-8. Create meters once per Flex session, after the amplifier handle has been observed:
+7. Wait briefly for the Flex radio to accept and/or broadcast the amplifier object handle.
+8. If no handle/status arrives after `amplifier create` is accepted, continue registration using the documented serial/name fallback.
+9. Create meters once per Flex session, after the amplifier handle is observed or after the create-accepted fallback:
    - `meter create name=FWD type=AMP ...`
    - `meter create name=RL type=AMP ...`
    - `meter create name=DRV type=AMP ...`
    - `meter create name=ID type=AMP ...`
    - `meter create name=TEMP type=AMP ...`
-9. Create interlock once per Flex session, after the amplifier handle has been observed:
+10. Create interlock once per Flex session, after the amplifier handle is observed or after the create-accepted fallback:
    - `interlock create type=AMP valid_antennas=<configured-antennas> name=PG-XL serial=<serial>`
-10. Enable keepalive and subscriptions:
+11. Enable keepalive and subscriptions:
    - `keepalive enable`
    - `sub amplifier all`
    - `sub slice all`
    - `sub tx all`
-11. Ping periodically.
-12. Do not recreate amplifier/meter/interlock objects unless the Flex TCP session actually reconnects.
-13. Do not send `amplifier set <handle> operate=1` unless it is a real user operate request and RF-risk control is explicitly enabled.
+12. Ping periodically.
+13. Do not recreate amplifier/meter/interlock objects unless the Flex TCP session actually reconnects.
+14. Do not send `amplifier set <handle> operate=1` unless it is a real user operate request and RF-risk control is explicitly enabled.
 
 ## Latest Failed Live Run Comparison
 
@@ -59,7 +60,7 @@ The latest failed evidence showed these violations:
 - Operational/evidence runs reject loopback PGXL advertised IP when the Flex radio path is LAN.
 - Operational/evidence runs reject `pgxl_connect_assist=true`.
 - Operational/evidence runs reject old lab amplifier profiles that add broad or unsafe non-standard fields to `amplifier create`. `aethersdr_minimal` is allowed because it is the explicit AetherSDR compatibility profile and keeps connect-assist disabled.
-- Meter, interlock, keepalive, and subscription commands are now sent only after the amplifier handle is observed. This avoids creating an AMP interlock before the radio has associated the virtual PGXL amplifier object.
+- Meter, interlock, keepalive, and subscription commands are now sent after the amplifier handle is observed, or after a short create-accepted fallback when the radio accepts the object but does not broadcast a handle/status. This avoids blocking registration forever while preserving the documented command sequence.
 - If Flex sends `amplifier <handle> removed`, EGB marks the lifecycle failed and stops re-registering until restart instead of entering a create/remove loop.
 - Operational configs now advertise `192.168.0.189` and keep connect-assist disabled.
 
