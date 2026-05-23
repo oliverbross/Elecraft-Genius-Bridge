@@ -49,9 +49,17 @@ pub async fn run_with_options(
         .await
         .with_context(|| format!("failed to bind PGXL emulator on {bind_addr}"))?;
     info!(%bind_addr, "PGXL emulator listening");
+    append_evidence_line(
+        "listener-startup.log",
+        format!("PGXL listener started bind_addr={bind_addr}"),
+    );
 
     loop {
         let (socket, peer) = listener.accept().await?;
+        append_evidence_line(
+            "listener-startup.log",
+            format!("PGXL accept peer={peer} bind_addr={bind_addr}"),
+        );
         let state = state.clone();
         let options = options.clone();
         tokio::spawn(async move {

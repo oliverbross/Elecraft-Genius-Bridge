@@ -64,6 +64,15 @@ enum Commands {
         #[arg(long)]
         duration_minutes: f64,
     },
+    ConnectionRegressionTest {
+        #[arg(
+            long,
+            default_value = "config.aethersdr-last-known-good-operational.yaml"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        duration_minutes: f64,
+    },
     ControlLab {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -307,6 +316,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("evidence-test", cfg, config, duration_minutes).await
+        }
+        Commands::ConnectionRegressionTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_connection_regression_test(cfg, config, duration_minutes).await
         }
         Commands::ControlLab {
             config,
@@ -1574,6 +1591,68 @@ async fn run_evidence_test(
     Ok(())
 }
 
+async fn run_connection_regression_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start(
+        "connection-regression-test",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    print_mode_banner(&cfg, "connection-regression-test");
+    append_evidence_line(
+        "last-known-good-comparison.md",
+        "Connection regression test uses BridgeStartMode::Lab so the locked Phase 50-era `aethersdr_force_direct` profile can be tested without altering the normal operational safety gates.",
+    );
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Lab).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let duration = Duration::from_secs_f64(duration_minutes * 60.0);
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await;
+    info!(
+        event_id = "connection_regression_test_started",
+        duration_minutes, "connection regression test started"
+    );
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = interval.tick() => print_soak_summary(&state, started.elapsed()).await,
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for Ctrl+C")?;
+                info!("connection regression test interrupted by Ctrl+C");
+                break;
+            }
+        }
+    }
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let report = connection_regression_report_markdown(&state).await;
+    tokio::fs::write(evidence.dir().join("connection-regression-test.md"), report).await?;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    let guard = state.read().await;
+    println!(
+        "connection regression: flex={} amp_removed={} pgxl_sessions={} tgxl_sessions={} pgxl_commands={} tgxl_commands={}",
+        guard.flex_injection.connection_state.as_str(),
+        guard.flex_injection.amplifier_removed_count,
+        guard.clients.pgxl_session_started_count,
+        guard.clients.tgxl_session_started_count,
+        guard.protocol.pgxl.commands_received,
+        guard.protocol.tgxl.commands_received
+    );
+    drop(guard);
+    println!("connection regression bundle: {}", zip.display());
+    Ok(())
+}
+
 async fn run_ecosystem_soak_test(
     cfg: BridgeConfig,
     config_path: PathBuf,
@@ -2412,6 +2491,7 @@ impl EvidenceRun {
         for file in [
             "flex-rx.log",
             "flex-tx.log",
+            "listener-startup.log",
             "pgxl-protocol.log",
             "tgxl-protocol.log",
             "amplifier-status-lines.log",
@@ -2462,6 +2542,7 @@ impl EvidenceRun {
             "first-poll-sequence.log",
             "startup-advertisement-policy.md",
             "serial-port-open-errors.log",
+            "connection-regression-test.md",
         ] {
             let path = dir.join(file);
             if !path.exists() {
@@ -3684,6 +3765,63 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         flex.sub_amplifier_all_accepted,
         flex.last_tx_line.as_deref().unwrap_or("none"),
         flex.last_rx_line.as_deref().unwrap_or("none"),
+    )
+}
+
+async fn connection_regression_report_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# Connection Regression Test\n\n\
+        Baseline target: Phase 50 known-good AetherSDR connection path (`f36d718`, `config.aethersdr-known-good.yaml`, `aethersdr_force_direct`).\n\n\
+        | Check | Result |\n\
+        | --- | --- |\n\
+        | Flex API connected | {} |\n\
+        | Amplifier create sent | {} |\n\
+        | Amplifier create accepted | {} |\n\
+        | Amplifier removed count | {} |\n\
+        | Amplifier handle | `{}` |\n\
+        | PGXL session started | {} |\n\
+        | TGXL session started | {} |\n\
+        | PGXL direct commands seen | {} |\n\
+        | TGXL direct commands seen | {} |\n\
+        | Active amplifier profile | `{}` |\n\
+        | Last amplifier status line | `{}` |\n\
+        | Last Flex TX | `{}` |\n\
+        | Last Flex RX | `{}` |\n\n\
+        PASS requires Flex connected, amplifier create accepted, `amplifier_removed_count=0`, `PGXL session started=true`, and `TGXL session started=true`. If PGXL/TGXL remain false, inspect `flex-rx.log`, `flex-tx.log`, `listener-startup.log`, `pgxl-protocol.log`, and `tgxl-protocol.log` in this bundle.\n",
+        guard.flex_injection.connection_state == ConnectionState::Connected,
+        guard.flex_injection.amplifier_create_sent,
+        guard.flex_injection.amplifier_create_accepted,
+        guard.flex_injection.amplifier_removed_count,
+        guard
+            .flex_injection
+            .amplifier_handle
+            .as_deref()
+            .unwrap_or("none"),
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        guard.protocol.pgxl.commands_received > 0,
+        guard.protocol.tgxl.commands_received > 0,
+        guard
+            .flex_injection
+            .active_amplifier_status_profile
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_tx_line
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_rx_line
+            .as_deref()
+            .unwrap_or("none"),
     )
 }
 
