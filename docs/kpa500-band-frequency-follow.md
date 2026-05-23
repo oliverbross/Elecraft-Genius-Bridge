@@ -25,6 +25,8 @@ Evidence is written to `kpa500-band-follow.log`, and `/status.radio_context` exp
 
 This remains experimental because `^BNnn;` is a band command, not a frequency command, and changing amplifier band from the bridge has RF-operational implications.
 
+Use `config.aethersdr-kpa-band-follow-test.yaml` for an explicit local test profile. It preserves the last-known-good AetherSDR connection profile, enables real tune/standby controls, and adds only `kpa500.follow_flex_band: true`.
+
 ## Limitation
 
 KPA500 cannot be directly frequency-followed by a verified serial frequency command. EGB can update PGXL/Flex-side frequency and band state from Flex, and KAT500 can be given `F <kHz>;`. KPA500 can only be band-followed experimentally with `^BNnn;`.

@@ -133,6 +133,17 @@ enum Commands {
         #[arg(long, default_value_t = 5.0)]
         duration_minutes: f64,
     },
+    PgxlTriggerStrategyTest {
+        #[arg(
+            long,
+            default_value = "config.aethersdr-last-known-good-real-controls.yaml"
+        )]
+        config: PathBuf,
+        #[arg(long, default_value = "current")]
+        strategy: String,
+        #[arg(long, default_value_t = 120.0)]
+        duration_seconds: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -424,6 +435,23 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("operational-gap-test", cfg, config, duration_minutes).await
+        }
+        Commands::PgxlTriggerStrategyTest {
+            config,
+            strategy,
+            duration_seconds,
+        } => {
+            let mut cfg = BridgeConfig::load(&config)?;
+            cfg.flex_injection.pgxl_startup_trigger_strategy = strategy;
+            cfg.validate()?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test(
+                "pgxl-trigger-strategy-test",
+                cfg,
+                config,
+                duration_seconds / 60.0,
+            )
+            .await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -1095,6 +1123,7 @@ async fn start_bridge(
                     "aethersdr" | "smartsdr" | "permissive"
                 ),
             compat_profile: cfg.pgxl.compat_profile.clone(),
+            status_profile: cfg.pgxl.status_profile.clone(),
             strict_emulation: cfg.pgxl.strict_emulation,
             startup_delay: Duration::from_millis(cfg.pgxl.startup_delay_ms),
             force_direct_connected_test: cfg.pgxl.force_direct_connected_test,
@@ -1187,6 +1216,7 @@ async fn start_bridge(
             amplifier_reannounce_interval: Duration::from_millis(
                 cfg.flex_injection.amplifier_reannounce_interval_ms,
             ),
+            pgxl_startup_trigger_strategy: cfg.flex_injection.pgxl_startup_trigger_strategy.clone(),
         };
         let state = state.clone();
         tokio::spawn(async move {
@@ -3481,6 +3511,7 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         amplifier_reannounce_interval: Duration::from_millis(
             cfg.flex_injection.amplifier_reannounce_interval_ms,
         ),
+        pgxl_startup_trigger_strategy: cfg.flex_injection.pgxl_startup_trigger_strategy.clone(),
     }
 }
 
@@ -6496,6 +6527,7 @@ mod tests {
         assert!(names.contains(&"full-operational-test".to_string()));
         assert!(names.contains(&"full-aethersdr-functional-test".to_string()));
         assert!(names.contains(&"operational-gap-test".to_string()));
+        assert!(names.contains(&"pgxl-trigger-strategy-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"test-startup-sequence".to_string()));

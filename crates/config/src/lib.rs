@@ -155,6 +155,7 @@ pub struct PgxlConfig {
     pub port: u16,
     pub aethersdr_compat: bool,
     pub compat_profile: String,
+    pub status_profile: String,
     pub strict_emulation: bool,
     pub startup_delay_ms: u64,
     pub force_direct_connected_test: bool,
@@ -167,6 +168,15 @@ impl PgxlConfig {
             other => Err(ConfigError::Invalid(format!(
                 "pgxl.compat_profile must be one of strict, aethersdr, smartsdr, permissive; got {other}"
             ))),
+        }?;
+        match self.status_profile.as_str() {
+            "status_current"
+            | "status_operate_capable"
+            | "status_rich_metered"
+            | "status_real_pgxl_like" => Ok(()),
+            other => Err(ConfigError::Invalid(format!(
+                "pgxl.status_profile must be one of status_current, status_operate_capable, status_rich_metered, status_real_pgxl_like; got {other}"
+            ))),
         }
     }
 }
@@ -178,6 +188,7 @@ impl Default for PgxlConfig {
             port: 9008,
             aethersdr_compat: false,
             compat_profile: "aethersdr".to_string(),
+            status_profile: "status_current".to_string(),
             strict_emulation: false,
             startup_delay_ms: 0,
             force_direct_connected_test: false,
@@ -411,6 +422,7 @@ pub struct FlexInjectionConfig {
     pub amplifier_startup_state_policy: String,
     pub wait_first_kpa_poll_timeout_ms: u64,
     pub amplifier_reannounce_interval_ms: u64,
+    pub pgxl_startup_trigger_strategy: String,
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
     pub ping_interval_ms: u64,
@@ -461,6 +473,18 @@ impl FlexInjectionConfig {
             return Err(ConfigError::Invalid(
                 "flex_injection.amplifier_reannounce_interval_ms must be > 0".to_string(),
             ));
+        }
+        match self.pgxl_startup_trigger_strategy.as_str() {
+            "current"
+            | "rapid_sub_only"
+            | "reannounce_status_only"
+            | "reannounce_create_style_status"
+            | "no_burst" => {}
+            other => {
+                return Err(ConfigError::Invalid(format!(
+                    "flex_injection.pgxl_startup_trigger_strategy must be one of current, rapid_sub_only, reannounce_status_only, reannounce_create_style_status, no_burst; got {other}"
+                )));
+            }
         }
         if self.reconnect_initial_ms == 0 {
             return Err(ConfigError::Invalid(
@@ -529,6 +553,7 @@ impl Default for FlexInjectionConfig {
             amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
             wait_first_kpa_poll_timeout_ms: 10000,
             amplifier_reannounce_interval_ms: 5000,
+            pgxl_startup_trigger_strategy: "current".to_string(),
             reconnect_initial_ms: 1000,
             reconnect_max_ms: 30000,
             ping_interval_ms: 30000,
@@ -631,6 +656,22 @@ pgxl:
     }
 
     #[test]
+    fn validates_pgxl_status_profiles() {
+        let mut cfg = BridgeConfig::default();
+        for profile in [
+            "status_current",
+            "status_operate_capable",
+            "status_rich_metered",
+            "status_real_pgxl_like",
+        ] {
+            cfg.pgxl.status_profile = profile.to_string();
+            cfg.validate().unwrap();
+        }
+        cfg.pgxl.status_profile = "invented".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
     fn validates_lan_only_flex_injection() {
         let mut cfg = BridgeConfig::default();
         cfg.flex_injection.enabled = true;
@@ -669,6 +710,26 @@ pgxl:
         cfg.validate().unwrap();
 
         cfg.flex_injection.amplifier_status_profile = "invented".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validates_pgxl_startup_trigger_strategy() {
+        let mut cfg = BridgeConfig::default();
+        cfg.flex_injection.enabled = true;
+        cfg.flex_injection.radio_ip = "192.168.1.100".to_string();
+        cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
+        for strategy in [
+            "current",
+            "rapid_sub_only",
+            "reannounce_status_only",
+            "reannounce_create_style_status",
+            "no_burst",
+        ] {
+            cfg.flex_injection.pgxl_startup_trigger_strategy = strategy.to_string();
+            cfg.validate().unwrap();
+        }
+        cfg.flex_injection.pgxl_startup_trigger_strategy = "invented".to_string();
         assert!(cfg.validate().is_err());
     }
 

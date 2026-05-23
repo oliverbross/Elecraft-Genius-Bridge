@@ -40,6 +40,7 @@ pub struct FlexInjectionSettings {
     pub tuner_presence_refresh: bool,
     pub tuner_refresh_interval: Duration,
     pub amplifier_reannounce_interval: Duration,
+    pub pgxl_startup_trigger_strategy: String,
 }
 
 impl FlexInjectionSettings {
@@ -157,6 +158,76 @@ pub async fn run(settings: FlexInjectionSettings, state: SharedState) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgxlStartupTriggerStrategy {
+    Current,
+    RapidSubOnly,
+    ReannounceStatusOnly,
+    ReannounceCreateStyleStatus,
+    NoBurst,
+}
+
+impl PgxlStartupTriggerStrategy {
+    fn from_config(value: &str) -> Self {
+        match value {
+            "rapid_sub_only" => Self::RapidSubOnly,
+            "reannounce_status_only" => Self::ReannounceStatusOnly,
+            "reannounce_create_style_status" => Self::ReannounceCreateStyleStatus,
+            "no_burst" => Self::NoBurst,
+            _ => Self::Current,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::RapidSubOnly => "rapid_sub_only",
+            Self::ReannounceStatusOnly => "reannounce_status_only",
+            Self::ReannounceCreateStyleStatus => "reannounce_create_style_status",
+            Self::NoBurst => "no_burst",
+        }
+    }
+
+    fn max_count(self) -> u8 {
+        match self {
+            Self::NoBurst => 0,
+            Self::RapidSubOnly => 20,
+            _ => 10,
+        }
+    }
+
+    fn interval(self) -> Duration {
+        match self {
+            Self::RapidSubOnly => Duration::from_millis(250),
+            _ => Duration::from_secs(1),
+        }
+    }
+
+    fn sends_sub_amplifier_all(self) -> bool {
+        matches!(self, Self::Current | Self::RapidSubOnly)
+    }
+
+    fn logs_status_reannounce(self) -> bool {
+        !matches!(self, Self::NoBurst | Self::RapidSubOnly)
+    }
+}
+
+fn arm_startup_burst(
+    timer: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
+    strategy: PgxlStartupTriggerStrategy,
+) -> bool {
+    if strategy == PgxlStartupTriggerStrategy::NoBurst {
+        timer
+            .as_mut()
+            .reset(tokio::time::Instant::now() + Duration::from_secs(86_400));
+        return false;
+    }
+    timer
+        .as_mut()
+        .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+    true
+}
+
 async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Result<()> {
     info!(
         radio = %settings.radio_addr,
@@ -218,6 +289,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut amplifier_startup_burst_timer = Box::pin(sleep(Duration::from_secs(86_400)));
     let mut amplifier_startup_burst_count = 0_u8;
     let mut amplifier_startup_burst_active = false;
+    let startup_trigger =
+        PgxlStartupTriggerStrategy::from_config(settings.pgxl_startup_trigger_strategy.as_str());
     let mut pgxl_connect_assist_retry_timer = Box::pin(sleep(Duration::from_secs(30)));
     let mut post_registration_fallback_timer = Box::pin(sleep(Duration::from_secs(86_400)));
 
@@ -345,10 +418,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     .await?;
                     post_amplifier_registration_sent = true;
                     amplifier_startup_burst_count = 0;
-                    amplifier_startup_burst_active = true;
-                    amplifier_startup_burst_timer
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+                    amplifier_startup_burst_active =
+                        arm_startup_burst(&mut amplifier_startup_burst_timer, startup_trigger);
                     amplifier_reannounce_timer.as_mut().reset(
                         tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
                     );
@@ -383,10 +454,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         .await?;
                         post_amplifier_registration_sent = true;
                         amplifier_startup_burst_count = 0;
-                        amplifier_startup_burst_active = true;
-                        amplifier_startup_burst_timer
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+                        amplifier_startup_burst_active =
+                            arm_startup_burst(&mut amplifier_startup_burst_timer, startup_trigger);
                         amplifier_reannounce_timer.as_mut().reset(
                             tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
                         );
@@ -480,10 +549,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 .await?;
                 post_amplifier_registration_sent = true;
                 amplifier_startup_burst_count = 0;
-                amplifier_startup_burst_active = true;
-                amplifier_startup_burst_timer
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + Duration::from_millis(250));
+                amplifier_startup_burst_active =
+                    arm_startup_burst(&mut amplifier_startup_burst_timer, startup_trigger);
                 amplifier_reannounce_timer.as_mut().reset(
                     tokio::time::Instant::now() + settings.amplifier_reannounce_interval,
                 );
@@ -495,40 +562,55 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 let guard = state.read().await;
                 guard.clients.pgxl_session_started_count > 0
             };
-            if post_amplifier_registration_sent && !pgxl_connected && amplifier_startup_burst_count < 10 {
+            if post_amplifier_registration_sent
+                && !pgxl_connected
+                && amplifier_startup_burst_count < startup_trigger.max_count()
+            {
                 amplifier_startup_burst_count = amplifier_startup_burst_count.saturating_add(1);
-                send_tracked_command(
-                    &mut writer,
-                    &mut session,
-                    &state,
-                    &mut next_seq,
-                    PendingCommand::new(
-                        "amplifier_startup_burst_refresh",
-                        "sub amplifier all",
-                        PendingKind::AmplifierReannounce,
-                    ),
-                )
-                .await?;
-                let line = synthetic_amplifier_status_line(
-                    settings,
-                    &state,
-                    session.amplifier_handle.as_deref(),
-                )
-                .await;
-                trace_amplifier_advertisement(
-                    settings,
-                    &state,
-                    "amplifier_status",
-                    "startup_burst",
-                    &line,
-                )
-                .await;
-                append_flex_log_line("amplifier-status-lines.log", &line);
-                append_evidence_line(
-                    "amplifier-reannounce.log",
-                    format!("startup_burst#{} {line}", amplifier_startup_burst_count),
-                );
-                append_evidence_line("amplifier-status-lines.log", line);
+                if startup_trigger.sends_sub_amplifier_all() {
+                    send_tracked_command(
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                        PendingCommand::new(
+                            "amplifier_startup_burst_refresh",
+                            "sub amplifier all",
+                            PendingKind::AmplifierReannounce,
+                        ),
+                    )
+                    .await?;
+                }
+                if startup_trigger.logs_status_reannounce() {
+                    let line = if startup_trigger == PgxlStartupTriggerStrategy::ReannounceCreateStyleStatus {
+                        settings.amplifier_create_command()
+                    } else {
+                        synthetic_amplifier_status_line(
+                            settings,
+                            &state,
+                            session.amplifier_handle.as_deref(),
+                        )
+                        .await
+                    };
+                    trace_amplifier_advertisement(
+                        settings,
+                        &state,
+                        "amplifier_status",
+                        startup_trigger.as_str(),
+                        &line,
+                    )
+                    .await;
+                    append_flex_log_line("amplifier-status-lines.log", &line);
+                    append_evidence_line(
+                        "amplifier-reannounce.log",
+                        format!(
+                            "startup_burst#{} strategy={} {line}",
+                            amplifier_startup_burst_count,
+                            startup_trigger.as_str()
+                        ),
+                    );
+                    append_evidence_line("amplifier-status-lines.log", line);
+                }
                 {
                     let mut guard = state.write().await;
                     guard.flex_injection.amplifier_reannounce_count =
@@ -536,18 +618,23 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     guard.flex_injection.amplifier_direct_connect_expected =
                         Some(!settings.amplifier_ip.is_loopback());
                     guard.flex_injection.last_amplifier_reannounce_reason =
-                        Some(format!("startup_burst_{}", amplifier_startup_burst_count));
+                        Some(format!(
+                            "startup_burst_{}_{}",
+                            startup_trigger.as_str(),
+                            amplifier_startup_burst_count
+                        ));
                     guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
                         guard.clients.pgxl_session_started_count > 0;
                 }
                 info!(
                     event_id = "amplifier_startup_burst_refresh",
                     burst_count = amplifier_startup_burst_count,
+                    strategy = startup_trigger.as_str(),
                     "Flex amplifier startup burst refresh query sent"
                 );
                 amplifier_startup_burst_timer
                     .as_mut()
-                    .reset(tokio::time::Instant::now() + Duration::from_secs(1));
+                    .reset(tokio::time::Instant::now() + startup_trigger.interval());
             } else {
                 amplifier_startup_burst_active = false;
                 amplifier_startup_burst_timer
@@ -2702,6 +2789,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_mock_state();
         let line = synthetic_amplifier_status_line(&settings, &state, Some("0x42000001")).await;
@@ -2753,6 +2841,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2801,6 +2890,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2862,6 +2952,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2904,6 +2995,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2942,6 +3034,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -2992,6 +3085,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let commands = registration_command_lines(&settings);
         assert_eq!(
@@ -3048,6 +3142,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         let commands = registration_commands_with_state(&settings, &state).await;
@@ -3091,6 +3186,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(30000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let state = bridge_core::state::shared_default_state();
         {
@@ -3222,6 +3318,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         let post = post_amplifier_registration_commands(&settings)
             .into_iter()
@@ -3265,6 +3362,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         assert!(settings.flex_force_operate_via_radio);
         assert!(!settings.allow_rf_risk);
@@ -3299,6 +3397,7 @@ mod tests {
             tuner_presence_refresh: false,
             tuner_refresh_interval: Duration::from_millis(5000),
             amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
         };
         assert!(settings.pgxl_connect_assist);
         assert!(!settings.flex_force_operate_via_radio);

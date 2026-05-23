@@ -18,6 +18,7 @@ pgxl:
   enabled: true
   port: 9008
   aethersdr_compat: false
+  status_profile: status_current
   strict_emulation: false
   startup_delay_ms: 0
 
@@ -32,6 +33,8 @@ tgxl:
 ```
 
 Set `aethersdr_compat: true` while diagnosing AetherSDR direct PGXL/TGXL behaviour. Compatibility mode emits only source-observed fields, removes unverified `capabilities`, `firmware`, `connection_state`, and `fault` fields from protocol bodies, and reports `swr` as return loss dB because AetherSDR converts it back to an SWR ratio.
+
+Set `pgxl.status_profile` only for direct PGXL button-gating experiments. `status_current` preserves the current proven status body. `status_operate_capable`, `status_rich_metered`, and `status_real_pgxl_like` append progressively richer capability/telemetry fields so evidence runs can prove whether AetherSDR begins emitting AMP commands. These profiles do not change Flex amplifier create fields or real KPA500 control gates.
 
 Set `strict_emulation: true` in mock mode to simulate a more realistic device startup sequence. The emulator sends the required `V` greeting immediately, but shared mock state reports transitional readiness until `startup_delay_ms` expires.
 
@@ -158,6 +161,7 @@ flex_injection:
   flex_force_operate_via_radio: false
   pgxl_connect_assist: false
   amplifier_reannounce_interval_ms: 5000
+  pgxl_startup_trigger_strategy: current
   reconnect_initial_ms: 1000
   reconnect_max_ms: 30000
   ping_interval_ms: 30000
@@ -183,6 +187,8 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 `flex_force_operate_via_radio` is also lab-only. It sends `amplifier set <handle> operate=1` to the Flex API after the injected amplifier handle is observed. It does not send `^OS1;` to the KPA500 and is used only to test whether the Flex radio owns and rewrites amplifier operate state.
 
 `pgxl_connect_assist` is a lab-only AetherSDR PGXL direct-connect workaround. It sends one Flex-side `amplifier set <handle> operate=1` after the virtual amplifier handle is discovered, which can trigger AetherSDR to open TCP 9008. It does not send `^OS1;` to the KPA500; PGXL direct status remains based on real KPA500 polling. This is not normal lifecycle machinery and must stay disabled for operational/evidence runs.
+
+`pgxl_startup_trigger_strategy` controls only the bounded startup burst used to measure PGXL direct-connect timing. `current` preserves the last-known-good behaviour, `rapid_sub_only` sends faster `sub amplifier all` refreshes, `reannounce_status_only` logs/status-reannounces without subscription spam, `reannounce_create_style_status` replays the create-style line into evidence for comparison, and `no_burst` disables the startup burst. Use `egb pgxl-trigger-strategy-test` to compare these; do not change the working AetherSDR profile while measuring.
 
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 

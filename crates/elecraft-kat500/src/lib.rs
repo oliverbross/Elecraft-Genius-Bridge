@@ -968,20 +968,73 @@ impl Kat500Driver {
             guard.controls.last_safety_decision = Some("executed".to_string());
         }
         if command.label == "autotune" {
-            if let Ok(response) =
-                send_command(port, CMD_TUNE_POLL, Duration::from_millis(750), transcript).await
-            {
-                let mut guard = self.state.write().await;
-                parse_kat500_response(&response, &mut guard.tuner);
-            }
-            if let Ok(response) =
-                send_command(port, CMD_VSWR, Duration::from_millis(750), transcript).await
-            {
-                let mut guard = self.state.write().await;
-                parse_kat500_response(&response, &mut guard.tuner);
-            }
+            self.poll_tune_until_idle(port, transcript).await;
         }
         Ok(())
+    }
+
+    async fn poll_tune_until_idle(
+        &self,
+        port: &mut SerialStream,
+        transcript: &mut SerialTranscript,
+    ) {
+        let started = Instant::now();
+        let mut last_tp_response = None;
+        loop {
+            match send_command(port, CMD_TUNE_POLL, Duration::from_millis(750), transcript).await {
+                Ok(response) => {
+                    let mut guard = self.state.write().await;
+                    parse_kat500_response(&response, &mut guard.tuner);
+                    last_tp_response = Some(response.clone());
+                    append_evidence_line(
+                        "kat500_tune_lifecycle.log",
+                        format!(
+                            "post-tune TP poll response={response} tuning={}",
+                            guard.tuner.tuning
+                        ),
+                    );
+                    if !guard.tuner.tuning {
+                        guard.lifecycle.tune.transition(
+                            TuneLifecycleState::Idle,
+                            "TP0 cleared KAT500 tune lifecycle after autotune",
+                        );
+                        break;
+                    }
+                }
+                Err(err) => {
+                    append_evidence_line(
+                        "kat500_tune_lifecycle.log",
+                        format!("post-tune TP poll failed: {err}"),
+                    );
+                }
+            }
+            if started.elapsed() >= Duration::from_secs(15) {
+                let mut guard = self.state.write().await;
+                guard.tuner.tuning = false;
+                guard.lifecycle.tune.mark_failure(format!(
+                    "KAT500 tune state expired after 15s without TP0; last_tp_response={last_tp_response:?}"
+                ));
+                guard.lifecycle.tune.transition(
+                    TuneLifecycleState::Idle,
+                    "KAT500 tune timeout expired tuning state",
+                );
+                append_evidence_line(
+                    "kat500_tune_lifecycle.log",
+                    format!(
+                        "post-tune TP timeout expired tuning state last_tp_response={last_tp_response:?}"
+                    ),
+                );
+                break;
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        if let Ok(response) =
+            send_command(port, CMD_VSWR, Duration::from_millis(750), transcript).await
+        {
+            let mut guard = self.state.write().await;
+            parse_kat500_response(&response, &mut guard.tuner);
+        }
     }
 
     pub async fn set_antenna(&self, antenna: u8) -> Result<()> {
@@ -1626,14 +1679,14 @@ async fn drain_stale_serial_input(
     transcript: &mut SerialTranscript,
 ) -> u64 {
     let mut drained = 0_u64;
-    while let Ok(Ok(response)) = timeout(Duration::from_millis(25), read_serial_line(port)).await {
+    while let Ok(Ok(response)) = timeout(Duration::from_millis(75), read_serial_line(port)).await {
         transcript.write_line("RX_STALE", &response).await;
         append_evidence_line(
             "kat500-frequency-follow.log",
             format!("drained stale serial response before F command: {response}"),
         );
         drained = drained.saturating_add(1);
-        if drained >= 8 {
+        if drained >= 20 {
             break;
         }
     }
@@ -2041,6 +2094,20 @@ mod tests {
             .capabilities
             .contains(&"atu_frequency_khz=10125".to_string()));
         assert!(tuner.capabilities.contains(&"band_number=04".to_string()));
+    }
+
+    #[test]
+    fn frequency_confirmation_requires_exact_requested_echo() {
+        assert_eq!(requested_khz_from_frequency_wire("F 24930;"), Some(24_930));
+        assert_eq!(
+            confirmed_khz_from_frequency_response("F 21074;"),
+            Some(21_074)
+        );
+        assert_ne!(
+            confirmed_khz_from_frequency_response("F 21074;"),
+            requested_khz_from_frequency_wire("F 24930;")
+        );
+        assert_eq!(confirmed_khz_from_frequency_response("VSWR 1.23;"), None);
     }
 
     #[test]
