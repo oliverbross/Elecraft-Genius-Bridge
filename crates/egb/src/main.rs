@@ -2623,6 +2623,16 @@ impl EvidenceRun {
             startup_advertisement_policy_markdown(state).await,
         )
         .await?;
+        tokio::fs::write(
+            self.dir.join("interlock-registration-audit.md"),
+            interlock_registration_audit_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("flex-registration-health.md"),
+            flex_registration_health_markdown(state).await,
+        )
+        .await?;
         let create_analysis_path = self.dir.join("create-profile-analysis.md");
         if !create_analysis_path.exists() {
             tokio::fs::write(
@@ -3648,6 +3658,9 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         - Amplifier handle: `{}`\n\
         - Meter handles: {:?}\n\
         - Interlock handle: `{}`\n\
+        - Last interlock status: `{}`\n\
+        - Empty interlock amplifier field: {}\n\
+        - Empty interlock amplifier count: {}\n\
         - `sub amplifier all` accepted: {}\n\
         - Last Flex TX: `{}`\n\
         - Last Flex RX: `{}`\n\n\
@@ -3665,9 +3678,76 @@ async fn flex_injection_health_markdown(cfg: &BridgeConfig, state: &SharedState)
         flex.amplifier_handle.as_deref().unwrap_or("none"),
         flex.meter_handles,
         flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.last_interlock_status_line.as_deref().unwrap_or("none"),
+        flex.interlock_amplifier_field_empty,
+        flex.interlock_empty_amplifier_count,
         flex.sub_amplifier_all_accepted,
         flex.last_tx_line.as_deref().unwrap_or("none"),
         flex.last_rx_line.as_deref().unwrap_or("none"),
+    )
+}
+
+async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let flex = &guard.flex_injection;
+    format!(
+        "# Interlock Registration Audit\n\n\
+        ## Current Command\n\n\
+        EGB creates the AMP interlock after the Flex radio has accepted and broadcast the amplifier object handle.\n\n\
+        ```text\n\
+        interlock create type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial=EGB-KPA500\n\
+        ```\n\n\
+        ## Official API Check\n\n\
+        The PGXL Amplifier-to-Radio API documents `interlock create` parameters `type`, `valid_antennas`, `name`, and `serial`; it does not document an explicit amplifier handle parameter. The same document's example uses `type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial=<pgxl-serial>`.\n\n\
+        ## Latest Runtime Evidence\n\n\
+        - Amplifier handle: `{}`\n\
+        - Interlock handle: `{}`\n\
+        - Last interlock status: `{}`\n\
+        - Empty `amplifier=` observed: {}\n\
+        - Empty `amplifier=` count: {}\n\
+        - Last amplifier status: `{}`\n\
+        - Last Flex TX: `{}`\n\
+        - Last Flex RX: `{}`\n\n\
+        If `reason=AMP:PG-XL` still arrives with `amplifier=` empty after this two-stage registration change, the remaining suspect is not command ordering but a hidden radio-side association requirement such as serial format or antenna/source topology.\n",
+        flex.amplifier_handle.as_deref().unwrap_or("none"),
+        flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.last_interlock_status_line.as_deref().unwrap_or("none"),
+        flex.interlock_amplifier_field_empty,
+        flex.interlock_empty_amplifier_count,
+        flex.last_amplifier_status_line.as_deref().unwrap_or("none"),
+        flex.last_tx_line.as_deref().unwrap_or("none"),
+        flex.last_rx_line.as_deref().unwrap_or("none"),
+    )
+}
+
+async fn flex_registration_health_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let flex = &guard.flex_injection;
+    format!(
+        "# Flex Registration Health\n\n\
+        - Amplifier create sent: {}\n\
+        - Amplifier create accepted: {}\n\
+        - Amplifier handle: `{}`\n\
+        - Meter handles: {:?}\n\
+        - Interlock handle: `{}`\n\
+        - Interlock amplifier field empty: {}\n\
+        - Amplifier removed count: {}\n\
+        - Duplicate amplifier create count: {}\n\
+        - Sub amplifier all accepted: {}\n\
+        - Connection state: `{}`\n\
+        - Degraded reason: `{}`\n\n\
+        Registration is healthy only if the amplifier handle is stable, meter/interlock handles are present when enabled, `amplifier_removed_count` remains zero, and the interlock status does not report `reason=AMP:PG-XL amplifier=` with an empty amplifier field.\n",
+        flex.amplifier_create_sent,
+        flex.amplifier_create_accepted,
+        flex.amplifier_handle.as_deref().unwrap_or("none"),
+        flex.meter_handles,
+        flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.interlock_amplifier_field_empty,
+        flex.amplifier_removed_count,
+        flex.duplicate_amplifier_create_count,
+        flex.sub_amplifier_all_accepted,
+        flex.connection_state.as_str(),
+        flex.degraded_reason.as_deref().unwrap_or("none"),
     )
 }
 
@@ -3702,6 +3782,10 @@ async fn operational_readiness_verdict_markdown(cfg: &BridgeConfig, state: &Shar
         }
         if guard.flex_injection.duplicate_amplifier_create_count > 0 {
             failures.push("Duplicate amplifier create attempts occurred".to_string());
+        }
+        if guard.flex_injection.interlock_amplifier_field_empty {
+            failures
+                .push("Flex interlock reports AMP:PG-XL with an empty amplifier field".to_string());
         }
     }
     if let Some(head) = git_head_commit() {

@@ -195,8 +195,9 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         );
     }
 
-    let mut registration: Option<Vec<PendingCommand>> = None;
-    let mut registration_sent = false;
+    let mut amplifier_create: Option<PendingCommand> = None;
+    let mut amplifier_create_sent = false;
+    let mut post_amplifier_registration_sent = false;
     let mut next_seq = 1_u32;
     let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
@@ -205,298 +206,325 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
 
     loop {
         tokio::select! {
-            line = timeout(Duration::from_secs(60), reader.next_line()) => {
-                let line = match line {
-                    Ok(Ok(Some(line))) => line,
-                    Ok(Ok(None)) => anyhow::bail!("Flex API closed connection"),
-                    Ok(Err(err)) => return Err(err).context("failed to read Flex API line"),
-                    Err(_) => anyhow::bail!("timed out waiting for Flex API traffic"),
-                };
-                session.observe_line(&line);
-                session.remember_recent_line(format!("RX {line}"));
-                if let Some(handle) = session.handle.clone() {
+        line = timeout(Duration::from_secs(60), reader.next_line()) => {
+            let line = match line {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => anyhow::bail!("Flex API closed connection"),
+                Ok(Err(err)) => return Err(err).context("failed to read Flex API line"),
+                Err(_) => anyhow::bail!("timed out waiting for Flex API traffic"),
+            };
+            session.observe_line(&line);
+            session.remember_recent_line(format!("RX {line}"));
+            if let Some(handle) = session.handle.clone() {
+                let mut guard = state.write().await;
+                guard.flex_injection.client_handle = Some(handle);
+                guard.flex_injection.client_handle_received = true;
+                guard
+                    .lifecycle
+                    .flex_session
+                    .transition(LifecycleState::Active, "Flex client handle received");
+            }
+            trace_flex_rx(&line);
+            {
+                let mut guard = state.write().await;
+                guard.flex_injection.last_rx_line = Some(line.clone());
+            }
+            if let Some(status) = parse_slice_status(&line) {
+                update_radio_context_from_slice(&state, &status).await;
+            }
+            if let Some(status) = parse_transmit_status(&line) {
+                update_radio_context_from_transmit(&state, &status).await;
+            }
+            if let Some(status) = parse_radio_status(&line) {
+                update_radio_context_from_radio(&state, &status).await;
+            }
+            if let Some(status) = parse_interlock_status(&line) {
+                observe_interlock_status(&state, &status).await;
+            }
+
+            if session.has_handle && !amplifier_create_sent {
+                wait_for_kpa_first_poll_if_needed(settings, &state).await;
+                let item = amplifier_create
+                    .get_or_insert(pending_amplifier_create_command_with_state(settings, &state).await);
+                {
                     let mut guard = state.write().await;
-                    guard.flex_injection.client_handle = Some(handle);
-                    guard.flex_injection.client_handle_received = true;
+                    guard
+                        .lifecycle
+                        .amplifier
+                        .transition(LifecycleState::ObjectCreated, "sending one-shot Flex amplifier registration");
+                }
+                validate_amplifier_create_for_profile(
+                    &settings.amplifier_status_profile,
+                    &item.command,
+                )
+                .map_err(anyhow::Error::msg)?;
+                info!(
+                    profile = %settings.amplifier_status_profile,
+                    create_line = %item.command,
+                    "Flex amplifier create profile selected"
+                );
+                trace_amplifier_advertisement(
+                    settings,
+                    &state,
+                    "amplifier_create",
+                    "registration",
+                    &item.command,
+                )
+                .await;
+                send_tracked_command(
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                    item.clone(),
+                )
+                .await?;
+                amplifier_create_sent = true;
+                {
+                    let mut guard = state.write().await;
                     guard
                         .lifecycle
                         .flex_session
-                        .transition(LifecycleState::Active, "Flex client handle received");
+                        .transition(LifecycleState::ObjectCreated, "amplifier create sent; waiting for amplifier status");
+                    guard
+                        .lifecycle
+                        .amplifier
+                        .transition(LifecycleState::ObjectAdvertised, "amplifier create sent");
                 }
-                trace_flex_rx(&line);
-                {
-                    let mut guard = state.write().await;
-                    guard.flex_injection.last_rx_line = Some(line.clone());
-                }
-                if let Some(status) = parse_slice_status(&line) {
-                    update_radio_context_from_slice(&state, &status).await;
-                }
-                if let Some(status) = parse_transmit_status(&line) {
-                    update_radio_context_from_transmit(&state, &status).await;
-                }
-                if let Some(status) = parse_radio_status(&line) {
-                    update_radio_context_from_radio(&state, &status).await;
-                }
+            }
 
-                if session.has_handle && !registration_sent {
-                    wait_for_kpa_first_poll_if_needed(settings, &state).await;
-                    let items = registration
-                        .get_or_insert(registration_commands_with_state(settings, &state).await);
-                    {
-                        let mut guard = state.write().await;
-                        guard
-                            .lifecycle
-                            .amplifier
-                            .transition(LifecycleState::ObjectCreated, "sending one-shot Flex amplifier registration");
+            if let Some((seq, code, body)) = parse_response(&line) {
+                if settings.flex_force_operate_via_radio {
+                    append_flex_operate_lab_line(format!("RX_RESPONSE R{seq}|{code}|{body}"));
+                }
+                session
+                    .observe_response(settings, &state, seq, &code, &body)
+                    .await;
+                if amplifier_create_sent
+                    && !post_amplifier_registration_sent
+                    && session.amplifier_handle.is_some()
+                {
+                    send_post_amplifier_registration_commands(
+                        settings,
+                        &mut writer,
+                        &mut session,
+                        &state,
+                        &mut next_seq,
+                    )
+                    .await?;
+                    post_amplifier_registration_sent = true;
+                }
+            }
+
+            if let Some(status) = parse_amplifier_status(&line) {
+                observe_tuner_presence(&state, &status).await;
+                if session.observe_amplifier_status(settings, &status) {
+                    record_amplifier_pairing_status(
+                        &state,
+                        status.raw.clone(),
+                        status.kvs.iter().map(|(key, _)| key.clone()).collect(),
+                    )
+                    .await;
+                    if status.is_removed() {
+                        record_amplifier_removed(&state, &status.handle, &session).await;
+                        anyhow::bail!(
+                            "Flex removed amplifier object {}; registration halted",
+                            status.handle
+                        );
                     }
-                    for item in items.iter() {
-                        if item.label == "amplifier_create" {
-                            validate_amplifier_create_for_profile(
-                                &settings.amplifier_status_profile,
-                                &item.command,
-                            )
-                            .map_err(anyhow::Error::msg)?;
-                            info!(
-                                profile = %settings.amplifier_status_profile,
-                                create_line = %item.command,
-                                "Flex amplifier create profile selected"
-                            );
-                            trace_amplifier_advertisement(
-                                settings,
-                                &state,
-                                "amplifier_create",
-                                "registration",
-                                &item.command,
-                            )
-                            .await;
-                        }
-                        send_tracked_command(
+                    set_amplifier_handle(&state, &status.handle).await;
+                    if !post_amplifier_registration_sent {
+                        send_post_amplifier_registration_commands(
+                            settings,
                             &mut writer,
                             &mut session,
                             &state,
                             &mut next_seq,
-                            item.clone(),
                         )
                         .await?;
+                        post_amplifier_registration_sent = true;
                     }
-                    registration_sent = true;
-                    {
-                        let mut guard = state.write().await;
-                        guard
-                            .lifecycle
-                            .flex_session
-                            .transition(LifecycleState::Subscribed, "registration commands sent once for this Flex session");
-                        guard
-                            .lifecycle
-                            .amplifier
-                            .transition(LifecycleState::ObjectAdvertised, "amplifier create sent");
-                    }
-                }
-
-                if let Some((seq, code, body)) = parse_response(&line) {
                     if settings.flex_force_operate_via_radio {
-                        append_flex_operate_lab_line(format!("RX_RESPONSE R{seq}|{code}|{body}"));
-                    }
-                    session
-                        .observe_response(settings, &state, seq, &code, &body)
-                        .await;
-                }
-
-                if let Some(status) = parse_amplifier_status(&line) {
-                    observe_tuner_presence(&state, &status).await;
-                    if session.observe_amplifier_status(settings, &status) {
-                        record_amplifier_pairing_status(
-                            &state,
-                            status.raw.clone(),
-                            status.kvs.iter().map(|(key, _)| key.clone()).collect(),
-                        )
-                        .await;
-                        if status.is_removed() {
-                            record_amplifier_removed(&state, &status.handle, &session).await;
-                            anyhow::bail!(
-                                "Flex removed amplifier object {}; registration halted",
-                                status.handle
-                            );
-                        }
-                        set_amplifier_handle(&state, &status.handle).await;
-                        if settings.flex_force_operate_via_radio {
-                            append_flex_operate_lab_line(format!("RX_STATUS {}", status.raw));
-                            send_flex_operate_lab_command(
-                                settings,
-                                &mut writer,
-                                &mut session,
-                                &state,
-                                &mut next_seq,
-                                &status.handle,
-                            )
-                            .await?;
-                        }
-                        if settings.pgxl_connect_assist {
-                            append_flex_operate_lab_line(format!(
-                                "CONNECT_ASSIST_RX_STATUS {}",
-                                status.raw
-                            ));
-                            send_pgxl_connect_assist_command(
-                                settings,
-                                &mut writer,
-                                &mut session,
-                                &state,
-                                &mut next_seq,
-                                &status.handle,
-                            )
-                            .await?;
-                        }
-                        handle_amplifier_status(
+                        append_flex_operate_lab_line(format!("RX_STATUS {}", status.raw));
+                        send_flex_operate_lab_command(
                             settings,
-                            &state,
                             &mut writer,
+                            &mut session,
+                            &state,
                             &mut next_seq,
-                            &status,
+                            &status.handle,
                         )
                         .await?;
                     }
-                }
-            }
-            () = &mut ping_timer => {
-                if registration_sent {
-                    send_tracked_command(
-                        &mut writer,
-                        &mut session,
-                        &state,
-                        &mut next_seq,
-                        PendingCommand::new("ping", "ping", PendingKind::Ping),
-                    )
-                    .await?;
-                    {
-                        let mut guard = state.write().await;
-                        guard.flex_injection.ping_count =
-                            guard.flex_injection.ping_count.saturating_add(1);
+                    if settings.pgxl_connect_assist {
+                        append_flex_operate_lab_line(format!(
+                            "CONNECT_ASSIST_RX_STATUS {}",
+                            status.raw
+                        ));
+                        send_pgxl_connect_assist_command(
+                            settings,
+                            &mut writer,
+                            &mut session,
+                            &state,
+                            &mut next_seq,
+                            &status.handle,
+                        )
+                        .await?;
                     }
-                    log_amp_snapshot(&state).await;
-                }
-                ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
-            }
-            () = &mut amplifier_reannounce_timer => {
-                if registration_sent {
-                    send_tracked_command(
-                        &mut writer,
-                        &mut session,
-                        &state,
-                        &mut next_seq,
-                        PendingCommand::new(
-                            "amplifier_reannounce_refresh",
-                            "sub amplifier all",
-                            PendingKind::AmplifierReannounce,
-                        ),
-                    )
-                    .await?;
-                    let line = synthetic_amplifier_status_line(
+                    handle_amplifier_status(
                         settings,
                         &state,
-                        session.amplifier_handle.as_deref(),
-                    )
-                    .await;
-                    trace_amplifier_advertisement(
-                        settings,
-                        &state,
-                        "amplifier_status",
-                        "periodic_reannounce",
-                        &line,
-                    )
-                    .await;
-                    append_flex_log_line("amplifier-status-lines.log", &line);
-                    append_evidence_line("amplifier-reannounce.log", line.clone());
-                    append_evidence_line("amplifier-status-lines.log", line);
-                    {
-                        let mut guard = state.write().await;
-                        guard.flex_injection.amplifier_reannounce_count =
-                            guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
-                        guard.flex_injection.amplifier_direct_connect_expected =
-                            Some(!settings.amplifier_ip.is_loopback());
-                        guard.flex_injection.last_amplifier_reannounce_reason =
-                            Some("periodic_sub_amplifier_all".to_string());
-                        guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
-                            guard.clients.pgxl_session_started_count > 0;
-                    }
-                    info!(
-                        event_id = "amplifier_presence_refreshed",
-                        profile = %settings.amplifier_status_profile,
-                        "Flex amplifier presence refresh query sent"
-                    );
-                }
-                amplifier_reannounce_timer.as_mut().reset(tokio::time::Instant::now() + settings.amplifier_reannounce_interval);
-            }
-            () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
-                if registration_sent {
-                    send_tracked_command(
                         &mut writer,
-                        &mut session,
-                        &state,
                         &mut next_seq,
-                        PendingCommand::new(
-                            "tuner_presence_refresh",
-                            "sub amplifier all",
-                            PendingKind::TunerPresenceRefresh,
-                        ),
+                        &status,
                     )
                     .await?;
-                    {
-                        let mut guard = state.write().await;
-                        guard.flex_injection.tuner_registration_refresh_count =
-                            guard.flex_injection.tuner_registration_refresh_count.saturating_add(1);
-                        guard.flex_injection.tuner_reannounce_count =
-                            guard.flex_injection.tuner_reannounce_count.saturating_add(1);
-                    }
-                    append_evidence_json(
-                        "disconnect-events.jsonl",
-                        &serde_json::json!({
-                            "event": "tuner_presence_refreshed",
-                            "source": "flex_injection",
-                            "command": "sub amplifier all",
-                        }),
-                    );
-                    info!(
-                        event_id = "tuner_presence_refreshed",
-                        "Flex tuner presence refresh query sent"
-                    );
                 }
-                tuner_refresh_timer.as_mut().reset(tokio::time::Instant::now() + settings.tuner_refresh_interval);
-            }
-            () = &mut pgxl_connect_assist_retry_timer, if settings.pgxl_connect_assist => {
-                let should_retry = {
-                    let guard = state.read().await;
-                    registration_sent
-                        && session.amplifier_handle.is_some()
-                        && guard.clients.pgxl_session_started_count == 0
-                };
-                if should_retry {
-                    session.assist_sent_handle = None;
-                    {
-                        let mut guard = state.write().await;
-                        guard.flex_injection.pgxl_connect_assist_retry_count =
-                            guard.flex_injection.pgxl_connect_assist_retry_count.saturating_add(1);
-                    }
-                    send_tracked_command(
-                        &mut writer,
-                        &mut session,
-                        &state,
-                        &mut next_seq,
-                        PendingCommand::new(
-                            "pgxl_connect_assist_retry",
-                            "sub amplifier all",
-                            PendingKind::AmplifierReannounce,
-                        ),
-                    )
-                    .await?;
-                    info!(
-                        event_id = "pgxl_connect_assist_retry",
-                        "PGXL connect-assist retry: reset assist guard and re-sent sub amplifier all"
-                    );
-                }
-                pgxl_connect_assist_retry_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(30));
             }
         }
+        () = &mut ping_timer => {
+            if post_amplifier_registration_sent {
+                send_tracked_command(
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                    PendingCommand::new("ping", "ping", PendingKind::Ping),
+                )
+                .await?;
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.ping_count =
+                        guard.flex_injection.ping_count.saturating_add(1);
+                }
+                log_amp_snapshot(&state).await;
+            }
+            ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
+        }
+        () = &mut amplifier_reannounce_timer => {
+            if post_amplifier_registration_sent {
+                send_tracked_command(
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                    PendingCommand::new(
+                        "amplifier_reannounce_refresh",
+                        "sub amplifier all",
+                        PendingKind::AmplifierReannounce,
+                    ),
+                )
+                .await?;
+                let line = synthetic_amplifier_status_line(
+                    settings,
+                    &state,
+                    session.amplifier_handle.as_deref(),
+                )
+                .await;
+                trace_amplifier_advertisement(
+                    settings,
+                    &state,
+                    "amplifier_status",
+                    "periodic_reannounce",
+                    &line,
+                )
+                .await;
+                append_flex_log_line("amplifier-status-lines.log", &line);
+                append_evidence_line("amplifier-reannounce.log", line.clone());
+                append_evidence_line("amplifier-status-lines.log", line);
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.amplifier_reannounce_count =
+                        guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
+                    guard.flex_injection.amplifier_direct_connect_expected =
+                        Some(!settings.amplifier_ip.is_loopback());
+                    guard.flex_injection.last_amplifier_reannounce_reason =
+                        Some("periodic_sub_amplifier_all".to_string());
+                    guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
+                        guard.clients.pgxl_session_started_count > 0;
+                }
+                info!(
+                    event_id = "amplifier_presence_refreshed",
+                    profile = %settings.amplifier_status_profile,
+                    "Flex amplifier presence refresh query sent"
+                );
+            }
+            amplifier_reannounce_timer.as_mut().reset(tokio::time::Instant::now() + settings.amplifier_reannounce_interval);
+        }
+        () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
+            if post_amplifier_registration_sent {
+                send_tracked_command(
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                    PendingCommand::new(
+                        "tuner_presence_refresh",
+                        "sub amplifier all",
+                        PendingKind::TunerPresenceRefresh,
+                    ),
+                )
+                .await?;
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.tuner_registration_refresh_count =
+                        guard.flex_injection.tuner_registration_refresh_count.saturating_add(1);
+                    guard.flex_injection.tuner_reannounce_count =
+                        guard.flex_injection.tuner_reannounce_count.saturating_add(1);
+                }
+                append_evidence_json(
+                    "disconnect-events.jsonl",
+                    &serde_json::json!({
+                        "event": "tuner_presence_refreshed",
+                        "source": "flex_injection",
+                        "command": "sub amplifier all",
+                    }),
+                );
+                info!(
+                    event_id = "tuner_presence_refreshed",
+                    "Flex tuner presence refresh query sent"
+                );
+            }
+            tuner_refresh_timer.as_mut().reset(tokio::time::Instant::now() + settings.tuner_refresh_interval);
+        }
+        () = &mut pgxl_connect_assist_retry_timer, if settings.pgxl_connect_assist => {
+            let should_retry = {
+                let guard = state.read().await;
+                post_amplifier_registration_sent
+                    && session.amplifier_handle.is_some()
+                    && guard.clients.pgxl_session_started_count == 0
+            };
+            if should_retry {
+                session.assist_sent_handle = None;
+                {
+                    let mut guard = state.write().await;
+                    guard.flex_injection.pgxl_connect_assist_retry_count =
+                        guard.flex_injection.pgxl_connect_assist_retry_count.saturating_add(1);
+                }
+                send_tracked_command(
+                    &mut writer,
+                    &mut session,
+                    &state,
+                    &mut next_seq,
+                    PendingCommand::new(
+                        "pgxl_connect_assist_retry",
+                        "sub amplifier all",
+                        PendingKind::AmplifierReannounce,
+                    ),
+                )
+                .await?;
+                info!(
+                    event_id = "pgxl_connect_assist_retry",
+                    "PGXL connect-assist retry: reset assist guard and re-sent sub amplifier all"
+                );
+            }
+            pgxl_connect_assist_retry_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(30));
+                    }
+                }
     }
+
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 async fn wait_for_kpa_first_poll_if_needed(settings: &FlexInjectionSettings, state: &SharedState) {
@@ -665,6 +693,37 @@ async fn send_tracked_command(
         guard.flex_injection.pending_count = session.pending.len();
     }
     *next_seq = next_seq.saturating_add(1);
+    Ok(())
+}
+
+async fn send_post_amplifier_registration_commands(
+    settings: &FlexInjectionSettings,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    session: &mut FlexSession,
+    state: &SharedState,
+    next_seq: &mut u32,
+) -> Result<()> {
+    info!(
+        amplifier_handle = session.amplifier_handle.as_deref().unwrap_or("unknown"),
+        "Flex amplifier handle observed; sending meters, interlock, keepalive, and subscriptions"
+    );
+    append_evidence_line(
+        "flex-registration-health.md",
+        format!(
+            "Post-amplifier registration started after amplifier_handle={}",
+            session.amplifier_handle.as_deref().unwrap_or("unknown")
+        ),
+    );
+    for item in post_amplifier_registration_commands(settings) {
+        send_tracked_command(writer, session, state, next_seq, item).await?;
+    }
+    {
+        let mut guard = state.write().await;
+        guard.lifecycle.flex_session.transition(
+            LifecycleState::Subscribed,
+            "post-amplifier registration commands sent after amplifier handle observed",
+        );
+    }
     Ok(())
 }
 
@@ -858,6 +917,7 @@ impl FlexSession {
                     );
                 }
                 if let Some(handle) = response_object_id(body) {
+                    self.amplifier_handle = Some(handle.to_string());
                     set_amplifier_handle(state, handle).await;
                 }
             }
@@ -1018,6 +1078,36 @@ async fn record_amplifier_candidate_fields(state: &SharedState, candidate_fields
     guard
         .flex_injection
         .amplifier_pgxl_tcp_attempted_after_status = guard.clients.pgxl_session_started_count > 0;
+}
+
+async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) {
+    let reason = status.value("reason").unwrap_or_default();
+    let amplifier = status.value("amplifier").unwrap_or_default();
+    let mut guard = state.write().await;
+    guard.flex_injection.last_interlock_status_line = Some(status.raw.clone());
+    if reason == "AMP:PG-XL" && amplifier.is_empty() {
+        guard.flex_injection.interlock_amplifier_field_empty = true;
+        guard.flex_injection.interlock_empty_amplifier_count = guard
+            .flex_injection
+            .interlock_empty_amplifier_count
+            .saturating_add(1);
+        guard.flex_injection.degraded_reason =
+            Some("Flex interlock status reports AMP:PG-XL with empty amplifier field".to_string());
+        warn!(
+            event_id = "flex_interlock_empty_amplifier",
+            raw = %status.raw,
+            "Flex interlock is not associated with an amplifier"
+        );
+        append_evidence_json(
+            "lifecycle-events.jsonl",
+            &serde_json::json!({
+                "event": "flex_interlock_empty_amplifier",
+                "raw": status.raw,
+            }),
+        );
+    } else if !amplifier.is_empty() {
+        guard.flex_injection.interlock_amplifier_field_empty = false;
+    }
 }
 
 async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
@@ -1498,6 +1588,10 @@ fn parse_radio_status(line: &str) -> Option<KeyValueStatus> {
     parse_kv_status(line, "radio ")
 }
 
+fn parse_interlock_status(line: &str) -> Option<KeyValueStatus> {
+    parse_kv_status(line, "interlock ")
+}
+
 async fn update_radio_context_from_slice(state: &SharedState, status: &KeyValueStatus) {
     let frequency_hz = status
         .value("RF_frequency")
@@ -1971,15 +2065,30 @@ pub fn registration_command_lines(settings: &FlexInjectionSettings) -> Vec<Strin
         .collect()
 }
 
+#[cfg(test)]
 async fn registration_commands_with_state(
     settings: &FlexInjectionSettings,
     state: &SharedState,
 ) -> Vec<PendingCommand> {
+    let mut commands = Vec::new();
+    commands.push(pending_amplifier_create_command_with_state(settings, state).await);
+    commands.extend(post_amplifier_registration_commands(settings));
+    commands
+}
+
+async fn pending_amplifier_create_command_with_state(
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+) -> PendingCommand {
     let state_value = {
         let guard = state.read().await;
         advertised_amp_state_for_settings(settings, &guard.amp).to_string()
     };
-    registration_commands_inner(settings, Some(&state_value))
+    PendingCommand::new(
+        "amplifier_create",
+        settings.amplifier_create_command_with_state(&state_value),
+        PendingKind::AmplifierCreate,
+    )
 }
 
 fn registration_commands(settings: &FlexInjectionSettings) -> Vec<PendingCommand> {
@@ -1998,6 +2107,49 @@ fn registration_commands_inner(
             .unwrap_or_else(|| settings.amplifier_create_command()),
         PendingKind::AmplifierCreate,
     ));
+    if settings.full_pgxl_registration && settings.create_meters {
+        for meter in amp_meter_create_commands() {
+            commands.push(PendingCommand::new(
+                format!("meter_create_{}", meter.name),
+                meter.command,
+                PendingKind::MeterCreate { name: meter.name },
+            ));
+        }
+    }
+    if settings.full_pgxl_registration && settings.create_interlock {
+        commands.push(PendingCommand::new(
+            "interlock_create",
+            interlock_create_command(&settings.serial),
+            PendingKind::InterlockCreate,
+        ));
+    }
+    if settings.full_pgxl_registration {
+        commands.push(PendingCommand::new(
+            "keepalive_enable",
+            "keepalive enable",
+            PendingKind::KeepaliveEnable,
+        ));
+    }
+    commands.push(PendingCommand::new(
+        "sub_amplifier_all",
+        "sub amplifier all",
+        PendingKind::Subscription,
+    ));
+    commands.push(PendingCommand::new(
+        "sub_slice_all",
+        "sub slice all",
+        PendingKind::Subscription,
+    ));
+    commands.push(PendingCommand::new(
+        "sub_tx_all",
+        "sub tx all",
+        PendingKind::Subscription,
+    ));
+    commands
+}
+
+fn post_amplifier_registration_commands(settings: &FlexInjectionSettings) -> Vec<PendingCommand> {
+    let mut commands = Vec::new();
     if settings.full_pgxl_registration && settings.create_meters {
         for meter in amp_meter_create_commands() {
             commands.push(PendingCommand::new(
@@ -2800,6 +2952,58 @@ mod tests {
                 .unwrap_err()
                 .contains("stripped/noisy")
         );
+    }
+
+    #[test]
+    fn parses_empty_interlock_amplifier_status() {
+        let status = parse_interlock_status(
+            "S0|interlock tx_client_handle=0x00000000 state=READY reason=AMP:PG-XL source= tx_allowed=1 amplifier=",
+        )
+        .unwrap();
+        assert_eq!(status.value("reason"), Some("AMP:PG-XL"));
+        assert_eq!(status.value("amplifier"), Some(""));
+    }
+
+    #[test]
+    fn post_registration_commands_wait_until_after_amplifier_create() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_minimal".to_string(),
+            trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
+            pgxl_connect_assist: false,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+        };
+        let post = post_amplifier_registration_commands(&settings)
+            .into_iter()
+            .map(|pending| pending.command)
+            .collect::<Vec<_>>();
+        assert!(!post
+            .iter()
+            .any(|command| command.starts_with("amplifier create")));
+        assert!(post
+            .iter()
+            .any(|command| command.starts_with("meter create name=FWD")));
+        assert!(post.iter().any(|command| command
+            == "interlock create type=AMP valid_antennas=ANT1,ANT2 name=PG-XL serial=EGB-KPA500"));
     }
 
     #[test]
