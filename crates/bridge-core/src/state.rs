@@ -979,6 +979,9 @@ pub struct ProtocolCounters {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ControlDiagnostics {
     pub aethersdr_button_command_seen: bool,
+    pub tune_command_seen: bool,
+    pub amp_control_command_seen: bool,
+    pub any_control_event_seen: bool,
     pub last_tgxl_control_command: Option<String>,
     pub last_pgxl_control_command: Option<String>,
     pub last_flex_amp_set_command: Option<String>,

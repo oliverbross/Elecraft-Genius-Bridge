@@ -428,6 +428,8 @@ async fn handle_command(
         "operate" => {
             let mut guard = state.write().await;
             guard.controls.aethersdr_button_command_seen = true;
+            guard.controls.amp_control_command_seen = true;
+            guard.controls.any_control_event_seen = true;
             guard.controls.control_requested_count =
                 guard.controls.control_requested_count.saturating_add(1);
             guard.controls.last_pgxl_control_command = Some(command.to_string());
@@ -458,6 +460,8 @@ async fn handle_command(
         "standby" => {
             let mut guard = state.write().await;
             guard.controls.aethersdr_button_command_seen = true;
+            guard.controls.amp_control_command_seen = true;
+            guard.controls.any_control_event_seen = true;
             guard.controls.control_requested_count =
                 guard.controls.control_requested_count.saturating_add(1);
             guard.controls.last_pgxl_control_command = Some(command.to_string());

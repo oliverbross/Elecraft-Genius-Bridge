@@ -2171,6 +2171,8 @@ async fn handle_amplifier_status(
         {
             let mut guard = state.write().await;
             guard.controls.aethersdr_button_command_seen = true;
+            guard.controls.amp_control_command_seen = true;
+            guard.controls.any_control_event_seen = true;
             guard.controls.control_requested_count =
                 guard.controls.control_requested_count.saturating_add(1);
             guard.controls.last_flex_amp_set_command = Some(status.raw.clone());
@@ -2213,6 +2215,8 @@ async fn handle_amplifier_status(
     {
         let mut guard = state.write().await;
         guard.controls.aethersdr_button_command_seen = true;
+        guard.controls.amp_control_command_seen = true;
+        guard.controls.any_control_event_seen = true;
         guard.controls.control_requested_count =
             guard.controls.control_requested_count.saturating_add(1);
         guard.controls.last_flex_amp_set_command = Some(status.raw.clone());

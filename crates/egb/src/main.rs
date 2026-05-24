@@ -3647,8 +3647,16 @@ async fn controls_analysis_markdown(state: &SharedState) -> String {
     let guard = state.read().await;
     let mut body = String::from("# Controls Analysis\n\n");
     body.push_str(&format!(
-        "- AetherSDR button command seen: {}\n",
-        guard.controls.aethersdr_button_command_seen
+        "- Tune command seen: {}\n",
+        guard.controls.tune_command_seen
+    ));
+    body.push_str(&format!(
+        "- AMP control command seen: {}\n",
+        guard.controls.amp_control_command_seen
+    ));
+    body.push_str(&format!(
+        "- Any control event seen: {}\n",
+        guard.controls.any_control_event_seen
     ));
     body.push_str(&format!(
         "- Control requests observed: {}\n",
@@ -4331,7 +4339,9 @@ async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String
         - Flex amp set command arrived: `{}`\n\
         - PGXL direct control command arrived: `{}`\n\
         - Any Flex command with `amplifier set`: `{}`\n\
-        - Any AetherSDR button command seen: `{}`\n\n\
+        - Tune command seen: `{}`\n\
+        - AMP control command seen: `{}`\n\
+        - Any control event seen: `{}`\n\n\
         ## Source Path\n\n\
         The inspected AetherSDR source shows the Amp applet button is command-capable: \
         `AmpApplet::setState()` shows the button, clicking it emits `operateToggled(bool)`, \
@@ -4381,7 +4391,9 @@ async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String
             .as_deref()
             .unwrap_or("none"),
         guard.controls.last_flex_amp_set_command.is_some(),
-        guard.controls.aethersdr_button_command_seen,
+        guard.controls.tune_command_seen,
+        guard.controls.amp_control_command_seen,
+        guard.controls.any_control_event_seen,
     )
 }
 
@@ -4643,7 +4655,7 @@ async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String 
         - Interlock mode: `{}`\n\
         - Last tune frequency: `{:?}` Hz\n\
         - Last tune band: `{}`\n\
-        - AetherSDR AMP command seen: `{}`\n\
+        - AMP control command seen: `{}`\n\
         - Last interlock state: `{}`\n\
         - Last interlock reason: `{}`\n\
         - Last interlock tx_allowed: `{}`\n\
@@ -5269,7 +5281,7 @@ async fn aethersdr_production_test_markdown(cfg: &BridgeConfig, state: &SharedSt
         | KPA state reflection | `{}` |\n\
         | Amplifier removed count | {} |\n\
         | Amplifier handle change count | {} |\n\
-        | AMP command seen | {} |\n\
+        | AMP control command seen | {} |\n\
         | Last Flex amp set command | `{}` |\n\
         | Last PGXL control command | `{}` |\n\n\
         Result: `{}`\n\n\
@@ -5300,7 +5312,7 @@ async fn aethersdr_production_test_markdown(cfg: &BridgeConfig, state: &SharedSt
         reflection_summary,
         guard.flex_injection.amplifier_removed_count,
         guard.flex_injection.amplifier_handle_change_count,
-        guard.controls.aethersdr_button_command_seen,
+        guard.controls.amp_control_command_seen,
         guard
             .controls
             .last_flex_amp_set_command
@@ -5464,7 +5476,9 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
         - Effective KPA operate: {} ({})\n\
         - Last Flex amp set/status command observed: `{}`\n\
         - Last PGXL direct control command observed: `{}`\n\
-        - Any AetherSDR/SmartSDR button command seen: {}\n\
+        - Tune command seen: {}\n\
+        - AMP control command seen: {}\n\
+        - Any control event seen: {}\n\
         - Control requested count: {}\n\
         - Last mapped Elecraft action: `{}`\n\
         - Last safety decision: `{}`\n\n\
@@ -5550,7 +5564,9 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
             .last_pgxl_control_command
             .as_deref()
             .unwrap_or("none"),
-        controls.aethersdr_button_command_seen,
+        controls.tune_command_seen,
+        controls.amp_control_command_seen,
+        controls.any_control_event_seen,
         controls.control_requested_count,
         controls
             .last_mapped_elecraft_action

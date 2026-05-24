@@ -417,6 +417,7 @@ async fn handle_command(
             if let Some(operate) = requested {
                 let mut guard = state.write().await;
                 guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.any_control_event_seen = true;
                 guard.controls.control_requested_count =
                     guard.controls.control_requested_count.saturating_add(1);
                 guard.controls.last_tgxl_control_command = Some(command.to_string());
@@ -440,6 +441,7 @@ async fn handle_command(
             if let Some(bypass) = requested {
                 let mut guard = state.write().await;
                 guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.any_control_event_seen = true;
                 guard.controls.control_requested_count =
                     guard.controls.control_requested_count.saturating_add(1);
                 guard.controls.last_tgxl_control_command = Some(command.to_string());
@@ -474,6 +476,8 @@ async fn handle_command(
             {
                 let mut guard = state.write().await;
                 guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.tune_command_seen = true;
+                guard.controls.any_control_event_seen = true;
                 guard.controls.control_requested_count =
                     guard.controls.control_requested_count.saturating_add(1);
                 guard.controls.last_tgxl_control_command = Some(command.to_string());
@@ -514,6 +518,7 @@ async fn handle_command(
             if let Some(ant) = ant {
                 let mut guard = state.write().await;
                 guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.any_control_event_seen = true;
                 guard.controls.control_requested_count =
                     guard.controls.control_requested_count.saturating_add(1);
                 guard.controls.last_tgxl_control_command = Some(command.to_string());
@@ -561,6 +566,7 @@ async fn handle_command(
             if let Some(ch) = ch {
                 let mut guard = state.write().await;
                 guard.controls.aethersdr_button_command_seen = true;
+                guard.controls.any_control_event_seen = true;
                 guard.controls.control_requested_count =
                     guard.controls.control_requested_count.saturating_add(1);
                 guard.controls.last_tgxl_control_command = Some(command.to_string());
@@ -718,6 +724,7 @@ async fn flexradio_get_line(seq: u32, state: &SharedState, ch: u8) -> String {
 async fn record_flexradio_set(command: &str, state: &SharedState) {
     let mut guard = state.write().await;
     guard.controls.aethersdr_button_command_seen = true;
+    guard.controls.any_control_event_seen = true;
     guard.controls.control_requested_count =
         guard.controls.control_requested_count.saturating_add(1);
     guard.controls.last_tgxl_control_command = Some(command.to_string());
@@ -764,6 +771,8 @@ async fn apply_relay_command(command: &str, state: &SharedState) -> Result<(), &
 
     let mut guard = state.write().await;
     guard.controls.aethersdr_button_command_seen = true;
+    guard.controls.tune_command_seen = true;
+    guard.controls.any_control_event_seen = true;
     guard.controls.control_requested_count =
         guard.controls.control_requested_count.saturating_add(1);
     guard.controls.last_tgxl_control_command = Some(command.to_string());

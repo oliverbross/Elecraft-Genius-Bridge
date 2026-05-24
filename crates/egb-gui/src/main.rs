@@ -1745,8 +1745,13 @@ impl GuiApp {
                     field(ui, "State lag", format_ms_age(status.amp.stale_duration_ms));
                     field(
                         ui,
-                        "Button command seen",
-                        bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                        "Tune command seen",
+                        bool_text(Some(status.controls.tune_command_seen)),
+                    );
+                    field(
+                        ui,
+                        "AMP control seen",
+                        bool_text(Some(status.controls.amp_control_command_seen)),
                     );
                     field(ui, "Command source", control_source_label(&status.controls));
                     field(
@@ -2353,8 +2358,13 @@ impl GuiApp {
             if let Some(status) = &self.status {
                 field(
                     ui,
-                    "Any client command arrived",
-                    bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                    "Any control event arrived",
+                    bool_text(Some(status.controls.any_control_event_seen)),
+                );
+                field(
+                    ui,
+                    "AMP control arrived",
+                    bool_text(Some(status.controls.amp_control_command_seen)),
                 );
                 field(ui, "Source", control_source_label(&status.controls));
                 field(
@@ -2907,8 +2917,13 @@ impl GuiApp {
                 ui.heading("Control Path");
                 field(
                     ui,
-                    "AetherSDR button command seen",
-                    bool_text(Some(status.controls.aethersdr_button_command_seen)),
+                    "AMP control command seen",
+                    bool_text(Some(status.controls.amp_control_command_seen)),
+                );
+                field(
+                    ui,
+                    "Tune command seen",
+                    bool_text(Some(status.controls.tune_command_seen)),
                 );
                 field(
                     ui,
@@ -3654,6 +3669,12 @@ struct FlexDiagnostics {
 struct ControlStatus {
     #[serde(default)]
     aethersdr_button_command_seen: bool,
+    #[serde(default)]
+    tune_command_seen: bool,
+    #[serde(default)]
+    amp_control_command_seen: bool,
+    #[serde(default)]
+    any_control_event_seen: bool,
     #[serde(default)]
     last_tgxl_control_command: Option<String>,
     #[serde(default)]
