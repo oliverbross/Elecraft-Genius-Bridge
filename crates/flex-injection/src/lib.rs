@@ -509,6 +509,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         &mut writer,
                         &mut next_seq,
                         &status,
+                        session.handle.as_deref(),
                     )
                     .await?;
                 }
@@ -1717,14 +1718,16 @@ async fn handle_amplifier_status(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     next_seq: &mut u32,
     status: &AmplifierStatus,
+    own_client_handle: Option<&str>,
 ) -> Result<()> {
     if settings.flex_force_operate_via_radio {
         return Ok(());
     }
-    let requested = status.requested_operate();
+    let requested = status.requested_operate(own_client_handle);
     debug!(
         amplifier_handle = %status.handle,
         requested_operate = ?requested,
+        source_handle = ?status.source_handle,
         raw = %status.raw,
         "Flex amplifier status observed"
     );
@@ -1858,6 +1861,7 @@ enum PendingKind {
 #[derive(Debug, Clone)]
 struct AmplifierStatus {
     raw: String,
+    source_handle: String,
     handle: String,
     kvs: Vec<(String, String)>,
 }
@@ -1877,7 +1881,7 @@ impl AmplifierStatus {
             .is_some_and(|body| body.split_whitespace().any(|token| token == "removed"))
     }
 
-    fn requested_operate(&self) -> Option<bool> {
+    fn requested_operate(&self, own_client_handle: Option<&str>) -> Option<bool> {
         if let Some(value) = self.value("operate") {
             return match value {
                 "1" => Some(true),
@@ -1885,7 +1889,23 @@ impl AmplifierStatus {
                 _ => None,
             };
         }
+        if self.is_external_client_status(own_client_handle) {
+            if let Some(value) = self.value("state") {
+                return match value.to_ascii_uppercase().as_str() {
+                    "IDLE" | "OPERATE" | "TRANSMIT" | "TRANSMIT_A" | "TRANSMIT_B" => Some(true),
+                    "STANDBY" => Some(false),
+                    _ => None,
+                };
+            }
+        }
         None
+    }
+
+    fn is_external_client_status(&self, own_client_handle: Option<&str>) -> bool {
+        if self.source_handle == "0" || self.source_handle == "0x00000000" {
+            return false;
+        }
+        own_client_handle != Some(self.source_handle.as_str())
     }
 
     fn tuner_disappearance_reason(&self) -> Option<&'static str> {
@@ -1925,6 +1945,7 @@ impl AmplifierStatus {
 }
 
 fn parse_amplifier_status(line: &str) -> Option<AmplifierStatus> {
+    let source_handle = status_source_handle(line)?.to_string();
     let body = status_body(line)?;
     let rest = body.strip_prefix("amplifier ")?;
     let mut parts = rest.split_whitespace();
@@ -1937,9 +1958,19 @@ fn parse_amplifier_status(line: &str) -> Option<AmplifierStatus> {
         .collect::<Vec<_>>();
     Some(AmplifierStatus {
         raw: line.to_string(),
+        source_handle,
         handle,
         kvs,
     })
+}
+
+fn status_source_handle(line: &str) -> Option<&str> {
+    if !line.starts_with('S') {
+        return None;
+    }
+    line.strip_prefix('S')?
+        .split_once('|')
+        .map(|(handle, _)| handle)
 }
 
 fn status_body(line: &str) -> Option<&str> {
@@ -2872,12 +2903,24 @@ mod tests {
         .unwrap();
         assert_eq!(status.handle, "0x42000001");
         assert_eq!(status.value("model"), Some("PowerGeniusXL"));
-        assert_eq!(status.requested_operate(), Some(true));
+        assert_eq!(status.requested_operate(Some("1A2B")), Some(true));
 
         let standby =
             parse_amplifier_status("S1A2B|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
                 .unwrap();
-        assert_eq!(standby.requested_operate(), None);
+        assert_eq!(standby.requested_operate(Some("1A2B")), None);
+        assert_eq!(standby.requested_operate(Some("CAFE")), Some(false));
+    }
+
+    #[test]
+    fn external_client_state_status_can_request_control() {
+        let operate =
+            parse_amplifier_status("SCAFE|amplifier 0x42000001 model=PowerGeniusXL state=OPERATE")
+                .unwrap();
+        assert_eq!(operate.source_handle, "CAFE");
+        assert_eq!(operate.requested_operate(Some("1A2B")), Some(true));
+        assert_eq!(operate.requested_operate(Some("CAFE")), None);
+        assert_eq!(operate.requested_operate(None), Some(true));
     }
 
     #[test]

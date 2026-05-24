@@ -2843,6 +2843,7 @@ impl EvidenceRun {
             "operational-readiness-verdict.md",
             "effective-control-policy.md",
             "flex-injection-health.md",
+            "flex-capability-state-dump.md",
             "control-execution-events.jsonl",
             "applet-visibility-paths.md",
             "smartsdr-interlock-analysis.md",
@@ -3047,6 +3048,11 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("flex-registration-health.md"),
             flex_registration_health_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("flex-capability-state-dump.md"),
+            flex_capability_state_dump_markdown(state).await,
         )
         .await?;
         let create_analysis_path = self.dir.join("create-profile-analysis.md");
@@ -4909,6 +4915,111 @@ async fn flex_registration_health_markdown(state: &SharedState) -> String {
         flex.sub_amplifier_all_accepted,
         flex.connection_state.as_str(),
         flex.degraded_reason.as_deref().unwrap_or("none"),
+    )
+}
+
+async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let flex = &guard.flex_injection;
+    let controls = &guard.controls;
+    let effective = &guard.effective_controls;
+    format!(
+        "# Flex Capability State Dump\n\n\
+        ## Amplifier Object\n\n\
+        - Flex connection state: `{}`\n\
+        - Client handle: `{}`\n\
+        - Amplifier handle: `{}`\n\
+        - Amplifier create sent/accepted: {}/{}\n\
+        - Last amplifier status line: `{}`\n\
+        - Last emitted amplifier advertisement: `{}`\n\
+        - Last advertised Flex amp state: `{}`\n\
+        - Last advertised PGXL state: `{}`\n\
+        - Amplifier handle changes: {}\n\
+        - Amplifier removed count: {}\n\
+        - Duplicate amplifier creates: {}\n\n\
+        ## Meters\n\n\
+        - Meter handles: {:?}\n\
+        - Meter publish supported: `{}`\n\
+        - Meter publish count: {}\n\
+        - Meter publish last result: `{}`\n\n\
+        ## Interlock\n\n\
+        - Interlock handle: `{}`\n\
+        - Interlock created: {}\n\
+        - Interlock disabled for test: {}\n\
+        - Last interlock status: `{}`\n\
+        - Last interlock state: `{}`\n\
+        - Last interlock reason: `{}`\n\
+        - Last interlock tx_allowed: `{}`\n\
+        - Empty amplifier field: {} count={}\n\
+        - Interlock blocked count: {}\n\n\
+        ## Control Eligibility\n\n\
+        - Effective KPA standby: {} ({})\n\
+        - Effective KPA operate: {} ({})\n\
+        - Last Flex amp set/status command observed: `{}`\n\
+        - Last PGXL direct control command observed: `{}`\n\
+        - Any AetherSDR/SmartSDR button command seen: {}\n\
+        - Control requested count: {}\n\
+        - Last mapped Elecraft action: `{}`\n\
+        - Last safety decision: `{}`\n\n\
+        ## Interpretation\n\n\
+        AetherSDR source sends AMP clicks as `amplifier set <handle> operate=<0|1>` through the Flex API. \
+        Direct PGXL TCP is telemetry-only in the inspected source. EGB now accepts both explicit `operate=0/1` \
+        status and external-client `state=OPERATE/STANDBY` amplifier status as possible control requests, while \
+        ignoring its own reflected amplifier status. If this dump still shows no Flex amp set/status command after \
+        a client button press, no usable control signal reached EGB.\n",
+        flex.connection_state.as_str(),
+        flex.client_handle.as_deref().unwrap_or("none"),
+        flex.amplifier_handle.as_deref().unwrap_or("none"),
+        flex.amplifier_create_sent,
+        flex.amplifier_create_accepted,
+        flex.last_amplifier_status_line.as_deref().unwrap_or("none"),
+        flex.last_emitted_amplifier_advertisement_line
+            .as_deref()
+            .unwrap_or("none"),
+        flex.last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("none"),
+        flex.last_advertised_pgxl_state.as_deref().unwrap_or("none"),
+        flex.amplifier_handle_change_count,
+        flex.amplifier_removed_count,
+        flex.duplicate_amplifier_create_count,
+        flex.meter_handles,
+        flex.meter_publish_supported
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        flex.meter_publish_count,
+        flex.meter_publish_last_result.as_deref().unwrap_or("none"),
+        flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.interlock_handle.is_some(),
+        flex.interlock_disabled_for_test,
+        flex.last_interlock_status_line.as_deref().unwrap_or("none"),
+        flex.last_interlock_state.as_deref().unwrap_or("none"),
+        flex.last_interlock_reason.as_deref().unwrap_or("none"),
+        flex.last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        flex.interlock_amplifier_field_empty,
+        flex.interlock_empty_amplifier_count,
+        flex.interlock_blocked_count,
+        effective.effective_kpa_standby_enabled,
+        effective.kpa_standby_reason,
+        effective.effective_kpa_operate_enabled,
+        effective.kpa_operate_reason,
+        controls
+            .last_flex_amp_set_command
+            .as_deref()
+            .unwrap_or("none"),
+        controls
+            .last_pgxl_control_command
+            .as_deref()
+            .unwrap_or("none"),
+        controls.aethersdr_button_command_seen,
+        controls.control_requested_count,
+        controls
+            .last_mapped_elecraft_action
+            .as_deref()
+            .unwrap_or("none"),
+        controls.last_safety_decision.as_deref().unwrap_or("none"),
     )
 }
 
