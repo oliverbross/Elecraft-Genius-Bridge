@@ -303,7 +303,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 .to_string(),
             );
             guard.flex_injection.external_control_capable_state = Some(
-                "AMP interlock configured; waiting for amplifier handle and client control command"
+                "AMP interlock configured; waiting for explicit amplifier set operate command"
                     .to_string(),
             );
         }
@@ -334,7 +334,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
             .is_none()
         {
             guard.flex_injection.external_control_capable_state = Some(
-                "unknown until an external client emits amplifier set/state command".to_string(),
+                "unknown until an external client emits explicit amplifier set operate command"
+                    .to_string(),
             );
         }
         guard.lifecycle.flex_session.transition(
@@ -2390,7 +2391,7 @@ impl AmplifierStatus {
             .is_some_and(|body| body.split_whitespace().any(|token| token == "removed"))
     }
 
-    fn requested_operate(&self, own_client_handle: Option<&str>) -> Option<bool> {
+    fn requested_operate(&self, _own_client_handle: Option<&str>) -> Option<bool> {
         if let Some(value) = self.value("operate") {
             return match value {
                 "1" => Some(true),
@@ -2398,23 +2399,7 @@ impl AmplifierStatus {
                 _ => None,
             };
         }
-        if self.is_external_client_status(own_client_handle) {
-            if let Some(value) = self.value("state") {
-                return match value.to_ascii_uppercase().as_str() {
-                    "IDLE" | "OPERATE" | "TRANSMIT" | "TRANSMIT_A" | "TRANSMIT_B" => Some(true),
-                    "STANDBY" => Some(false),
-                    _ => None,
-                };
-            }
-        }
         None
-    }
-
-    fn is_external_client_status(&self, own_client_handle: Option<&str>) -> bool {
-        if self.source_handle == "0" || self.source_handle == "0x00000000" {
-            return false;
-        }
-        own_client_handle != Some(self.source_handle.as_str())
     }
 
     fn tuner_disappearance_reason(&self) -> Option<&'static str> {
@@ -3460,18 +3445,25 @@ mod tests {
             parse_amplifier_status("S1A2B|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
                 .unwrap();
         assert_eq!(standby.requested_operate(Some("1A2B")), None);
-        assert_eq!(standby.requested_operate(Some("CAFE")), Some(false));
+        assert_eq!(standby.requested_operate(Some("CAFE")), None);
     }
 
     #[test]
-    fn external_client_state_status_can_request_control() {
+    fn passive_flex_state_status_never_requests_control() {
         let operate =
             parse_amplifier_status("SCAFE|amplifier 0x42000001 model=PowerGeniusXL state=OPERATE")
                 .unwrap();
         assert_eq!(operate.source_handle, "CAFE");
-        assert_eq!(operate.requested_operate(Some("1A2B")), Some(true));
+        assert_eq!(operate.requested_operate(Some("1A2B")), None);
         assert_eq!(operate.requested_operate(Some("CAFE")), None);
-        assert_eq!(operate.requested_operate(None), Some(true));
+        assert_eq!(operate.requested_operate(None), None);
+
+        let standby =
+            parse_amplifier_status("SCAFE|amplifier 0x42000001 model=PowerGeniusXL state=STANDBY")
+                .unwrap();
+        assert_eq!(standby.requested_operate(Some("1A2B")), None);
+        assert_eq!(standby.requested_operate(Some("CAFE")), None);
+        assert_eq!(standby.requested_operate(None), None);
     }
 
     #[test]
