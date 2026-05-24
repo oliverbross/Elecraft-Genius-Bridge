@@ -86,8 +86,8 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
-  disable_amp_interlock: true
-  enable_runtime_interlock: false
+  disable_amp_interlock: false
+  enable_runtime_interlock: true
   enable_vita_meter_publish: false
   amplifier_status_profile: aethersdr_force_direct
   trace_amplifier_advertisements: false

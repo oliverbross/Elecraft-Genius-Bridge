@@ -284,6 +284,28 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         if settings.disable_amp_interlock {
             guard.flex_injection.last_interlock_reason =
                 Some("INTERLOCK_DISABLED_FOR_TEST".to_string());
+            guard.flex_injection.last_interlock_tx_allowed = Some(false);
+            guard.flex_injection.amplifier_operable_eligibility =
+                Some("AMP interlock disabled for test; TX not authorized by interlock".to_string());
+            guard.flex_injection.external_control_capable_state =
+                Some("interlock_disabled_for_test; AMP controls are diagnostic-only".to_string());
+        } else if settings.create_interlock {
+            guard.flex_injection.last_interlock_state = Some("PENDING".to_string());
+            guard.flex_injection.last_interlock_reason =
+                Some("AMP interlock configured; waiting for Flex interlock status".to_string());
+            guard.flex_injection.last_interlock_tx_allowed = Some(false);
+            guard.flex_injection.amplifier_operable_eligibility = Some(
+                if settings.allow_rf_risk {
+                    "AMP interlock pending; TX blocked until Flex requests and EGB allows it"
+                } else {
+                    "AMP interlock pending; TX blocked by RF-risk policy"
+                }
+                .to_string(),
+            );
+            guard.flex_injection.external_control_capable_state = Some(
+                "AMP interlock configured; waiting for amplifier handle and client control command"
+                    .to_string(),
+            );
         }
         guard.flex_injection.meter_publish_supported = Some(settings.enable_vita_meter_publish);
         guard.flex_injection.meter_publish_last_result =
@@ -298,10 +320,23 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         } else {
             "meter handles pending; VITA-49 value publication disabled".to_string()
         });
-        guard.flex_injection.amplifier_operable_eligibility =
-            Some("unknown until amplifier/interlock statuses arrive".to_string());
-        guard.flex_injection.external_control_capable_state =
-            Some("unknown until an external client emits amplifier set/state command".to_string());
+        if guard
+            .flex_injection
+            .amplifier_operable_eligibility
+            .is_none()
+        {
+            guard.flex_injection.amplifier_operable_eligibility =
+                Some("unknown until amplifier/interlock statuses arrive".to_string());
+        }
+        if guard
+            .flex_injection
+            .external_control_capable_state
+            .is_none()
+        {
+            guard.flex_injection.external_control_capable_state = Some(
+                "unknown until an external client emits amplifier set/state command".to_string(),
+            );
+        }
         guard.lifecycle.flex_session.transition(
             LifecycleState::Connecting,
             "Flex TCP connected; waiting for handle",
@@ -1412,6 +1447,34 @@ impl FlexSession {
                 if let Some(handle) = response_object_id(body) {
                     let mut guard = state.write().await;
                     guard.flex_injection.interlock_handle = Some(handle.to_string());
+                    guard.flex_injection.last_interlock_tx_allowed = Some(false);
+                    guard.flex_injection.amplifier_operable_eligibility = Some(
+                        if guard.flex_injection.enable_runtime_interlock {
+                            "AMP interlock created; TX blocked until runtime interlock allows it"
+                        } else {
+                            "AMP interlock created; runtime interlock disabled"
+                        }
+                        .to_string(),
+                    );
+                    guard.flex_injection.external_control_capable_state = Some(format!(
+                        "amp_handle={} pgxl_tcp={} interlock_handle={} tx_allowed=false",
+                        guard
+                            .flex_injection
+                            .amplifier_handle
+                            .as_deref()
+                            .unwrap_or("none"),
+                        guard.clients.pgxl_connected,
+                        handle
+                    ));
+                    append_evidence_json(
+                        "interlock-runtime-events.jsonl",
+                        &serde_json::json!({
+                            "event": "interlock_created",
+                            "handle": handle,
+                            "tx_allowed": false,
+                            "reason": "initialized blocked until Flex runtime interlock permits TX",
+                        }),
+                    );
                 }
             }
             PendingKind::Subscription => {
@@ -1576,9 +1639,10 @@ async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) 
     let reason = status.value("reason").unwrap_or_default();
     let amplifier = status.value("amplifier").unwrap_or_default();
     let interlock_state = status.value("state").unwrap_or_default();
-    let tx_allowed = status
+    let raw_tx_allowed = status
         .value("tx_allowed")
         .map(|value| matches!(value, "1" | "true" | "True" | "TRUE"));
+    let tx_allowed = raw_tx_allowed.or(Some(false));
     let mut guard = state.write().await;
     let new_interlock_state = if interlock_state.is_empty() {
         None
@@ -1616,11 +1680,18 @@ async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) 
         Some(reason.to_string())
     };
     guard.flex_injection.last_interlock_tx_allowed = tx_allowed;
-    guard.flex_injection.amplifier_operable_eligibility = Some(match tx_allowed {
-        Some(false) => "blocked by Flex interlock tx_allowed=0".to_string(),
-        Some(true) => "Flex interlock reports tx_allowed=1".to_string(),
-        None => "Flex interlock status has no tx_allowed value".to_string(),
-    });
+    guard.flex_injection.amplifier_operable_eligibility =
+        Some(match (tx_allowed, raw_tx_allowed) {
+            (Some(false), Some(false)) => "blocked by Flex interlock tx_allowed=0".to_string(),
+            (Some(true), Some(true)) => "Flex interlock reports tx_allowed=1".to_string(),
+            (Some(false), None) => {
+                "blocked: Flex interlock status omitted tx_allowed, treating as false".to_string()
+            }
+            (Some(true), None) => "Flex interlock reports tx_allowed=1".to_string(),
+            (Some(false), Some(true)) => "blocked by EGB interlock policy override".to_string(),
+            (Some(true), Some(false)) => "Flex interlock reports tx_allowed=1".to_string(),
+            (None, _) => "blocked: no deterministic tx_allowed value available".to_string(),
+        });
     guard.flex_injection.external_control_capable_state = Some(format!(
         "amp_handle={} pgxl_tcp={} interlock_state={} tx_allowed={}",
         guard
@@ -1682,6 +1753,7 @@ async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) 
                 "state": interlock_state,
                 "reason": reason,
                 "tx_allowed": tx_allowed,
+                "raw_tx_allowed": raw_tx_allowed,
             }),
         );
     } else if !amplifier.is_empty() {
@@ -4141,6 +4213,24 @@ mod tests {
         let (allowed, reason) = interlock_runtime_allows_tx(&settings, &state).await;
         assert!(!allowed);
         assert!(reason.contains("RF-risk"));
+    }
+
+    #[tokio::test]
+    async fn interlock_status_without_tx_allowed_is_deterministically_blocked() {
+        let state = bridge_core::state::shared_mock_state();
+        let status = parse_interlock_status(
+            "S0|interlock tx_client_handle=0x00000000 state=READY reason=AMP:PG-XL source= amplifier=",
+        )
+        .unwrap();
+        observe_interlock_status(&state, &status).await;
+        let guard = state.read().await;
+        assert_eq!(guard.flex_injection.last_interlock_tx_allowed, Some(false));
+        assert!(guard
+            .flex_injection
+            .amplifier_operable_eligibility
+            .as_deref()
+            .unwrap_or_default()
+            .contains("omitted tx_allowed"));
     }
 
     #[test]

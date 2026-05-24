@@ -3003,6 +3003,7 @@ impl EvidenceRun {
             "effective-control-policy.md",
             "flex-injection-health.md",
             "flex-capability-state-dump.md",
+            "production-interlock-eligibility.md",
             "control-execution-events.jsonl",
             "applet-visibility-paths.md",
             "smartsdr-interlock-analysis.md",
@@ -3218,6 +3219,11 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("flex-capability-state-dump.md"),
             flex_capability_state_dump_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("production-interlock-eligibility.md"),
+            production_interlock_eligibility_markdown(state).await,
         )
         .await?;
         let create_analysis_path = self.dir.join("create-profile-analysis.md");
@@ -5573,6 +5579,62 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
             .as_deref()
             .unwrap_or("none"),
         controls.last_safety_decision.as_deref().unwrap_or("none"),
+    )
+}
+
+async fn production_interlock_eligibility_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let flex = &guard.flex_injection;
+    let controls = &guard.controls;
+    format!(
+        "# Production Interlock Eligibility\n\n\
+        - Interlock created: {}\n\
+        - Interlock handle: `{}`\n\
+        - Interlock disabled for test: {}\n\
+        - Runtime interlock enabled: {}\n\
+        - Last interlock state: `{}`\n\
+        - Last interlock reason: `{}`\n\
+        - tx_allowed: `{}`\n\
+        - Amplifier operable eligibility: `{}`\n\
+        - External control-capable state: `{}`\n\
+        - AMP control command seen: {}\n\
+        - Last Flex amp set command: `{}`\n\
+        - Last PGXL control command: `{}`\n\
+        - Tune command seen: {}\n\
+        - Any control event seen: {}\n\n\
+        ## Interpretation\n\n\
+        Production should create the AMP interlock and keep `tx_allowed` deterministic. \
+        With RF-risk disabled, EGB exposes a safe blocked interlock state and will answer \
+        runtime PTT requests with `not_ready` rather than allowing transmit. If this file \
+        shows `Interlock created: true`, `Runtime interlock enabled: true`, and a non-unknown \
+        `tx_allowed`, but `AMP control command seen: false`, AetherSDR still did not emit \
+        `amplifier set <handle> operate=<0|1>` despite valid interlock eligibility evidence.\n",
+        flex.interlock_handle.is_some(),
+        flex.interlock_handle.as_deref().unwrap_or("none"),
+        flex.interlock_disabled_for_test,
+        flex.enable_runtime_interlock,
+        flex.last_interlock_state.as_deref().unwrap_or("none"),
+        flex.last_interlock_reason.as_deref().unwrap_or("none"),
+        flex.last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        flex.amplifier_operable_eligibility
+            .as_deref()
+            .unwrap_or("unknown"),
+        flex.external_control_capable_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        controls.amp_control_command_seen,
+        controls
+            .last_flex_amp_set_command
+            .as_deref()
+            .unwrap_or("none"),
+        controls
+            .last_pgxl_control_command
+            .as_deref()
+            .unwrap_or("none"),
+        controls.tune_command_seen,
+        controls.any_control_event_seen,
     )
 }
 
