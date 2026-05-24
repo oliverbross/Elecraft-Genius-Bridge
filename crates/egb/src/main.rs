@@ -2802,11 +2802,13 @@ impl EvidenceRun {
             "amplifier-reannounce.log",
             "kpa-state-reannounce.log",
             "amp-state-reflection-latency.md",
+            "amp-state-reflection-events.jsonl",
             "amp-button-eligibility-evidence.md",
             "pgxl-direct-selftest.log",
             "pgxl-trigger-analysis.md",
             "pgxl-pairing-analysis.md",
             "kpa500-serial.log",
+            "kpa500-unsolicited.log",
             "kat500-serial.log",
             "client-sessions.jsonl",
             "disconnect-events.jsonl",
@@ -4151,8 +4153,11 @@ async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String
         - Interlock tx_allowed: `{}`\n\
         - PGXL connected: `{}`\n\
         - KPA real state: `{}`\n\
+        - Flex amplifier handle stable: `{}`\n\
+        - Flex amplifier handle changes: `{}`\n\
         - Flex amp set command arrived: `{}`\n\
         - PGXL direct control command arrived: `{}`\n\
+        - Any Flex command with `amplifier set`: `{}`\n\
         - Any AetherSDR button command seen: `{}`\n\n\
         ## Source Path\n\n\
         The inspected AetherSDR source shows the Amp applet button is command-capable: \
@@ -4187,6 +4192,12 @@ async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String
         guard.clients.pgxl_connected,
         guard.amp.state.pgxl_state(),
         guard
+            .flex_injection
+            .amplifier_handle
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.amplifier_handle_change_count,
+        guard
             .controls
             .last_flex_amp_set_command
             .as_deref()
@@ -4196,6 +4207,7 @@ async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String
             .last_pgxl_control_command
             .as_deref()
             .unwrap_or("none"),
+        guard.controls.last_flex_amp_set_command.is_some(),
         guard.controls.aethersdr_button_command_seen,
     )
 }
@@ -4207,11 +4219,21 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
         - Current KPA state: `{}`\n\
         - Last advertised PGXL state: `{}`\n\
         - Last advertised Flex amp state: `{}`\n\
+        - KPA state change detected at ms: `{:?}`\n\
+        - KPA state change state: `{}`\n\
+        - First/last PGXL direct status state at ms: `{:?}`\n\
+        - First/last PGXL direct status state: `{}`\n\
+        - Last Flex reannounce sent at ms: `{:?}`\n\
+        - Last Flex reannounce state: `{}`\n\
         - KPA last successful poll ms: `{:?}`\n\
         - Amplifier reannounce requests: `{}`\n\
         - Last reannounce request reason: `{}`\n\
         - Last reannounce reason: `{}`\n\
         - `sub amplifier all` command count: `{}`\n\n\
+        ## Timing Result\n\n\
+        - Estimated KPA-detect to next PGXL-status latency ms: `{}`\n\
+        - Estimated KPA-detect to Flex-reannounce latency ms: `{}`\n\
+        - Target `<2s` passed by PGXL status path: `{}`\n\n\
         ## Implemented Path\n\n\
         On a KPA `^OS` state change, EGB updates shared amp state immediately, updates \
         PGXL direct status from the same shared state, and runs a bounded Flex refresh burst \
@@ -4236,6 +4258,24 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
             .last_advertised_flex_amp_state
             .as_deref()
             .unwrap_or("unknown"),
+        guard.flex_injection.last_kpa_state_change_detected_at_ms,
+        guard
+            .flex_injection
+            .last_kpa_state_change_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.last_pgxl_status_state_at_ms,
+        guard
+            .flex_injection
+            .last_pgxl_status_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.last_flex_reannounce_sent_at_ms,
+        guard
+            .flex_injection
+            .last_flex_reannounce_state
+            .as_deref()
+            .unwrap_or("none"),
         system_time_ms(guard.amp.last_successful_poll_at),
         guard.flex_injection.amplifier_reannounce_request_count,
         guard
@@ -4249,7 +4289,36 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
             .as_deref()
             .unwrap_or("none"),
         guard.flex_injection.sub_amplifier_all_command_count,
+        latency_text(
+            guard.flex_injection.last_kpa_state_change_detected_at_ms,
+            guard.flex_injection.last_pgxl_status_state_at_ms,
+        ),
+        latency_text(
+            guard.flex_injection.last_kpa_state_change_detected_at_ms,
+            guard.flex_injection.last_flex_reannounce_sent_at_ms,
+        ),
+        latency_passed(
+            guard.flex_injection.last_kpa_state_change_detected_at_ms,
+            guard.flex_injection.last_pgxl_status_state_at_ms,
+            2000,
+        ),
     )
+}
+
+fn latency_text(start: Option<u128>, end: Option<u128>) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) if end >= start => (end - start).to_string(),
+        (Some(_), Some(_)) => "out_of_order".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn latency_passed(start: Option<u128>, end: Option<u128>, max_ms: u128) -> String {
+    match (start, end) {
+        (Some(start), Some(end)) if end >= start && end - start <= max_ms => "yes".to_string(),
+        (Some(start), Some(end)) if end >= start => "no".to_string(),
+        _ => "unknown".to_string(),
+    }
 }
 
 async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String {

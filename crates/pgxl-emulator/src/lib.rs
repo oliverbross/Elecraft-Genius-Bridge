@@ -352,11 +352,27 @@ async fn handle_command(
 ) -> CommandOutcome {
     match command {
         "info" => CommandOutcome::ok(response_line(seq, 0, info_body(aethersdr_compat))),
-        "status" => CommandOutcome::ok(response_line(
-            seq,
-            0,
-            status_body(state, aethersdr_compat, status_profile).await,
-        )),
+        "status" => {
+            let body = status_body(state, aethersdr_compat, status_profile).await;
+            let state_value = status_field(&body, "state").unwrap_or("UNKNOWN");
+            let timestamp_ms = timestamp_millis();
+            {
+                let mut guard = state.write().await;
+                guard.flex_injection.last_pgxl_status_state_at_ms = Some(timestamp_ms);
+                guard.flex_injection.last_pgxl_status_state = Some(state_value.to_string());
+            }
+            append_evidence_json(
+                "amp-state-reflection-events.jsonl",
+                &serde_json::json!({
+                    "event": "pgxl_status_response",
+                    "timestamp_ms": timestamp_ms,
+                    "seq": seq,
+                    "state": state_value,
+                    "body": body,
+                }),
+            );
+            CommandOutcome::ok(response_line(seq, 0, body))
+        }
         "setup read" | "setup" => CommandOutcome::ok(response_line(seq, 0, setup_body())),
         "ifconf read" | "network" | "network read" => {
             CommandOutcome::ok(response_line(seq, 0, ifconf_body()))
@@ -665,6 +681,12 @@ fn pgxl_vac_value(amp: &bridge_core::AmpState) -> u16 {
     } else {
         0
     }
+}
+
+fn status_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    body.split_whitespace()
+        .filter_map(|token| token.split_once('='))
+        .find_map(|(field, value)| (field == key).then_some(value))
 }
 
 struct SessionStats {

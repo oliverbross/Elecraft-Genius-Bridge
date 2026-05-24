@@ -631,6 +631,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     let mut guard = state.write().await;
                     guard.flex_injection.amplifier_reannounce_count =
                         guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
+                    guard.flex_injection.last_flex_reannounce_sent_at_ms =
+                        Some(timestamp_millis());
+                    guard.flex_injection.last_flex_reannounce_state =
+                        guard.flex_injection.last_advertised_flex_amp_state.clone();
                     guard.flex_injection.amplifier_direct_connect_expected =
                         Some(!settings.amplifier_ip.is_loopback());
                     guard.flex_injection.last_amplifier_reannounce_reason =
@@ -778,6 +782,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         let mut guard = state.write().await;
                         guard.flex_injection.amplifier_reannounce_count =
                             guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
+                        guard.flex_injection.last_flex_reannounce_sent_at_ms =
+                            Some(timestamp_millis());
+                        guard.flex_injection.last_flex_reannounce_state =
+                            guard.flex_injection.last_advertised_flex_amp_state.clone();
                         guard.flex_injection.amplifier_direct_connect_expected =
                             Some(!settings.amplifier_ip.is_loopback());
                         guard.flex_injection.last_amplifier_reannounce_reason =

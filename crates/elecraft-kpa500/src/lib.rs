@@ -1148,6 +1148,10 @@ fn record_amp_poll_change(
         Some(guard.amp.state.pgxl_state().to_string());
 
     if state_changed {
+        let detected_at_ms = unix_timestamp_ms();
+        guard.flex_injection.last_kpa_state_change_detected_at_ms = Some(detected_at_ms);
+        guard.flex_injection.last_kpa_state_change_state =
+            Some(guard.amp.state.pgxl_state().to_string());
         info!(
             event_id = "kpa_state_changed",
             old_state = ?before.state,
@@ -1162,7 +1166,7 @@ fn record_amp_poll_change(
             "control-events.jsonl",
             &serde_json::json!({
                 "event": "kpa_state_changed",
-                "timestamp_ms": unix_timestamp_ms(),
+                "timestamp_ms": detected_at_ms,
                 "old_state": format!("{:?}", before.state),
                 "new_state": format!("{:?}", guard.amp.state),
                 "old_operate": before.operate,
@@ -1183,7 +1187,7 @@ fn record_amp_poll_change(
             "kpa-state-reannounce.log",
             format!(
                 "kpa_state_changed timestamp_ms={} old_state={:?} new_state={:?} old_operate={} new_operate={} burst_schedule_ms=0,250,500,1000,1500,2000 source_response={response}",
-                unix_timestamp_ms(),
+                detected_at_ms,
                 before.state,
                 guard.amp.state,
                 before.operate,
@@ -1362,6 +1366,25 @@ async fn send_command_collect(
             } else {
                 "mismatched"
             };
+            if classification == "unsolicited" && response.starts_with("^SP") {
+                append_evidence_json(
+                    "kpa500-serial.log",
+                    &serde_json::json!({
+                        "event": "unsolicited_kpa_status",
+                        "command": command.label,
+                        "expected_prefix": expected_prefixes,
+                        "response": response,
+                        "classification": "unsolicited",
+                    }),
+                );
+                append_evidence_line(
+                    "kpa500-unsolicited.log",
+                    format!(
+                        "unsolicited_kpa_status command={} expected={expected_prefixes:?} response={response}",
+                        command.label
+                    ),
+                );
+            }
             if classification == "unsolicited" || classification == "echo_only" {
                 trace!(
                     device = "KPA500",
@@ -1430,7 +1453,9 @@ fn matches_expected_response(response: &str, expected_prefixes: &[&str]) -> bool
 }
 
 fn is_unsolicited_response(response: &str) -> bool {
-    const PREFIXES: &[&str] = &["^RVM", "^SN", "^OS", "^WS", "^TM", "^VI", "^FL", "^BN"];
+    const PREFIXES: &[&str] = &[
+        "^RVM", "^SN", "^OS", "^WS", "^TM", "^VI", "^FL", "^BN", "^SP", "^ST",
+    ];
     PREFIXES
         .iter()
         .any(|prefix| response.starts_with(prefix) && response.ends_with(';'))
@@ -1850,6 +1875,7 @@ mod tests {
             expected_prefixes(CMD_OPERATE_STATUS)
         ));
         assert!(is_unsolicited_response("^FL00;"));
+        assert!(is_unsolicited_response("^SP1;"));
         assert!(matches_expected_response(
             "^OS0;",
             expected_prefixes(CMD_OPERATE_STATUS)
