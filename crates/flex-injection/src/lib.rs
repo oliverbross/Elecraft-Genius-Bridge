@@ -686,10 +686,14 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     let mut guard = state.write().await;
                     guard.flex_injection.amplifier_reannounce_count =
                         guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
-                    guard.flex_injection.last_flex_reannounce_sent_at_ms =
-                        Some(timestamp_millis());
-                    guard.flex_injection.last_flex_reannounce_state =
-                        guard.flex_injection.last_advertised_flex_amp_state.clone();
+                    let sent_at_ms = timestamp_millis();
+                    guard.flex_injection.last_flex_reannounce_sent_at_ms = Some(sent_at_ms);
+                    let advertised_state = guard.flex_injection.last_advertised_flex_amp_state.clone();
+                    guard.flex_injection.last_flex_reannounce_state = advertised_state.clone();
+                    let transition_updates = guard.flex_injection.record_flex_reannounce_sent(
+                        sent_at_ms,
+                        advertised_state,
+                    );
                     guard.flex_injection.amplifier_direct_connect_expected =
                         Some(!settings.amplifier_ip.is_loopback());
                     guard.flex_injection.last_amplifier_reannounce_reason =
@@ -700,6 +704,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         ));
                     guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
                         guard.clients.pgxl_session_started_count > 0;
+                    drop(guard);
+                    for transition in transition_updates {
+                        append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
+                    }
                 }
                 info!(
                     event_id = "amplifier_startup_burst_refresh",
@@ -762,8 +770,20 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         Some(!settings.amplifier_ip.is_loopback());
                     guard.flex_injection.last_amplifier_reannounce_reason =
                         Some("periodic_keepalive_reannounce".to_string());
+                    let sent_at_ms = timestamp_millis();
+                    guard.flex_injection.last_flex_reannounce_sent_at_ms = Some(sent_at_ms);
+                    let advertised_state = guard.flex_injection.last_advertised_flex_amp_state.clone();
+                    guard.flex_injection.last_flex_reannounce_state = advertised_state.clone();
+                    let transition_updates = guard.flex_injection.record_flex_reannounce_sent(
+                        sent_at_ms,
+                        advertised_state,
+                    );
                     guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
                         guard.clients.pgxl_session_started_count > 0;
+                    drop(guard);
+                    for transition in transition_updates {
+                        append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
+                    }
                 }
                 info!(
                     event_id = "amplifier_presence_refreshed",
@@ -837,16 +857,25 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         let mut guard = state.write().await;
                         guard.flex_injection.amplifier_reannounce_count =
                             guard.flex_injection.amplifier_reannounce_count.saturating_add(1);
-                        guard.flex_injection.last_flex_reannounce_sent_at_ms =
-                            Some(timestamp_millis());
-                        guard.flex_injection.last_flex_reannounce_state =
+                        let sent_at_ms = timestamp_millis();
+                        guard.flex_injection.last_flex_reannounce_sent_at_ms = Some(sent_at_ms);
+                        let advertised_state =
                             guard.flex_injection.last_advertised_flex_amp_state.clone();
+                        guard.flex_injection.last_flex_reannounce_state = advertised_state.clone();
+                        let transition_updates = guard.flex_injection.record_flex_reannounce_sent(
+                            sent_at_ms,
+                            advertised_state,
+                        );
                         guard.flex_injection.amplifier_direct_connect_expected =
                             Some(!settings.amplifier_ip.is_loopback());
                         guard.flex_injection.last_amplifier_reannounce_reason =
                             Some(format!("requested_{reason}"));
                         guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
                             guard.clients.pgxl_session_started_count > 0;
+                        drop(guard);
+                        for transition in transition_updates {
+                            append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
+                        }
                     }
                     info!(
                         event_id = "amplifier_presence_requested_refresh",
@@ -1493,6 +1522,7 @@ async fn record_amplifier_pairing_status(
     line: String,
     candidate_fields: Vec<String>,
 ) {
+    let timestamp_ms = timestamp_millis();
     let mut guard = state.write().await;
     let observed_state = line
         .split_whitespace()
@@ -1503,7 +1533,7 @@ async fn record_amplifier_pairing_status(
         .flex_injection
         .amplifier_object_seen_at_ms
         .get_or_insert_with(timestamp_millis);
-    if let Some(observed_state) = observed_state {
+    if let Some(observed_state) = observed_state.as_deref() {
         if guard.flex_injection.flex_desired_amp_state.as_deref() == Some("OPERATE")
             && observed_state == "STANDBY"
         {
@@ -1517,6 +1547,13 @@ async fn record_amplifier_pairing_status(
     if guard.flex_injection.pgxl_connect_assist_enabled {
         guard.flex_injection.pgxl_connect_assist_triggered_tcp =
             guard.clients.pgxl_session_started_count > 0;
+    }
+    let updates = guard
+        .flex_injection
+        .record_flex_status_observed(timestamp_ms, observed_state);
+    drop(guard);
+    for transition in updates {
+        append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
     }
 }
 

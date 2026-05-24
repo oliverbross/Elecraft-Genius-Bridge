@@ -27,10 +27,12 @@ Evidence files:
 
 ## Meaning
 
-`^SP1;` is not currently mapped to authoritative PGXL/KPA state because the
-verified operational state remains `^OS0;` / `^OS1;`. If a future KPA500
-Programmer Reference transcript proves an exact semantic for `^SP`, it can be
-promoted from logged unsolicited status to parsed telemetry.
+The Elecraft KPA500 Programmer's Reference defines `^SP` as fault speaker
+on/off. `^SP1;` means the fault speaker is enabled; it is configuration
+telemetry, not operate/standby state and not a command failure.
+
+EGB parses unsolicited `^SP0;` / `^SP1;` into `amp.fault_speaker_on`, but the
+verified operational state remains `^OS0;` / `^OS1;`.
 
 ## State Reflection
 

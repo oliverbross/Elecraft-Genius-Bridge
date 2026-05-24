@@ -360,6 +360,13 @@ async fn handle_command(
                 let mut guard = state.write().await;
                 guard.flex_injection.last_pgxl_status_state_at_ms = Some(timestamp_ms);
                 guard.flex_injection.last_pgxl_status_state = Some(state_value.to_string());
+                let updates = guard
+                    .flex_injection
+                    .record_pgxl_status_observed(timestamp_ms, state_value);
+                drop(guard);
+                for transition in updates {
+                    append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
+                }
             }
             append_evidence_json(
                 "amp-state-reflection-events.jsonl",

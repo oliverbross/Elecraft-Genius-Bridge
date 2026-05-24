@@ -380,6 +380,7 @@ impl BridgeState {
                 temperature_c: 32.0,
                 meffa: "OK".to_string(),
                 fault: None,
+                fault_speaker_on: None,
                 warning: None,
                 firmware_version: Some("MOCK".to_string()),
                 serial_number: Some("MOCK-KPA500".to_string()),
@@ -436,6 +437,7 @@ pub struct AmpState {
     pub temperature_c: f32,
     pub meffa: String,
     pub fault: Option<String>,
+    pub fault_speaker_on: Option<bool>,
     pub warning: Option<String>,
     pub firmware_version: Option<String>,
     pub serial_number: Option<String>,
@@ -471,6 +473,7 @@ impl Default for AmpState {
             temperature_c: 0.0,
             meffa: "UNKNOWN".to_string(),
             fault: None,
+            fault_speaker_on: None,
             warning: None,
             firmware_version: None,
             serial_number: None,
@@ -657,6 +660,8 @@ pub struct FlexInjectionState {
     pub last_advertised_tgxl_operate: Option<bool>,
     pub last_kpa_state_change_detected_at_ms: Option<u128>,
     pub last_kpa_state_change_state: Option<String>,
+    pub kpa_state_transition_count: u64,
+    pub kpa_state_transition_latencies: Vec<KpaStateTransitionLatency>,
     pub last_pgxl_status_state_at_ms: Option<u128>,
     pub last_pgxl_status_state: Option<String>,
     pub last_flex_reannounce_sent_at_ms: Option<u128>,
@@ -680,6 +685,155 @@ pub struct FlexInjectionState {
     pub tuner_last_seen_at: Option<SystemTime>,
     #[serde(skip)]
     pub amplifier_last_seen_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KpaStateTransitionLatency {
+    pub transition_id: u64,
+    pub old_state: String,
+    pub new_state: String,
+    pub kpa_detect_ms: u128,
+    pub shared_state_update_ms: u128,
+    pub first_pgxl_status_after_detect_ms: Option<u128>,
+    pub first_pgxl_status_state: Option<String>,
+    pub first_pgxl_matching_state_ms: Option<u128>,
+    pub first_flex_reannounce_tx_ms: Option<u128>,
+    pub first_flex_status_observed_ms: Option<u128>,
+    pub first_flex_status_state: Option<String>,
+    pub first_flex_matching_state_ms: Option<u128>,
+    pub passed_pgxl_under_2s: Option<bool>,
+    pub passed_flex_under_2s: Option<bool>,
+}
+
+impl KpaStateTransitionLatency {
+    fn new(transition_id: u64, old_state: String, new_state: String, timestamp_ms: u128) -> Self {
+        Self {
+            transition_id,
+            old_state,
+            new_state,
+            kpa_detect_ms: timestamp_ms,
+            shared_state_update_ms: timestamp_ms,
+            first_pgxl_status_after_detect_ms: None,
+            first_pgxl_status_state: None,
+            first_pgxl_matching_state_ms: None,
+            first_flex_reannounce_tx_ms: None,
+            first_flex_status_observed_ms: None,
+            first_flex_status_state: None,
+            first_flex_matching_state_ms: None,
+            passed_pgxl_under_2s: None,
+            passed_flex_under_2s: None,
+        }
+    }
+
+    fn refresh_pass_flags(&mut self) {
+        self.passed_pgxl_under_2s = self.first_pgxl_matching_state_ms.map(|observed| {
+            observed >= self.kpa_detect_ms && observed - self.kpa_detect_ms <= 2_000
+        });
+        self.passed_flex_under_2s = self.first_flex_matching_state_ms.map(|observed| {
+            observed >= self.kpa_detect_ms && observed - self.kpa_detect_ms <= 2_000
+        });
+    }
+}
+
+impl FlexInjectionState {
+    pub fn record_kpa_state_transition(
+        &mut self,
+        old_state: String,
+        new_state: String,
+        timestamp_ms: u128,
+    ) -> KpaStateTransitionLatency {
+        self.kpa_state_transition_count = self.kpa_state_transition_count.saturating_add(1);
+        let transition = KpaStateTransitionLatency::new(
+            self.kpa_state_transition_count,
+            old_state,
+            new_state,
+            timestamp_ms,
+        );
+        self.kpa_state_transition_latencies.push(transition.clone());
+        if self.kpa_state_transition_latencies.len() > 64 {
+            let remove_count = self.kpa_state_transition_latencies.len().saturating_sub(64);
+            self.kpa_state_transition_latencies.drain(0..remove_count);
+        }
+        transition
+    }
+
+    pub fn record_pgxl_status_observed(
+        &mut self,
+        timestamp_ms: u128,
+        state: &str,
+    ) -> Vec<KpaStateTransitionLatency> {
+        let mut updated = Vec::new();
+        for transition in &mut self.kpa_state_transition_latencies {
+            if timestamp_ms < transition.kpa_detect_ms {
+                continue;
+            }
+            let mut changed = false;
+            if transition.first_pgxl_status_after_detect_ms.is_none() {
+                transition.first_pgxl_status_after_detect_ms = Some(timestamp_ms);
+                transition.first_pgxl_status_state = Some(state.to_string());
+                changed = true;
+            }
+            if transition.first_pgxl_matching_state_ms.is_none() && state == transition.new_state {
+                transition.first_pgxl_matching_state_ms = Some(timestamp_ms);
+                changed = true;
+            }
+            if changed {
+                transition.refresh_pass_flags();
+                updated.push(transition.clone());
+            }
+        }
+        updated
+    }
+
+    pub fn record_flex_reannounce_sent(
+        &mut self,
+        timestamp_ms: u128,
+        _state: Option<String>,
+    ) -> Vec<KpaStateTransitionLatency> {
+        let mut updated = Vec::new();
+        for transition in &mut self.kpa_state_transition_latencies {
+            if timestamp_ms < transition.kpa_detect_ms {
+                continue;
+            }
+            if transition.first_flex_reannounce_tx_ms.is_none() {
+                transition.first_flex_reannounce_tx_ms = Some(timestamp_ms);
+                transition.refresh_pass_flags();
+                updated.push(transition.clone());
+            }
+        }
+        updated
+    }
+
+    pub fn record_flex_status_observed(
+        &mut self,
+        timestamp_ms: u128,
+        state: Option<String>,
+    ) -> Vec<KpaStateTransitionLatency> {
+        let Some(state) = state else {
+            return Vec::new();
+        };
+        let mut updated = Vec::new();
+        for transition in &mut self.kpa_state_transition_latencies {
+            if timestamp_ms < transition.kpa_detect_ms {
+                continue;
+            }
+            let mut changed = false;
+            if transition.first_flex_status_observed_ms.is_none() {
+                transition.first_flex_status_observed_ms = Some(timestamp_ms);
+                transition.first_flex_status_state = Some(state.clone());
+                changed = true;
+            }
+            if transition.first_flex_matching_state_ms.is_none() && state == transition.new_state {
+                transition.first_flex_matching_state_ms = Some(timestamp_ms);
+                changed = true;
+            }
+            if changed {
+                transition.refresh_pass_flags();
+                updated.push(transition.clone());
+            }
+        }
+        updated
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -922,5 +1076,51 @@ mod tests {
         assert_eq!(Band::from_frequency_hz(28_500_000), Band::M10);
         assert_eq!(Band::from_frequency_hz(50_300_000), Band::M6);
         assert_eq!(Band::from_frequency_hz(11_000_000), Band::Unknown);
+    }
+
+    #[test]
+    fn kpa_transition_latency_records_first_pgxl_and_flex_events() {
+        let mut flex = FlexInjectionState::default();
+        let transition =
+            flex.record_kpa_state_transition("STANDBY".to_string(), "OPERATE".to_string(), 1_000);
+
+        assert_eq!(transition.transition_id, 1);
+
+        let updates = flex.record_pgxl_status_observed(1_100, "STANDBY");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0]
+                .first_pgxl_status_state
+                .as_deref(),
+            Some("STANDBY")
+        );
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0].first_pgxl_matching_state_ms,
+            None
+        );
+
+        let updates = flex.record_pgxl_status_observed(1_200, "OPERATE");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0].first_pgxl_status_after_detect_ms,
+            Some(1_100)
+        );
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0].first_pgxl_matching_state_ms,
+            Some(1_200)
+        );
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0].passed_pgxl_under_2s,
+            Some(true)
+        );
+
+        let updates = flex.record_flex_reannounce_sent(1_050, Some("OPERATE".to_string()));
+        assert_eq!(updates.len(), 1);
+        let updates = flex.record_flex_status_observed(1_300, Some("OPERATE".to_string()));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0].passed_flex_under_2s,
+            Some(true)
+        );
     }
 }

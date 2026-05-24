@@ -6,6 +6,13 @@ Use this profile for same-PC AetherSDR operation:
 .\target\release\egb.exe baseline-regression-test --config .\config.aethersdr-production.yaml --duration-minutes 3
 ```
 
+Use the fuller live production test when validating Tune and external KPA
+state-reflection timing:
+
+```powershell
+.\target\release\egb.exe aethersdr-production-test --config .\config.aethersdr-production.yaml --duration-minutes 3
+```
+
 The production profile intentionally keeps the known-good AetherSDR path separate from SmartSDR experiments.
 
 ## Required Network Shape
@@ -40,5 +47,15 @@ AetherSDR auto-opens PGXL TCP using the advertised Flex amplifier IP. If EGB is 
 - KAT frequency-follow is disabled.
 - Flex reports amplifier removal.
 - runtime config hashes disagree.
+
+`aethersdr-production-test` adds:
+
+- Tune execution count.
+- KAT/KPA follow confirmation state.
+- per-transition KPA state-reflection latency in
+  `kpa-state-transition-latency.jsonl`.
+- AMP command arrival status. AMP command arrival is reported, not required for
+  PASS, because current AetherSDR/SmartSDR evidence shows no usable
+  operate/standby command is emitted in this mode.
 
 SmartSDR meter/interlock tests must use their own profile and must not replace this AetherSDR baseline.

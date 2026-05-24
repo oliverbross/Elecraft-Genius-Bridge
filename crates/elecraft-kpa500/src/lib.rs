@@ -1102,6 +1102,13 @@ fn parse_kpa500_response(response: &str, amp: &mut bridge_core::AmpState) {
         .and_then(|value| value.strip_suffix(';'))
     {
         parse_fault(raw, response, amp);
+        return;
+    }
+    if let Some(raw) = response
+        .strip_prefix("^SP")
+        .and_then(|value| value.strip_suffix(';'))
+    {
+        parse_fault_speaker(raw, response, amp);
     }
 }
 
@@ -1152,6 +1159,11 @@ fn record_amp_poll_change(
         guard.flex_injection.last_kpa_state_change_detected_at_ms = Some(detected_at_ms);
         guard.flex_injection.last_kpa_state_change_state =
             Some(guard.amp.state.pgxl_state().to_string());
+        let transition = guard.flex_injection.record_kpa_state_transition(
+            before.state.pgxl_state().to_string(),
+            guard.amp.state.pgxl_state().to_string(),
+            detected_at_ms,
+        );
         info!(
             event_id = "kpa_state_changed",
             old_state = ?before.state,
@@ -1176,6 +1188,7 @@ fn record_amp_poll_change(
                 "source_response": response,
             }),
         );
+        append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
         append_evidence_line(
             "amplifier-reannounce.log",
             format!(
@@ -1300,6 +1313,14 @@ fn parse_fault(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
             amp.fault = Some(format!("KPA500 fault {code}"));
         }
         Err(_) => warn_invalid("fault", raw, response),
+    }
+}
+
+fn parse_fault_speaker(raw: &str, response: &str, amp: &mut bridge_core::AmpState) {
+    match raw.trim() {
+        "0" => amp.fault_speaker_on = Some(false),
+        "1" => amp.fault_speaker_on = Some(true),
+        _ => warn_invalid("fault_speaker", raw, response),
     }
 }
 
@@ -1852,6 +1873,19 @@ mod tests {
         parse_kpa500_response("^WS000 000;", &mut amp);
         assert_eq!(amp.forward_power_watts, 0.0);
         assert_eq!(amp.swr, 1.0);
+    }
+
+    #[test]
+    fn parser_records_fault_speaker_without_changing_operate_state() {
+        let mut amp = bridge_core::AmpState::default();
+        parse_kpa500_response("^OS1;", &mut amp);
+        parse_kpa500_response("^SP1;", &mut amp);
+        assert_eq!(amp.fault_speaker_on, Some(true));
+        assert_eq!(amp.state, AmpOperatingState::Operate);
+
+        parse_kpa500_response("^SP0;", &mut amp);
+        assert_eq!(amp.fault_speaker_on, Some(false));
+        assert_eq!(amp.state, AmpOperatingState::Operate);
     }
 
     #[test]

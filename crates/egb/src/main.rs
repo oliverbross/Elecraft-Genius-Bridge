@@ -145,6 +145,12 @@ enum Commands {
         #[arg(long, default_value_t = 3.0)]
         duration_minutes: f64,
     },
+    AethersdrProductionTest {
+        #[arg(long, default_value = "config.aethersdr-production.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 3.0)]
+        duration_minutes: f64,
+    },
     PgxlTriggerStrategyTest {
         #[arg(
             long,
@@ -504,6 +510,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_baseline_regression_test(cfg, config, duration_minutes).await
+        }
+        Commands::AethersdrProductionTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_aethersdr_production_test(cfg, config, duration_minutes).await
         }
         Commands::PgxlTriggerStrategyTest {
             config,
@@ -1927,6 +1941,61 @@ async fn run_baseline_regression_test(
     Ok(())
 }
 
+async fn run_aethersdr_production_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start(
+        "aethersdr-production-test",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    print_mode_banner(&cfg, "aethersdr-production-test");
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(duration_minutes * 60.0);
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = interval.tick() => print_soak_summary(&state, started.elapsed()).await,
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for Ctrl+C")?;
+                break;
+            }
+        }
+    }
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let reflection = amp_state_reflection_latency_markdown(&state).await;
+    tokio::fs::write(
+        evidence.dir().join("amp-state-reflection-latency.md"),
+        reflection,
+    )
+    .await?;
+    let report = aethersdr_production_test_markdown(&cfg, &state).await;
+    tokio::fs::write(evidence.dir().join("aethersdr-production-test.md"), report).await?;
+    let failures = aethersdr_production_test_failures(&cfg, &state).await;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "AETHERSDR_PRODUCTION_TEST_FAILED: {}. Evidence: {}",
+            failures.join("; "),
+            zip.display()
+        );
+    }
+    println!("aethersdr production test PASS: {}", zip.display());
+    Ok(())
+}
+
 async fn run_ecosystem_soak_test(
     cfg: BridgeConfig,
     config_path: PathBuf,
@@ -2889,6 +2958,7 @@ impl EvidenceRun {
             "amplifier-status-lines.log",
             "amplifier-reannounce.log",
             "kpa-state-reannounce.log",
+            "kpa-state-transition-latency.jsonl",
             "amp-state-reflection-latency.md",
             "amp-state-reflection-events.jsonl",
             "amp-button-eligibility-evidence.md",
@@ -2945,6 +3015,7 @@ impl EvidenceRun {
             "startup-advertisement-policy.md",
             "serial-port-open-errors.log",
             "connection-regression-test.md",
+            "aethersdr-production-test.md",
             "pgxl-delayed-connect-analysis.md",
         ] {
             let path = dir.join(file);
@@ -4310,6 +4381,54 @@ async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String
 
 async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
     let guard = state.read().await;
+    let transition_rows = if guard
+        .flex_injection
+        .kpa_state_transition_latencies
+        .is_empty()
+    {
+        "No KPA state transitions were detected during this run.\n".to_string()
+    } else {
+        let mut rows = String::from(
+            "| id | transition | detect ms | first PGXL status | first matching PGXL | first Flex TX | first Flex status | first matching Flex | PGXL <2s | Flex <2s |\n\
+             |---:|---|---:|---|---|---|---|---|---|---|\n",
+        );
+        for transition in &guard.flex_injection.kpa_state_transition_latencies {
+            rows.push_str(&format!(
+                "| {} | {} -> {} | {} | {} `{}` | {} | {} | {} `{}` | {} | {} | {} |\n",
+                transition.transition_id,
+                transition.old_state,
+                transition.new_state,
+                transition.kpa_detect_ms,
+                option_u128_text(transition.first_pgxl_status_after_detect_ms),
+                transition
+                    .first_pgxl_status_state
+                    .as_deref()
+                    .unwrap_or("none"),
+                option_u128_text(transition.first_pgxl_matching_state_ms),
+                option_u128_text(transition.first_flex_reannounce_tx_ms),
+                option_u128_text(transition.first_flex_status_observed_ms),
+                transition
+                    .first_flex_status_state
+                    .as_deref()
+                    .unwrap_or("none"),
+                option_u128_text(transition.first_flex_matching_state_ms),
+                option_bool_text(transition.passed_pgxl_under_2s),
+                option_bool_text(transition.passed_flex_under_2s),
+            ));
+        }
+        rows
+    };
+    let latest_transition = guard.flex_injection.kpa_state_transition_latencies.last();
+    let latest_pgxl_latency = latest_transition.and_then(|transition| {
+        transition
+            .first_pgxl_matching_state_ms
+            .and_then(|end| end.checked_sub(transition.kpa_detect_ms))
+    });
+    let latest_flex_latency = latest_transition.and_then(|transition| {
+        transition
+            .first_flex_matching_state_ms
+            .and_then(|end| end.checked_sub(transition.kpa_detect_ms))
+    });
     format!(
         "# AMP State Reflection Latency\n\n\
         - Current KPA state: `{}`\n\
@@ -4317,8 +4436,8 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
         - Last advertised Flex amp state: `{}`\n\
         - KPA state change detected at ms: `{:?}`\n\
         - KPA state change state: `{}`\n\
-        - First/last PGXL direct status state at ms: `{:?}`\n\
-        - First/last PGXL direct status state: `{}`\n\
+        - Last PGXL direct status state at ms: `{:?}`\n\
+        - Last PGXL direct status state: `{}`\n\
         - Last Flex reannounce sent at ms: `{:?}`\n\
         - Last Flex reannounce state: `{}`\n\
         - KPA last successful poll ms: `{:?}`\n\
@@ -4327,9 +4446,12 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
         - Last reannounce reason: `{}`\n\
         - `sub amplifier all` command count: `{}`\n\n\
         ## Timing Result\n\n\
-        - Estimated KPA-detect to next PGXL-status latency ms: `{}`\n\
-        - Estimated KPA-detect to Flex-reannounce latency ms: `{}`\n\
-        - Target `<2s` passed by PGXL status path: `{}`\n\n\
+        - Latest transition KPA-detect to first matching PGXL-status latency ms: `{}`\n\
+        - Latest transition KPA-detect to first matching Flex-status latency ms: `{}`\n\
+        - Latest transition target `<2s` passed by PGXL status path: `{}`\n\
+        - Latest transition target `<2s` passed by Flex status path: `{}`\n\n\
+        ## Per-Transition Evidence\n\n\
+        {}\n\
         ## Implemented Path\n\n\
         On a KPA `^OS` state change, EGB updates shared amp state immediately, updates \
         PGXL direct status from the same shared state, and runs a bounded Flex refresh burst \
@@ -4385,35 +4507,29 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
             .as_deref()
             .unwrap_or("none"),
         guard.flex_injection.sub_amplifier_all_command_count,
-        latency_text(
-            guard.flex_injection.last_kpa_state_change_detected_at_ms,
-            guard.flex_injection.last_pgxl_status_state_at_ms,
-        ),
-        latency_text(
-            guard.flex_injection.last_kpa_state_change_detected_at_ms,
-            guard.flex_injection.last_flex_reannounce_sent_at_ms,
-        ),
-        latency_passed(
-            guard.flex_injection.last_kpa_state_change_detected_at_ms,
-            guard.flex_injection.last_pgxl_status_state_at_ms,
-            2000,
-        ),
+        latest_pgxl_latency
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        latest_flex_latency
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        option_bool_text(latest_transition.and_then(|transition| transition.passed_pgxl_under_2s)),
+        option_bool_text(latest_transition.and_then(|transition| transition.passed_flex_under_2s)),
+        transition_rows,
     )
 }
 
-fn latency_text(start: Option<u128>, end: Option<u128>) -> String {
-    match (start, end) {
-        (Some(start), Some(end)) if end >= start => (end - start).to_string(),
-        (Some(_), Some(_)) => "out_of_order".to_string(),
-        _ => "unknown".to_string(),
-    }
+fn option_u128_text(value: Option<u128>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn latency_passed(start: Option<u128>, end: Option<u128>, max_ms: u128) -> String {
-    match (start, end) {
-        (Some(start), Some(end)) if end >= start && end - start <= max_ms => "yes".to_string(),
-        (Some(start), Some(end)) if end >= start => "no".to_string(),
-        _ => "unknown".to_string(),
+fn option_bool_text(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
     }
 }
 
@@ -4994,6 +5110,141 @@ async fn baseline_regression_report_markdown(cfg: &BridgeConfig, state: &SharedS
             .config_hash_match
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        if failures.is_empty() { "PASS" } else { "FAIL" },
+        if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join("; ")
+        },
+    )
+}
+
+async fn aethersdr_production_test_failures(
+    cfg: &BridgeConfig,
+    state: &SharedState,
+) -> Vec<String> {
+    let mut failures = baseline_regression_failures(cfg, state).await;
+    let guard = state.read().await;
+    if guard.flex_injection.amplifier_handle_change_count > 1 {
+        failures.push(format!(
+            "amplifier handle churn count {}",
+            guard.flex_injection.amplifier_handle_change_count
+        ));
+    }
+    if guard.controls.tune_executed_count == 0 {
+        failures.push("Tune was not executed; click AetherSDR Tune during the test".to_string());
+    }
+    for transition in &guard.flex_injection.kpa_state_transition_latencies {
+        if transition.passed_pgxl_under_2s == Some(false) {
+            failures.push(format!(
+                "KPA transition {} PGXL reflection exceeded 2s",
+                transition.transition_id
+            ));
+        }
+        if transition.passed_flex_under_2s == Some(false) {
+            failures.push(format!(
+                "KPA transition {} Flex reflection exceeded 2s",
+                transition.transition_id
+            ));
+        }
+    }
+    failures
+}
+
+async fn aethersdr_production_test_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let failures = aethersdr_production_test_failures(cfg, state).await;
+    let guard = state.read().await;
+    let pgxl_delay_ms = match (
+        guard.clients.pgxl_listener_ready_at_ms,
+        guard.clients.pgxl_first_accept_at_ms,
+    ) {
+        (Some(ready), Some(accept)) if accept >= ready => Some(accept - ready),
+        _ => None,
+    };
+    let reflection_summary = if guard
+        .flex_injection
+        .kpa_state_transition_latencies
+        .is_empty()
+    {
+        "no external KPA state transitions observed".to_string()
+    } else {
+        guard
+            .flex_injection
+            .kpa_state_transition_latencies
+            .iter()
+            .map(|transition| {
+                format!(
+                    "#{} {}->{} pgxl={} flex={}",
+                    transition.transition_id,
+                    transition.old_state,
+                    transition.new_state,
+                    option_bool_text(transition.passed_pgxl_under_2s),
+                    option_bool_text(transition.passed_flex_under_2s)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    format!(
+        "# AetherSDR Production Test\n\n\
+        Config: `config.aethersdr-production.yaml`\n\n\
+        | Check | Result |\n\
+        | --- | --- |\n\
+        | PGXL bind IP | `{}` |\n\
+        | Advertised PGXL IP | `{}` |\n\
+        | PGXL delay ms | `{}` |\n\
+        | PGXL session started | {} |\n\
+        | TGXL session started | {} |\n\
+        | Tune executions | {} |\n\
+        | KAT frequency-follow enabled | {} |\n\
+        | KPA band-follow enabled | {} |\n\
+        | KAT follow confirmations | `{}` |\n\
+        | KPA band-follow confirmations | `{}` |\n\
+        | KPA state reflection | `{}` |\n\
+        | Amplifier removed count | {} |\n\
+        | Amplifier handle change count | {} |\n\
+        | AMP command seen | {} |\n\
+        | Last Flex amp set command | `{}` |\n\
+        | Last PGXL control command | `{}` |\n\n\
+        Result: `{}`\n\n\
+        Failures: `{}`\n\n\
+        Note: AMP operate/standby command arrival is reported but not required for PASS because live evidence shows AetherSDR/SmartSDR may not emit a usable command in this mode. EGB can execute KPA500 standby if a command arrives; operate remains RF-risk gated.\n",
+        cfg.server.bind_ip,
+        advertised_pgxl_ip(cfg)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|err| format!("error: {err}")),
+        pgxl_delay_ms
+            .map(|delay| delay.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        guard.controls.tune_executed_count,
+        cfg.kat500.follow_flex_frequency,
+        cfg.kpa500.follow_flex_band,
+        guard
+            .radio_context
+            .last_kat500_follow_confirmation_match
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard
+            .radio_context
+            .last_kpa500_follow_confirmation_match
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        reflection_summary,
+        guard.flex_injection.amplifier_removed_count,
+        guard.flex_injection.amplifier_handle_change_count,
+        guard.controls.aethersdr_button_command_seen,
+        guard
+            .controls
+            .last_flex_amp_set_command
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .controls
+            .last_pgxl_control_command
+            .as_deref()
+            .unwrap_or("none"),
         if failures.is_empty() { "PASS" } else { "FAIL" },
         if failures.is_empty() {
             "none".to_string()
