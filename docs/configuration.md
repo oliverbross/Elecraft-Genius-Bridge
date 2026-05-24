@@ -205,6 +205,8 @@ Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL p
 
 `enable_vita_meter_publish` enables the experimental VITA-49 AMP meter publisher. EGB sends externally-created AMP meter values to the radio UDP VITA port `4991` using meter IDs and stream IDs returned by `meter create`. This is off by default until live SmartSDR meter display is verified.
 
+`allow_mismatched_advertised_ip` is a lab-only override. Operational/evidence starts now fail if `server.bind_ip` is loopback while the advertised PGXL IP is a LAN address, because AetherSDR opens PGXL TCP using the advertised amplifier IP. Use `config.aethersdr-production.yaml` for same-PC AetherSDR (`127.0.0.1` bind and advertised IP), and `config.smartsdr-pgxl-meter-test.yaml` for LAN SmartSDR meter/interlock experiments.
+
 `flex_injection.amplifier_startup_state_policy` controls whether PGXL/Flex amplifier advertisement can happen before KPA500 telemetry is real:
 
 - `wait_for_first_kpa_poll`: recommended for real hardware. EGB waits for `^OS;`, `^TM;`, `^VI;`, and `^FL;` before sending the direct-connect amplifier create with live state.

@@ -139,6 +139,12 @@ enum Commands {
         #[arg(long, default_value_t = 5.0)]
         duration_minutes: f64,
     },
+    BaselineRegressionTest {
+        #[arg(long, default_value = "config.aethersdr-production.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 3.0)]
+        duration_minutes: f64,
+    },
     PgxlTriggerStrategyTest {
         #[arg(
             long,
@@ -490,6 +496,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("flex-runtime-test", cfg, config, duration_minutes).await
+        }
+        Commands::BaselineRegressionTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_baseline_regression_test(cfg, config, duration_minutes).await
         }
         Commands::PgxlTriggerStrategyTest {
             config,
@@ -888,6 +902,15 @@ fn pgxl_advertised_ip_reachability_warning(cfg: &BridgeConfig) -> Option<String>
 fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) -> Result<()> {
     if cfg.flex_injection.enabled {
         let advertised = advertised_pgxl_ip(cfg)?;
+        if mode == BridgeStartMode::Operational
+            && pgxl_advertised_ip_reachability_warning(cfg).is_some()
+            && !cfg.flex_injection.allow_mismatched_advertised_ip
+        {
+            anyhow::bail!(
+                "PGXL_ADVERTISED_IP_UNREACHABLE_FROM_LOOPBACK_BIND: server.bind_ip={} but Flex advertises {advertised}. Same-host AetherSDR must use force_advertised_pgxl_ip=127.0.0.1, or bind EGB to the LAN IP. Set flex_injection.allow_mismatched_advertised_ip=true only for explicit lab experiments.",
+                cfg.server.bind_ip
+            );
+        }
         if advertised.is_loopback() && !loopback_pgxl_ip_is_intentional(cfg) {
             anyhow::bail!(
                 "INVALID_PGXL_ADVERTISED_IP: flex_injection advertises loopback IP {advertised}, but the Flex radio/client path is not local-only. Set flex_injection.amplifier_ip or force_advertised_pgxl_ip to this PC's reachable LAN IP."
@@ -1852,6 +1875,55 @@ async fn run_connection_regression_test(
     );
     drop(guard);
     println!("connection regression bundle: {}", zip.display());
+    Ok(())
+}
+
+async fn run_baseline_regression_test(
+    cfg: BridgeConfig,
+    config_path: PathBuf,
+    duration_minutes: f64,
+) -> Result<()> {
+    if !duration_minutes.is_finite() || duration_minutes <= 0.0 {
+        anyhow::bail!("--duration-minutes must be a finite value greater than 0");
+    }
+    let evidence = EvidenceRun::start(
+        "baseline-regression-test",
+        &config_path,
+        &cfg,
+        std::env::args(),
+    )?;
+    print_mode_banner(&cfg, "baseline-regression-test");
+    let state = start_bridge(&cfg, Some(&config_path), BridgeStartMode::Operational).await?;
+    evidence.write_status("status-start.json", &state).await?;
+    let sampler = evidence.start_status_sampler(state.clone());
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(duration_minutes * 60.0);
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = interval.tick() => print_soak_summary(&state, started.elapsed()).await,
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed waiting for Ctrl+C")?;
+                break;
+            }
+        }
+    }
+    sampler.abort();
+    evidence.write_status("status-end.json", &state).await?;
+    let report = baseline_regression_report_markdown(&cfg, &state).await;
+    tokio::fs::write(evidence.dir().join("baseline-regression-test.md"), report).await?;
+    let failures = baseline_regression_failures(&cfg, &state).await;
+    let zip = evidence.finish(&state, Some(started.elapsed())).await?;
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "BASELINE_REGRESSION_FAILED: {}. Evidence: {}",
+            failures.join("; "),
+            zip.display()
+        );
+    }
+    println!("baseline regression PASS: {}", zip.display());
     Ok(())
 }
 
@@ -4842,6 +4914,95 @@ async fn connection_regression_report_markdown(state: &SharedState) -> String {
     )
 }
 
+async fn baseline_regression_failures(cfg: &BridgeConfig, state: &SharedState) -> Vec<String> {
+    let guard = state.read().await;
+    let mut failures = Vec::new();
+    let pgxl_delay_ms = match (
+        guard.clients.pgxl_listener_ready_at_ms,
+        guard.clients.pgxl_first_accept_at_ms,
+    ) {
+        (Some(ready), Some(accept)) if accept >= ready => Some(accept - ready),
+        _ => None,
+    };
+    if pgxl_delay_ms.map_or(true, |delay| delay > 2_000) {
+        failures.push(format!("PGXL delay >2s ({pgxl_delay_ms:?} ms)"));
+    }
+    if !cfg.kpa500.follow_flex_band {
+        failures.push("KPA band-follow disabled".to_string());
+    }
+    if !cfg.kat500.follow_flex_frequency {
+        failures.push("KAT frequency-follow disabled".to_string());
+    }
+    if guard.flex_injection.amplifier_removed_count > 0 {
+        failures.push(format!(
+            "amplifier removed count {}",
+            guard.flex_injection.amplifier_removed_count
+        ));
+    }
+    if guard.clients.tgxl_session_started_count == 0 {
+        failures.push("TGXL session missing".to_string());
+    }
+    if guard.clients.pgxl_session_started_count == 0 {
+        failures.push("PGXL session missing".to_string());
+    }
+    if guard.config_identity.config_hash_match == Some(false) {
+        failures.push("runtime config hash mismatch".to_string());
+    }
+    failures
+}
+
+async fn baseline_regression_report_markdown(cfg: &BridgeConfig, state: &SharedState) -> String {
+    let failures = baseline_regression_failures(cfg, state).await;
+    let guard = state.read().await;
+    let pgxl_delay_ms = match (
+        guard.clients.pgxl_listener_ready_at_ms,
+        guard.clients.pgxl_first_accept_at_ms,
+    ) {
+        (Some(ready), Some(accept)) if accept >= ready => Some(accept - ready),
+        _ => None,
+    };
+    format!(
+        "# Baseline Regression Test\n\n\
+        Config: `config.aethersdr-production.yaml`\n\n\
+        | Check | Result |\n\
+        | --- | --- |\n\
+        | PGXL bind IP | `{}` |\n\
+        | Advertised PGXL IP | `{}` |\n\
+        | PGXL delay ms | `{}` |\n\
+        | PGXL session started | {} |\n\
+        | TGXL session started | {} |\n\
+        | KPA band-follow enabled | {} |\n\
+        | KAT frequency-follow enabled | {} |\n\
+        | Amplifier removed count | {} |\n\
+        | Runtime config mismatch | `{}` |\n\n\
+        Result: `{}`\n\n\
+        Failures: `{}`\n",
+        cfg.server.bind_ip,
+        advertised_pgxl_ip(cfg)
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|err| format!("error: {err}")),
+        pgxl_delay_ms
+            .map(|delay| delay.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard.clients.pgxl_session_started_count > 0,
+        guard.clients.tgxl_session_started_count > 0,
+        cfg.kpa500.follow_flex_band,
+        cfg.kat500.follow_flex_frequency,
+        guard.flex_injection.amplifier_removed_count,
+        guard
+            .config_identity
+            .config_hash_match
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        if failures.is_empty() { "PASS" } else { "FAIL" },
+        if failures.is_empty() {
+            "none".to_string()
+        } else {
+            failures.join("; ")
+        },
+    )
+}
+
 async fn interlock_registration_audit_markdown(state: &SharedState) -> String {
     let guard = state.read().await;
     let flex = &guard.flex_injection;
@@ -7412,6 +7573,12 @@ mod tests {
         cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
         let warning = pgxl_advertised_ip_reachability_warning(&cfg).unwrap();
         assert!(warning.contains("PGXL_ADVERTISED_IP_UNREACHABLE_FROM_LOOPBACK_BIND"));
+        let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("PGXL_ADVERTISED_IP_UNREACHABLE_FROM_LOOPBACK_BIND"));
+        cfg.flex_injection.allow_mismatched_advertised_ip = true;
+        validate_operational_start_config(&cfg, BridgeStartMode::Operational).unwrap();
     }
 
     #[test]
@@ -7420,6 +7587,7 @@ mod tests {
         cfg.flex_injection.enabled = true;
         cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
         cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
+        cfg.server.bind_ip = "192.168.0.189".to_string();
         cfg.flex_injection.pgxl_connect_assist = true;
         let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
             .unwrap_err()
@@ -7434,6 +7602,7 @@ mod tests {
         cfg.flex_injection.enabled = true;
         cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
         cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
+        cfg.server.bind_ip = "192.168.0.189".to_string();
 
         for profile in ["pgxl_verbose", "old_good_pgxl", "aethersdr_pgxl_direct_lab"] {
             cfg.flex_injection.amplifier_status_profile = profile.to_string();

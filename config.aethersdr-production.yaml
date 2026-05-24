@@ -1,6 +1,5 @@
 server:
-  # SmartSDR/Flex runtime experiment only. Do not use for AetherSDR baseline tests.
-  bind_ip: 192.168.0.189
+  bind_ip: 127.0.0.1
 
 pgxl:
   enabled: true
@@ -78,8 +77,7 @@ flex_injection:
   radio_ip: 192.168.0.199
   radio_port: 4992
   amplifier_ip: 192.168.0.189
-  force_advertised_pgxl_ip: 192.168.0.189
-  allow_mismatched_advertised_ip: false
+  force_advertised_pgxl_ip: 127.0.0.1
   amplifier_port: 9008
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500
@@ -88,11 +86,11 @@ flex_injection:
   full_pgxl_registration: true
   create_meters: true
   create_interlock: true
-  disable_amp_interlock: false
-  enable_runtime_interlock: true
-  enable_vita_meter_publish: true
+  disable_amp_interlock: true
+  enable_runtime_interlock: false
+  enable_vita_meter_publish: false
   amplifier_status_profile: aethersdr_force_direct
-  trace_amplifier_advertisements: true
+  trace_amplifier_advertisements: false
   pgxl_force_operate_advertisement: false
   flex_force_operate_via_radio: false
   pgxl_connect_assist: false
