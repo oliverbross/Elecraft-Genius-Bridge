@@ -87,3 +87,25 @@ It is Flex-side/client-side:
 - If SmartSDR expects a TGXL/tuner object, EGB needs a verified Flex-side tuner
   registration sequence or a real TGXL capture.
 
+## Phase 69 Re-Audit
+
+The SmartSDR interlock API shows that a dynamic Ethernet AMP interlock is not
+only a registration record. The external device is expected to participate in a
+PTT-time `PTT_REQUESTED` -> `interlock ready <id>` exchange. EGB currently
+creates the PGXL interlock and records `state`/`tx_allowed`, but it does not yet
+perform the ready/not-ready exchange. This is a SmartSDR TX/interlock gap and a
+possible "partially operable" signal to clients.
+
+The SmartSDR meter API also confirms that externally created meters can receive
+values through UDP VITA-49 packets on port `4991`. EGB's prior
+`meter_publish_supported=false` should be read as an implementation gap, not as
+an API impossibility.
+
+Phase 69 adds isolated advertisement variants:
+
+- `no_hack_fields`
+- `state_only`
+- `current_hack_fields`
+
+These variants allow live comparison of strict/no-hack, minimal state, and old
+readiness-field behaviour without changing the working default profile.

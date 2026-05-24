@@ -492,14 +492,16 @@ impl FlexInjectionConfig {
         }
         match self.aethersdr_open_trigger_variant.as_str() {
             "current"
+            | "no_hack_fields"
             | "state_only"
             | "state_connected"
             | "state_ip_port"
             | "state_model_ip_port_serial"
-            | "availability_fields" => {}
+            | "availability_fields"
+            | "current_hack_fields" => {}
             other => {
                 return Err(ConfigError::Invalid(format!(
-                    "flex_injection.aethersdr_open_trigger_variant must be one of current, state_only, state_connected, state_ip_port, state_model_ip_port_serial, availability_fields; got {other}"
+                    "flex_injection.aethersdr_open_trigger_variant must be one of current, no_hack_fields, state_only, state_connected, state_ip_port, state_model_ip_port_serial, availability_fields, current_hack_fields; got {other}"
                 )));
             }
         }
@@ -762,11 +764,13 @@ pgxl:
         cfg.flex_injection.amplifier_ip = "192.168.1.50".to_string();
         for variant in [
             "current",
+            "no_hack_fields",
             "state_only",
             "state_connected",
             "state_ip_port",
             "state_model_ip_port_serial",
             "availability_fields",
+            "current_hack_fields",
         ] {
             cfg.flex_injection.aethersdr_open_trigger_variant = variant.to_string();
             cfg.validate().unwrap();

@@ -4950,9 +4950,14 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
         - Last interlock state: `{}`\n\
         - Last interlock reason: `{}`\n\
         - Last interlock tx_allowed: `{}`\n\
+        - Last interlock transition: `{}` at `{}`\n\
+        - Last tx_allowed transition: `{}` at `{}`\n\
         - Empty amplifier field: {} count={}\n\
         - Interlock blocked count: {}\n\n\
         ## Control Eligibility\n\n\
+        - Amplifier operable eligibility: `{}`\n\
+        - Meter availability: `{}`\n\
+        - External control-capable state: `{}`\n\
         - Effective KPA standby: {} ({})\n\
         - Effective KPA operate: {} ({})\n\
         - Last Flex amp set/status command observed: `{}`\n\
@@ -4998,13 +5003,28 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
         flex.last_interlock_tx_allowed
             .map(|value| value.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
+        flex.last_interlock_transition.as_deref().unwrap_or("none"),
+        flex.last_interlock_transition_at_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        flex.last_tx_allowed_transition.as_deref().unwrap_or("none"),
+        flex.last_tx_allowed_transition_at_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
         flex.interlock_amplifier_field_empty,
         flex.interlock_empty_amplifier_count,
         flex.interlock_blocked_count,
+        flex.amplifier_operable_eligibility
+            .as_deref()
+            .unwrap_or("unknown"),
+        flex.meter_availability.as_deref().unwrap_or("unknown"),
+        flex.external_control_capable_state
+            .as_deref()
+            .unwrap_or("unknown"),
         effective.effective_kpa_standby_enabled,
-        effective.kpa_standby_reason,
+        effective.kpa_standby_reason.as_str(),
         effective.effective_kpa_operate_enabled,
-        effective.kpa_operate_reason,
+        effective.kpa_operate_reason.as_str(),
         controls
             .last_flex_amp_set_command
             .as_deref()
@@ -6035,10 +6055,17 @@ async fn status_json(state: &SharedState) -> String {
             "last_interlock_state": guard.flex_injection.last_interlock_state,
             "last_interlock_reason": guard.flex_injection.last_interlock_reason,
             "last_interlock_tx_allowed": guard.flex_injection.last_interlock_tx_allowed,
+            "last_interlock_transition": guard.flex_injection.last_interlock_transition,
+            "last_interlock_transition_at_ms": guard.flex_injection.last_interlock_transition_at_ms,
+            "last_tx_allowed_transition": guard.flex_injection.last_tx_allowed_transition,
+            "last_tx_allowed_transition_at_ms": guard.flex_injection.last_tx_allowed_transition_at_ms,
             "empty_amplifier_field_count": guard.flex_injection.interlock_empty_amplifier_count,
             "interlock_blocked_count": guard.flex_injection.interlock_blocked_count,
             "interlock_created": guard.flex_injection.interlock_handle.is_some(),
             "interlock_disabled_for_test": guard.flex_injection.interlock_disabled_for_test,
+            "amplifier_operable_eligibility": guard.flex_injection.amplifier_operable_eligibility,
+            "meter_availability": guard.flex_injection.meter_availability,
+            "external_control_capable_state": guard.flex_injection.external_control_capable_state,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
         },

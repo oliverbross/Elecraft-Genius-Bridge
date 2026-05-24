@@ -286,6 +286,12 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         guard.flex_injection.meter_publish_last_result = Some(
             "Flex AMP meter objects are created, but no verified client-side meter value publication command is implemented".to_string(),
         );
+        guard.flex_injection.meter_availability =
+            Some("meter handles pending; VITA-49 value publication not active".to_string());
+        guard.flex_injection.amplifier_operable_eligibility =
+            Some("unknown until amplifier/interlock statuses arrive".to_string());
+        guard.flex_injection.external_control_capable_state =
+            Some("unknown until an external client emits amplifier set/state command".to_string());
         guard.lifecycle.flex_session.transition(
             LifecycleState::Connecting,
             "Flex TCP connected; waiting for handle",
@@ -1307,6 +1313,10 @@ impl FlexSession {
                     "meter create accepted; live value publication command remains unverified"
                         .to_string(),
                 );
+                guard.flex_injection.meter_availability = Some(format!(
+                    "{} meter handles created; value publication not active",
+                    guard.flex_injection.meter_handles.len()
+                ));
             }
             PendingKind::InterlockCreate => {
                 if let Some(handle) = response_object_id(body) {
@@ -1465,18 +1475,66 @@ async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) 
         .value("tx_allowed")
         .map(|value| matches!(value, "1" | "true" | "True" | "TRUE"));
     let mut guard = state.write().await;
-    guard.flex_injection.last_interlock_status_line = Some(status.raw.clone());
-    guard.flex_injection.last_interlock_state = if interlock_state.is_empty() {
+    let new_interlock_state = if interlock_state.is_empty() {
         None
     } else {
         Some(interlock_state.to_string())
     };
+    if guard.flex_injection.last_interlock_state != new_interlock_state {
+        let previous = guard
+            .flex_injection
+            .last_interlock_state
+            .as_deref()
+            .unwrap_or("none")
+            .to_string();
+        let next = new_interlock_state.as_deref().unwrap_or("none").to_string();
+        guard.flex_injection.last_interlock_transition = Some(format!("{previous} -> {next}"));
+        guard.flex_injection.last_interlock_transition_at_ms = Some(timestamp_millis());
+    }
+    if guard.flex_injection.last_interlock_tx_allowed != tx_allowed {
+        let previous = guard
+            .flex_injection
+            .last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let next = tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        guard.flex_injection.last_tx_allowed_transition = Some(format!("{previous} -> {next}"));
+        guard.flex_injection.last_tx_allowed_transition_at_ms = Some(timestamp_millis());
+    }
+    guard.flex_injection.last_interlock_status_line = Some(status.raw.clone());
+    guard.flex_injection.last_interlock_state = new_interlock_state;
     guard.flex_injection.last_interlock_reason = if reason.is_empty() {
         None
     } else {
         Some(reason.to_string())
     };
     guard.flex_injection.last_interlock_tx_allowed = tx_allowed;
+    guard.flex_injection.amplifier_operable_eligibility = Some(match tx_allowed {
+        Some(false) => "blocked by Flex interlock tx_allowed=0".to_string(),
+        Some(true) => "Flex interlock reports tx_allowed=1".to_string(),
+        None => "Flex interlock status has no tx_allowed value".to_string(),
+    });
+    guard.flex_injection.external_control_capable_state = Some(format!(
+        "amp_handle={} pgxl_tcp={} interlock_state={} tx_allowed={}",
+        guard
+            .flex_injection
+            .amplifier_handle
+            .as_deref()
+            .unwrap_or("none"),
+        guard.clients.pgxl_connected,
+        guard
+            .flex_injection
+            .last_interlock_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
     if reason == "AMP:PG-XL" && amplifier.is_empty() {
         guard.flex_injection.interlock_amplifier_field_empty = true;
         guard.flex_injection.interlock_empty_amplifier_count = guard
@@ -2347,6 +2405,7 @@ pub fn amplifier_create_command_with_state_for_variant(
     );
     if open_trigger_variant != "current" {
         match open_trigger_variant {
+            "no_hack_fields" => {}
             "state_only" | "state_ip_port" | "state_model_ip_port_serial" => {
                 if let Some(state_value) = state_value {
                     command.push_str(&format!(" state={}", sanitize_token(state_value)));
@@ -2363,6 +2422,12 @@ pub fn amplifier_create_command_with_state_for_variant(
                     command.push_str(&format!(" state={}", sanitize_token(state_value)));
                 }
                 command.push_str(" available=1 tx_ready=1 control=1");
+            }
+            "current_hack_fields" => {
+                if let Some(state_value) = state_value {
+                    command.push_str(&format!(" state={}", sanitize_token(state_value)));
+                }
+                command.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1");
             }
             _ => {}
         }
@@ -2472,6 +2537,19 @@ async fn synthetic_amplifier_status_line(
             "tx_ready".to_string(),
             "control".to_string(),
         ],
+        "current_hack_fields" => vec![
+            "model".to_string(),
+            "ip".to_string(),
+            "port".to_string(),
+            "serial_num".to_string(),
+            "ant".to_string(),
+            "state".to_string(),
+            "connected".to_string(),
+            "configured".to_string(),
+            "enabled".to_string(),
+            "direct".to_string(),
+            "lan".to_string(),
+        ],
         _ => vec![
             "model".to_string(),
             "ip".to_string(),
@@ -2510,6 +2588,8 @@ async fn synthetic_amplifier_status_line(
         line.push_str(" connected=1");
     } else if settings.aethersdr_open_trigger_variant == "availability_fields" {
         line.push_str(" available=1 tx_ready=1 control=1");
+    } else if settings.aethersdr_open_trigger_variant == "current_hack_fields" {
+        line.push_str(" connected=1 configured=1 enabled=1 direct=1 lan=1");
     }
     match settings.amplifier_status_profile.as_str() {
         "pgxl_verbose" | "old_good_pgxl" => {
@@ -3509,6 +3589,65 @@ mod tests {
             "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY"
         );
         validate_amplifier_create_for_profile("aethersdr_operational", &command).unwrap();
+    }
+
+    #[test]
+    fn aethersdr_open_trigger_variants_isolate_hack_fields() {
+        let base_args = (
+            "192.168.0.189".parse().unwrap(),
+            9008,
+            "PowerGeniusXL",
+            "EGB-KPA500",
+            "ANT1:PORTA,ANT2:PORTB",
+            "aethersdr_force_direct",
+            Some("OPERATE"),
+        );
+        let no_hack = amplifier_create_command_with_state_for_variant(
+            base_args.0,
+            base_args.1,
+            base_args.2,
+            base_args.3,
+            base_args.4,
+            base_args.5,
+            "no_hack_fields",
+            base_args.6,
+        );
+        assert_eq!(
+            no_hack,
+            "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB"
+        );
+        assert!(!amplifier_create_has_nonstandard_fields(&no_hack));
+
+        let state_only = amplifier_create_command_with_state_for_variant(
+            base_args.0,
+            base_args.1,
+            base_args.2,
+            base_args.3,
+            base_args.4,
+            base_args.5,
+            "state_only",
+            base_args.6,
+        );
+        assert!(state_only.ends_with(" state=OPERATE"));
+        assert!(!state_only.contains("connected="));
+        assert!(!state_only.contains("direct="));
+
+        let current_hack = amplifier_create_command_with_state_for_variant(
+            base_args.0,
+            base_args.1,
+            base_args.2,
+            base_args.3,
+            base_args.4,
+            base_args.5,
+            "current_hack_fields",
+            base_args.6,
+        );
+        assert!(current_hack.contains("state=OPERATE"));
+        assert!(current_hack.contains("connected=1"));
+        assert!(current_hack.contains("configured=1"));
+        assert!(current_hack.contains("enabled=1"));
+        assert!(current_hack.contains("direct=1"));
+        assert!(current_hack.contains("lan=1"));
     }
 
     #[test]
