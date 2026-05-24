@@ -2960,6 +2960,7 @@ impl EvidenceRun {
             "kpa-state-reannounce.log",
             "kpa-state-transition-latency.jsonl",
             "amp-state-reflection-latency.md",
+            "flex-state-reflection-evidence.md",
             "amp-state-reflection-events.jsonl",
             "amp-button-eligibility-evidence.md",
             "pgxl-direct-selftest.log",
@@ -3177,6 +3178,11 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("amp-state-reflection-latency.md"),
             amp_state_reflection_latency_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("flex-state-reflection-evidence.md"),
+            flex_state_reflection_evidence_markdown(state).await,
         )
         .await?;
         tokio::fs::write(
@@ -4389,12 +4395,12 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
         "No KPA state transitions were detected during this run.\n".to_string()
     } else {
         let mut rows = String::from(
-            "| id | transition | detect ms | first PGXL status | first matching PGXL | first Flex TX | first Flex status | first matching Flex | PGXL <2s | Flex <2s |\n\
-             |---:|---|---:|---|---|---|---|---|---|---|\n",
+            "| id | transition | detect ms | first PGXL status | first matching PGXL | first Flex TX | first Flex status | first matching Flex | Flex result | PGXL <2s | Flex <2s |\n\
+             |---:|---|---:|---|---|---|---|---|---|---|---|\n",
         );
         for transition in &guard.flex_injection.kpa_state_transition_latencies {
             rows.push_str(&format!(
-                "| {} | {} -> {} | {} | {} `{}` | {} | {} | {} `{}` | {} | {} | {} |\n",
+                "| {} | {} -> {} | {} | {} `{}` | {} | {} | {} `{}` | {} | `{}` | {} | {} |\n",
                 transition.transition_id,
                 transition.old_state,
                 transition.new_state,
@@ -4412,6 +4418,10 @@ async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
                     .as_deref()
                     .unwrap_or("none"),
                 option_u128_text(transition.first_flex_matching_state_ms),
+                transition
+                    .flex_state_reflection_result
+                    .as_deref()
+                    .unwrap_or("pending"),
                 option_bool_text(transition.passed_pgxl_under_2s),
                 option_bool_text(transition.passed_flex_under_2s),
             ));
@@ -4531,6 +4541,58 @@ fn option_bool_text(value: Option<bool>) -> &'static str {
         Some(false) => "no",
         None => "unknown",
     }
+}
+
+async fn flex_state_reflection_evidence_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let mut rows = String::from(
+        "| id | transition | EGB emitted amplifier state line | Flex echoed amplifier state line | result |\n\
+         |---:|---|---|---|---|\n",
+    );
+    if guard
+        .flex_injection
+        .kpa_state_transition_latencies
+        .is_empty()
+    {
+        rows.push_str("| - | none | none | none | no KPA state transitions observed |\n");
+    } else {
+        for transition in &guard.flex_injection.kpa_state_transition_latencies {
+            rows.push_str(&format!(
+                "| {} | {} -> {} | `{}` | `{}` | `{}` |\n",
+                transition.transition_id,
+                transition.old_state,
+                transition.new_state,
+                markdown_cell_text(
+                    transition
+                        .first_flex_reannounce_line
+                        .as_deref()
+                        .unwrap_or("none")
+                ),
+                markdown_cell_text(
+                    transition
+                        .first_flex_status_line
+                        .as_deref()
+                        .unwrap_or("none")
+                ),
+                transition
+                    .flex_state_reflection_result
+                    .as_deref()
+                    .unwrap_or("pending")
+            ));
+        }
+    }
+    format!(
+        "# Flex State Reflection Evidence\n\n\
+        This file compares the EGB-emitted amplifier status line against the next Flex amplifier status line observed after each KPA `^OS` transition.\n\n\
+        {}\n\
+        ## Interpretation\n\n\
+        If EGB emits `state=OPERATE` but Flex echoes `state=STANDBY`, the direct PGXL status path is correct and the remaining Flex-side mismatch is radio-side rewriting/ownership of the amplifier operate field. EGB should not treat that as stale shared state unless the emitted line itself is wrong.\n",
+        rows
+    )
+}
+
+fn markdown_cell_text(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
 }
 
 async fn full_aethersdr_functional_test_markdown(state: &SharedState) -> String {
@@ -5174,12 +5236,16 @@ async fn aethersdr_production_test_markdown(cfg: &BridgeConfig, state: &SharedSt
             .iter()
             .map(|transition| {
                 format!(
-                    "#{} {}->{} pgxl={} flex={}",
+                    "#{} {}->{} pgxl={} flex={} flex_result={}",
                     transition.transition_id,
                     transition.old_state,
                     transition.new_state,
                     option_bool_text(transition.passed_pgxl_under_2s),
-                    option_bool_text(transition.passed_flex_under_2s)
+                    option_bool_text(transition.passed_flex_under_2s),
+                    transition
+                        .flex_state_reflection_result
+                        .as_deref()
+                        .unwrap_or("pending")
                 )
             })
             .collect::<Vec<_>>()

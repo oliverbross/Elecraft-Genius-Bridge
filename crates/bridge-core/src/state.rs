@@ -698,9 +698,12 @@ pub struct KpaStateTransitionLatency {
     pub first_pgxl_status_state: Option<String>,
     pub first_pgxl_matching_state_ms: Option<u128>,
     pub first_flex_reannounce_tx_ms: Option<u128>,
+    pub first_flex_reannounce_line: Option<String>,
     pub first_flex_status_observed_ms: Option<u128>,
     pub first_flex_status_state: Option<String>,
+    pub first_flex_status_line: Option<String>,
     pub first_flex_matching_state_ms: Option<u128>,
+    pub flex_state_reflection_result: Option<String>,
     pub passed_pgxl_under_2s: Option<bool>,
     pub passed_flex_under_2s: Option<bool>,
 }
@@ -717,9 +720,12 @@ impl KpaStateTransitionLatency {
             first_pgxl_status_state: None,
             first_pgxl_matching_state_ms: None,
             first_flex_reannounce_tx_ms: None,
+            first_flex_reannounce_line: None,
             first_flex_status_observed_ms: None,
             first_flex_status_state: None,
+            first_flex_status_line: None,
             first_flex_matching_state_ms: None,
+            flex_state_reflection_result: None,
             passed_pgxl_under_2s: None,
             passed_flex_under_2s: None,
         }
@@ -789,6 +795,7 @@ impl FlexInjectionState {
         &mut self,
         timestamp_ms: u128,
         _state: Option<String>,
+        line: Option<String>,
     ) -> Vec<KpaStateTransitionLatency> {
         let mut updated = Vec::new();
         for transition in &mut self.kpa_state_transition_latencies {
@@ -797,6 +804,7 @@ impl FlexInjectionState {
             }
             if transition.first_flex_reannounce_tx_ms.is_none() {
                 transition.first_flex_reannounce_tx_ms = Some(timestamp_ms);
+                transition.first_flex_reannounce_line = line.clone();
                 transition.refresh_pass_flags();
                 updated.push(transition.clone());
             }
@@ -808,6 +816,7 @@ impl FlexInjectionState {
         &mut self,
         timestamp_ms: u128,
         state: Option<String>,
+        line: Option<String>,
     ) -> Vec<KpaStateTransitionLatency> {
         let Some(state) = state else {
             return Vec::new();
@@ -821,10 +830,18 @@ impl FlexInjectionState {
             if transition.first_flex_status_observed_ms.is_none() {
                 transition.first_flex_status_observed_ms = Some(timestamp_ms);
                 transition.first_flex_status_state = Some(state.clone());
+                transition.first_flex_status_line = line.clone();
+                if state != transition.new_state {
+                    transition.flex_state_reflection_result = Some(format!(
+                        "flex_echoed_{}_while_egb_expected_{}",
+                        state, transition.new_state
+                    ));
+                }
                 changed = true;
             }
             if transition.first_flex_matching_state_ms.is_none() && state == transition.new_state {
                 transition.first_flex_matching_state_ms = Some(timestamp_ms);
+                transition.flex_state_reflection_result = Some("matched".to_string());
                 changed = true;
             }
             if changed {
@@ -1114,13 +1131,59 @@ mod tests {
             Some(true)
         );
 
-        let updates = flex.record_flex_reannounce_sent(1_050, Some("OPERATE".to_string()));
+        let updates = flex.record_flex_reannounce_sent(
+            1_050,
+            Some("OPERATE".to_string()),
+            Some("amplifier 1 state=OPERATE".to_string()),
+        );
         assert_eq!(updates.len(), 1);
-        let updates = flex.record_flex_status_observed(1_300, Some("OPERATE".to_string()));
+        let updates = flex.record_flex_status_observed(
+            1_300,
+            Some("OPERATE".to_string()),
+            Some("S1|amplifier 1 state=OPERATE".to_string()),
+        );
         assert_eq!(updates.len(), 1);
         assert_eq!(
             flex.kpa_state_transition_latencies[0].passed_flex_under_2s,
             Some(true)
+        );
+        assert_eq!(
+            flex.kpa_state_transition_latencies[0]
+                .flex_state_reflection_result
+                .as_deref(),
+            Some("matched")
+        );
+    }
+
+    #[test]
+    fn kpa_transition_latency_records_flex_rewrite_evidence() {
+        let mut flex = FlexInjectionState::default();
+        flex.record_kpa_state_transition("STANDBY".to_string(), "OPERATE".to_string(), 1_000);
+
+        flex.record_flex_reannounce_sent(
+            1_050,
+            Some("OPERATE".to_string()),
+            Some("amplifier 1 state=OPERATE".to_string()),
+        );
+        flex.record_flex_status_observed(
+            1_075,
+            Some("STANDBY".to_string()),
+            Some("S1|amplifier 1 state=STANDBY".to_string()),
+        );
+
+        let transition = &flex.kpa_state_transition_latencies[0];
+        assert_eq!(
+            transition.first_flex_reannounce_line.as_deref(),
+            Some("amplifier 1 state=OPERATE")
+        );
+        assert_eq!(
+            transition.first_flex_status_line.as_deref(),
+            Some("S1|amplifier 1 state=STANDBY")
+        );
+        assert_eq!(transition.first_flex_matching_state_ms, None);
+        assert_eq!(
+            transition.flex_state_reflection_result.as_deref(),
+            Some("flex_echoed_STANDBY_while_egb_expected_OPERATE")
         );
     }
 }

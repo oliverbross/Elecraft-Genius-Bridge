@@ -652,6 +652,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     )
                     .await?;
                 }
+                let mut reannounce_line = None;
                 if startup_trigger.logs_status_reannounce() {
                     let line = if startup_trigger == PgxlStartupTriggerStrategy::ReannounceCreateStyleStatus {
                         settings.amplifier_create_command()
@@ -672,6 +673,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     )
                     .await;
                     append_flex_log_line("amplifier-status-lines.log", &line);
+                    reannounce_line = Some(line.clone());
                     append_evidence_line(
                         "amplifier-reannounce.log",
                         format!(
@@ -680,7 +682,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                             startup_trigger.as_str()
                         ),
                     );
-                    append_evidence_line("amplifier-status-lines.log", line);
+                    append_evidence_line("amplifier-status-lines.log", &line);
                 }
                 {
                     let mut guard = state.write().await;
@@ -693,6 +695,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     let transition_updates = guard.flex_injection.record_flex_reannounce_sent(
                         sent_at_ms,
                         advertised_state,
+                        reannounce_line,
                     );
                     guard.flex_injection.amplifier_direct_connect_expected =
                         Some(!settings.amplifier_ip.is_loopback());
@@ -761,7 +764,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     "amplifier-reannounce.log",
                     format!("periodic_keepalive_reannounce reason=prevent_flex_amp_expiry {line}"),
                 );
-                append_evidence_line("amplifier-status-lines.log", line);
+                append_evidence_line("amplifier-status-lines.log", &line);
                 {
                     let mut guard = state.write().await;
                     guard.flex_injection.amplifier_reannounce_count =
@@ -777,6 +780,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     let transition_updates = guard.flex_injection.record_flex_reannounce_sent(
                         sent_at_ms,
                         advertised_state,
+                        Some(line.clone()),
                     );
                     guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
                         guard.clients.pgxl_session_started_count > 0;
@@ -852,7 +856,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                             requested_reannounce_burst_remaining.saturating_sub(1)
                         ),
                     );
-                    append_evidence_line("amplifier-status-lines.log", line);
+                    append_evidence_line("amplifier-status-lines.log", &line);
                     {
                         let mut guard = state.write().await;
                         guard.flex_injection.amplifier_reannounce_count =
@@ -865,6 +869,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         let transition_updates = guard.flex_injection.record_flex_reannounce_sent(
                             sent_at_ms,
                             advertised_state,
+                            Some(line.clone()),
                         );
                         guard.flex_injection.amplifier_direct_connect_expected =
                             Some(!settings.amplifier_ip.is_loopback());
@@ -1528,7 +1533,7 @@ async fn record_amplifier_pairing_status(
         .split_whitespace()
         .find_map(|token| token.strip_prefix("state="))
         .map(str::to_string);
-    guard.flex_injection.last_amplifier_status_line = Some(line);
+    guard.flex_injection.last_amplifier_status_line = Some(line.clone());
     guard
         .flex_injection
         .amplifier_object_seen_at_ms
@@ -1548,9 +1553,11 @@ async fn record_amplifier_pairing_status(
         guard.flex_injection.pgxl_connect_assist_triggered_tcp =
             guard.clients.pgxl_session_started_count > 0;
     }
-    let updates = guard
-        .flex_injection
-        .record_flex_status_observed(timestamp_ms, observed_state);
+    let updates = guard.flex_injection.record_flex_status_observed(
+        timestamp_ms,
+        observed_state,
+        Some(line.clone()),
+    );
     drop(guard);
     for transition in updates {
         append_evidence_json("kpa-state-transition-latency.jsonl", &transition);
