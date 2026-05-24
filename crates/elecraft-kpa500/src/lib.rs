@@ -1179,6 +1179,17 @@ fn record_amp_poll_change(
                 before.state, guard.amp.state
             ),
         );
+        append_evidence_line(
+            "kpa-state-reannounce.log",
+            format!(
+                "kpa_state_changed timestamp_ms={} old_state={:?} new_state={:?} old_operate={} new_operate={} burst_schedule_ms=0,250,500,1000,1500,2000 source_response={response}",
+                unix_timestamp_ms(),
+                before.state,
+                guard.amp.state,
+                before.operate,
+                guard.amp.operate
+            ),
+        );
     } else {
         debug!(
             event_id = "kpa_telemetry_changed",

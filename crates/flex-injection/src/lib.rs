@@ -231,6 +231,16 @@ fn arm_startup_burst(
     true
 }
 
+fn requested_reannounce_delay(remaining_after_send: u8) -> Duration {
+    match remaining_after_send {
+        // State-change burst schedule after the immediate send:
+        // +250 ms, +500 ms, +1000 ms, +1500 ms, +2000 ms.
+        5 | 4 => Duration::from_millis(250),
+        1..=3 => Duration::from_millis(500),
+        _ => Duration::from_millis(100),
+    }
+}
+
 async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Result<()> {
     info!(
         radio = %settings.radio_addr,
@@ -675,12 +685,15 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     settings,
                     &state,
                     "amplifier_status",
-                    "periodic_reannounce",
+                    "periodic_keepalive_reannounce",
                     &line,
                 )
                 .await;
                 append_flex_log_line("amplifier-status-lines.log", &line);
-                append_evidence_line("amplifier-reannounce.log", line.clone());
+                append_evidence_line(
+                    "amplifier-reannounce.log",
+                    format!("periodic_keepalive_reannounce reason=prevent_flex_amp_expiry {line}"),
+                );
                 append_evidence_line("amplifier-status-lines.log", line);
                 {
                     let mut guard = state.write().await;
@@ -689,14 +702,14 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     guard.flex_injection.amplifier_direct_connect_expected =
                         Some(!settings.amplifier_ip.is_loopback());
                     guard.flex_injection.last_amplifier_reannounce_reason =
-                        Some("periodic_sub_amplifier_all".to_string());
+                        Some("periodic_keepalive_reannounce".to_string());
                     guard.flex_injection.amplifier_pgxl_tcp_attempted_after_status =
                         guard.clients.pgxl_session_started_count > 0;
                 }
                 info!(
                     event_id = "amplifier_presence_refreshed",
                     profile = %settings.amplifier_status_profile,
-                    "Flex amplifier presence refresh query sent"
+                    "Flex amplifier presence keepalive refresh query sent"
                 );
             }
             amplifier_reannounce_timer.as_mut().reset(tokio::time::Instant::now() + settings.amplifier_reannounce_interval);
@@ -716,10 +729,12 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                         None
                     }
                 } {
-                    requested_reannounce_burst_remaining = if reason == "kpa_state_changed" { 4 } else { 1 };
+                    requested_reannounce_burst_remaining =
+                        if reason == "kpa_state_changed" { 6 } else { 1 };
                     requested_reannounce_burst_reason = Some(reason);
                 }
 
+                let mut next_requested_reannounce_delay = Duration::from_millis(100);
                 if requested_reannounce_burst_remaining > 0 {
                     let reason = requested_reannounce_burst_reason
                         .clone()
@@ -778,47 +793,39 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     );
                     requested_reannounce_burst_remaining =
                         requested_reannounce_burst_remaining.saturating_sub(1);
+                    next_requested_reannounce_delay =
+                        requested_reannounce_delay(requested_reannounce_burst_remaining);
                     if requested_reannounce_burst_remaining == 0 {
                         requested_reannounce_burst_reason = None;
                     }
                 }
+                amplifier_requested_reannounce_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + next_requested_reannounce_delay);
+            } else {
+                amplifier_requested_reannounce_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_millis(100));
             }
-            amplifier_requested_reannounce_timer
-                .as_mut()
-                .reset(tokio::time::Instant::now() + Duration::from_millis(250));
         }
         () = &mut tuner_refresh_timer, if settings.tuner_presence_refresh => {
             if post_amplifier_registration_sent && !amplifier_startup_burst_active {
-                send_tracked_command(
-                    &mut writer,
-                    &mut session,
-                    &state,
-                    &mut next_seq,
-                    PendingCommand::new(
-                        "tuner_presence_refresh",
-                        "sub amplifier all",
-                        PendingKind::TunerPresenceRefresh,
-                    ),
-                )
-                .await?;
                 {
                     let mut guard = state.write().await;
-                    guard.flex_injection.tuner_registration_refresh_count =
-                        guard.flex_injection.tuner_registration_refresh_count.saturating_add(1);
-                    guard.flex_injection.tuner_reannounce_count =
-                        guard.flex_injection.tuner_reannounce_count.saturating_add(1);
+                    guard.flex_injection.last_tuner_disappearance_reason =
+                        Some("periodic_tuner_refresh_skipped_avoid_duplicate_subscriptions".to_string());
                 }
                 append_evidence_json(
                     "disconnect-events.jsonl",
                     &serde_json::json!({
-                        "event": "tuner_presence_refreshed",
+                        "event": "tuner_presence_refresh_skipped",
                         "source": "flex_injection",
-                        "command": "sub amplifier all",
+                        "reason": "avoid_duplicate_subscriptions",
                     }),
                 );
-                info!(
-                    event_id = "tuner_presence_refreshed",
-                    "Flex tuner presence refresh query sent"
+                debug!(
+                    event_id = "tuner_presence_refresh_skipped",
+                    "Skipped periodic tuner sub amplifier all; direct TGXL state remains on TCP 9010"
                 );
             }
             tuner_refresh_timer.as_mut().reset(tokio::time::Instant::now() + settings.tuner_refresh_interval);
@@ -1312,7 +1319,7 @@ impl FlexSession {
                 let mut guard = state.write().await;
                 guard.flex_injection.keepalive_enable_accepted = true;
             }
-            PendingKind::AmplifierReannounce | PendingKind::TunerPresenceRefresh => {}
+            PendingKind::AmplifierReannounce => {}
             PendingKind::Ping => {
                 let mut guard = state.write().await;
                 if code == "0" {
@@ -1837,7 +1844,6 @@ enum PendingKind {
     AmplifierReannounce,
     AmplifierOperateLab,
     PgxlConnectAssist,
-    TunerPresenceRefresh,
     Ping,
 }
 

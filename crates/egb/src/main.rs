@@ -161,6 +161,12 @@ enum Commands {
         #[arg(long, default_value_t = 5.0)]
         duration_minutes: f64,
     },
+    AmpStateReflectionTest {
+        #[arg(long, default_value = "config.aethersdr-kpa-band-follow-test.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        duration_minutes: f64,
+    },
     ComparePgxlProfiles {
         #[arg(long, default_value = "config.yaml")]
         config: PathBuf,
@@ -507,6 +513,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_band_follow_test(cfg, config, duration_minutes).await
+        }
+        Commands::AmpStateReflectionTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test("amp-state-reflection-test", cfg, config, duration_minutes).await
         }
         Commands::ComparePgxlProfiles {
             config,
@@ -2786,6 +2800,9 @@ impl EvidenceRun {
             "tgxl-protocol.log",
             "amplifier-status-lines.log",
             "amplifier-reannounce.log",
+            "kpa-state-reannounce.log",
+            "amp-state-reflection-latency.md",
+            "amp-button-eligibility-evidence.md",
             "pgxl-direct-selftest.log",
             "pgxl-trigger-analysis.md",
             "pgxl-pairing-analysis.md",
@@ -2988,6 +3005,16 @@ impl EvidenceRun {
         tokio::fs::write(
             self.dir.join("aethersdr-operational-test.md"),
             aethersdr_operational_test_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("amp-button-eligibility-evidence.md"),
+            amp_button_eligibility_evidence_markdown(state).await,
+        )
+        .await?;
+        tokio::fs::write(
+            self.dir.join("amp-state-reflection-latency.md"),
+            amp_state_reflection_latency_markdown(state).await,
         )
         .await?;
         tokio::fs::write(
@@ -4101,6 +4128,127 @@ async fn aethersdr_operational_test_markdown(state: &SharedState) -> String {
             .last_flex_amp_set_command
             .as_deref()
             .unwrap_or("none"),
+    )
+}
+
+async fn amp_button_eligibility_evidence_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    let pgxl_status = serde_json::to_string(&serde_json::json!({
+        "state": advertised_amp_state_for_status(&guard.amp),
+        "temp": guard.amp.temperature_c,
+        "id": guard.amp.pa_current_amps,
+        "vac": pgxl_vac_value_for_status(&guard.amp),
+        "meffa": pgxl_meffa_for_status(&guard.amp),
+    }))
+    .unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "# AMP Button Eligibility Evidence\n\n\
+        ## Runtime State\n\n\
+        - Flex amplifier handle known: `{}`\n\
+        - Last advertised amplifier status line: `{}`\n\
+        - Last PGXL direct status equivalent: `{}`\n\
+        - Interlock state: `{}`\n\
+        - Interlock tx_allowed: `{}`\n\
+        - PGXL connected: `{}`\n\
+        - KPA real state: `{}`\n\
+        - Flex amp set command arrived: `{}`\n\
+        - PGXL direct control command arrived: `{}`\n\
+        - Any AetherSDR button command seen: `{}`\n\n\
+        ## Source Path\n\n\
+        The inspected AetherSDR source shows the Amp applet button is command-capable: \
+        `AmpApplet::setState()` shows the button, clicking it emits `operateToggled(bool)`, \
+        and `MainWindow` sends `amplifier set <handle> operate=<0|1>` only when \
+        `RadioModel::ampHandle()` is non-empty. Direct PGXL TCP is telemetry-only for \
+        `info` and `status` in the inspected source.\n\n\
+        If both control logs remain empty while `amplifier_handle` is present, the click did \
+        not reach that source path in the installed AetherSDR build or the user action was \
+        on a display/peripheral UI element rather than the Amp applet button.\n",
+        guard
+            .flex_injection
+            .amplifier_handle
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_amplifier_status_line
+            .as_deref()
+            .unwrap_or("none"),
+        pgxl_status,
+        guard
+            .flex_injection
+            .last_interlock_state
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_interlock_tx_allowed
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        guard.clients.pgxl_connected,
+        guard.amp.state.pgxl_state(),
+        guard
+            .controls
+            .last_flex_amp_set_command
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .controls
+            .last_pgxl_control_command
+            .as_deref()
+            .unwrap_or("none"),
+        guard.controls.aethersdr_button_command_seen,
+    )
+}
+
+async fn amp_state_reflection_latency_markdown(state: &SharedState) -> String {
+    let guard = state.read().await;
+    format!(
+        "# AMP State Reflection Latency\n\n\
+        - Current KPA state: `{}`\n\
+        - Last advertised PGXL state: `{}`\n\
+        - Last advertised Flex amp state: `{}`\n\
+        - KPA last successful poll ms: `{:?}`\n\
+        - Amplifier reannounce requests: `{}`\n\
+        - Last reannounce request reason: `{}`\n\
+        - Last reannounce reason: `{}`\n\
+        - `sub amplifier all` command count: `{}`\n\n\
+        ## Implemented Path\n\n\
+        On a KPA `^OS` state change, EGB updates shared amp state immediately, updates \
+        PGXL direct status from the same shared state, and runs a bounded Flex refresh burst \
+        at approximately `0, 250, 500, 1000, 1500, 2000 ms`. The burst uses `sub amplifier all` \
+        because no separate verified Flex client command for pushing an external amplifier \
+        status update has been proven. A single periodic amplifier keepalive refresh remains \
+        because live testing showed Flex removes the object without it; the duplicate tuner \
+        refresh stream is skipped.\n\n\
+        ## Verification\n\n\
+        Use `advertised-state-history.jsonl`, `kpa-state-reannounce.log`, `flex-tx.log`, \
+        and `pgxl-protocol.log` in the same evidence bundle to measure the client-visible path. \
+        AetherSDR direct PGXL polling should see the new direct status on the next `status` poll \
+        after the KPA poll cycle detects the change.\n",
+        guard.amp.state.pgxl_state(),
+        guard
+            .flex_injection
+            .last_advertised_pgxl_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        guard
+            .flex_injection
+            .last_advertised_flex_amp_state
+            .as_deref()
+            .unwrap_or("unknown"),
+        system_time_ms(guard.amp.last_successful_poll_at),
+        guard.flex_injection.amplifier_reannounce_request_count,
+        guard
+            .flex_injection
+            .last_amplifier_reannounce_request_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard
+            .flex_injection
+            .last_amplifier_reannounce_reason
+            .as_deref()
+            .unwrap_or("none"),
+        guard.flex_injection.sub_amplifier_all_command_count,
     )
 }
 
@@ -6874,6 +7022,7 @@ mod tests {
         assert!(names.contains(&"pgxl-trigger-strategy-test".to_string()));
         assert!(names.contains(&"aethersdr-open-trigger-test".to_string()));
         assert!(names.contains(&"band-follow-test".to_string()));
+        assert!(names.contains(&"amp-state-reflection-test".to_string()));
         assert!(names.contains(&"replay-session".to_string()));
         assert!(names.contains(&"simulate-control".to_string()));
         assert!(names.contains(&"simulate-pgxl-control".to_string()));
