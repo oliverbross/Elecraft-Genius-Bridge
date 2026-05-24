@@ -79,7 +79,11 @@ flex_injection:
   radio_ip: 192.168.0.199
   radio_port: 4992
   amplifier_ip: 192.168.0.189
-  force_advertised_pgxl_ip: 192.168.0.189
+  # AetherSDR is running on this Windows host for the band-follow test, and the
+  # PGXL/TGXL listeners are bound to loopback. The Flex amplifier status must
+  # therefore advertise loopback too; advertising the LAN IP makes AetherSDR's
+  # Flex-triggered PGXL auto-open try the wrong endpoint and fall back later.
+  force_advertised_pgxl_ip: 127.0.0.1
   amplifier_port: 9008
   amplifier_model: PowerGeniusXL
   serial: EGB-KPA500

@@ -71,6 +71,12 @@ amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-K
 
 The current compatibility profile uses `amplifier_status_profile: aethersdr_minimal`. The locked last-known-good profile uses `aethersdr_force_direct` because that is the most recent evidence-backed path where PGXL and TGXL both connected. Phase 49 safeguards still apply: KPA/KAT preflight must pass, the advertised IP must be reachable from the radio/client path, and `pgxl_connect_assist` remains off.
 
+For Oliver's current same-host Windows AetherSDR tests, the PGXL/TGXL listeners
+are bound to `127.0.0.1`. The matching advertised PGXL IP must also be
+`127.0.0.1`; otherwise AetherSDR's immediate Flex amplifier trigger attempts the
+LAN IP while EGB is listening only on loopback. Use the LAN IP only when EGB is
+also bound to that LAN IP and AetherSDR is expected to connect over the LAN.
+
 ## Strict Official PGXL Audit
 
 Config:

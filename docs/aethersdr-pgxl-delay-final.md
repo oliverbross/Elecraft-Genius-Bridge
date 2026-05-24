@@ -15,7 +15,13 @@ Known facts:
 - Latest PGXL session: hundreds of status commands, `0` parse failures.
 - `amplifier_removed_count=0`.
 
-Conclusion: EGB is ready before AetherSDR opens TCP. The remaining delay is AetherSDR-side direct-PGXL open timing, gating, or retry behaviour.
+Conclusion: EGB is ready before AetherSDR opens TCP. Phase 65 found the missing
+piece: in the latest evidence the PGXL listener was bound to `127.0.0.1:9008`
+but the Flex amplifier status advertised `192.168.0.189`. AetherSDR's automatic
+PGXL path uses the advertised Flex amplifier IP, so the immediate auto-open was
+pointed at an address where this EGB instance was not listening. The later
+successful PGXL session came from AetherSDR's local/manual peripheral path, which
+used `127.0.0.1`.
 
 The inspected AetherSDR source appears intended to call `connectToPgxl(ampIp)` immediately from `RadioModel::amplifierChanged(true)` when `ampIp` is non-empty. If the installed binary still waits tens of seconds, the next practical fix is an AetherSDR-side patch or logging run.
 
@@ -27,4 +33,8 @@ Minimal AetherSDR patch direction:
 - If `ampIp` is non-empty and PGXL direct is not connected, call `connectToPgxl(ampIp)` immediately.
 - Avoid waiting for any delayed retry timer when the radio-side amplifier object already contains a reachable IP.
 
-EGB should not add destructive or fake lifecycle hacks for this delay. The EGB PGXL server is already available and stable.
+EGB should not add destructive or fake lifecycle hacks for this delay. The fix is
+address consistency:
+
+- same-host AetherSDR: bind PGXL to `127.0.0.1` and advertise `127.0.0.1`;
+- LAN AetherSDR: bind PGXL to the Windows LAN IP and advertise that LAN IP.

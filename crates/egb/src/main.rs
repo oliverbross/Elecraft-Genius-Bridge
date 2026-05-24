@@ -831,19 +831,30 @@ fn advertised_pgxl_ip(cfg: &BridgeConfig) -> Result<IpAddr> {
 }
 
 fn loopback_pgxl_ip_is_intentional(cfg: &BridgeConfig) -> bool {
-    let server_loopback = cfg
-        .server
+    // The Flex radio reports this address, but the direct PGXL/TGXL TCP client is
+    // AetherSDR. For a same-host Windows AetherSDR setup, a loopback advertised
+    // PGXL IP is intentional even when the Flex radio itself is on the LAN.
+    cfg.server
         .bind_ip
         .parse::<IpAddr>()
         .map(|ip| ip.is_loopback())
-        .unwrap_or(false);
-    let radio_loopback = cfg
-        .flex_injection
-        .radio_ip
-        .parse::<IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false);
-    server_loopback && radio_loopback
+        .unwrap_or(false)
+}
+
+fn pgxl_advertised_ip_reachability_warning(cfg: &BridgeConfig) -> Option<String> {
+    if !cfg.flex_injection.enabled || !cfg.pgxl.enabled {
+        return None;
+    }
+    let bind_ip = cfg.server.bind_ip.parse::<IpAddr>().ok()?;
+    let advertised = advertised_pgxl_ip(cfg).ok()?;
+    if bind_ip.is_loopback() && !advertised.is_loopback() {
+        Some(format!(
+            "PGXL_ADVERTISED_IP_UNREACHABLE_FROM_LOOPBACK_BIND: PGXL listener is bound to {bind_ip}:{} but Flex advertises {advertised}:{}. AetherSDR auto-open uses the advertised amplifier IP, so same-host AetherSDR should advertise 127.0.0.1, or EGB should bind to the LAN IP.",
+            cfg.pgxl.port, cfg.flex_injection.amplifier_port
+        ))
+    } else {
+        None
+    }
 }
 
 fn validate_operational_start_config(cfg: &BridgeConfig, mode: BridgeStartMode) -> Result<()> {
@@ -903,6 +914,15 @@ async fn run_startup_preflights(
     mode: BridgeStartMode,
 ) -> Result<()> {
     validate_operational_start_config(cfg, mode)?;
+    if let Some(warning) = pgxl_advertised_ip_reachability_warning(cfg) {
+        warn!(
+            event_id = "pgxl_advertised_ip_reachability_warning",
+            warning = %warning,
+            "PGXL advertised IP does not match listener reachability"
+        );
+        append_evidence_line("warnings-errors.log", warning.clone());
+        append_evidence_line("pgxl-delayed-connect-analysis.md", format!("- {warning}"));
+    }
     if cfg.kpa500.enabled && !cfg.kpa500.mock && (cfg.pgxl.enabled || cfg.flex_injection.enabled) {
         run_kpa_startup_preflight(cfg, state, policy).await?;
     }
@@ -6963,7 +6983,7 @@ mod tests {
         cfg.flex_injection.enabled = true;
         cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
         cfg.flex_injection.amplifier_ip = "127.0.0.1".to_string();
-        cfg.server.bind_ip = "127.0.0.1".to_string();
+        cfg.server.bind_ip = "192.168.0.189".to_string();
         let err = validate_operational_start_config(&cfg, BridgeStartMode::Operational)
             .unwrap_err()
             .to_string();
@@ -6974,10 +6994,21 @@ mod tests {
     fn operational_start_allows_loopback_pgxl_ip_for_local_radio_path() {
         let mut cfg = BridgeConfig::default();
         cfg.flex_injection.enabled = true;
-        cfg.flex_injection.radio_ip = "127.0.0.1".to_string();
+        cfg.flex_injection.radio_ip = "192.168.0.199".to_string();
         cfg.flex_injection.amplifier_ip = "127.0.0.1".to_string();
         cfg.server.bind_ip = "127.0.0.1".to_string();
         validate_operational_start_config(&cfg, BridgeStartMode::Operational).unwrap();
+    }
+
+    #[test]
+    fn pgxl_reachability_warns_when_loopback_listener_advertises_lan_ip() {
+        let mut cfg = BridgeConfig::default();
+        cfg.pgxl.enabled = true;
+        cfg.flex_injection.enabled = true;
+        cfg.server.bind_ip = "127.0.0.1".to_string();
+        cfg.flex_injection.amplifier_ip = "192.168.0.189".to_string();
+        let warning = pgxl_advertised_ip_reachability_warning(&cfg).unwrap();
+        assert!(warning.contains("PGXL_ADVERTISED_IP_UNREACHABLE_FROM_LOOPBACK_BIND"));
     }
 
     #[test]

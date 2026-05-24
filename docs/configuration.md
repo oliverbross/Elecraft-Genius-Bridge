@@ -174,6 +174,13 @@ Phase 19 `flex_injection` is a LAN/local-only registration client. It connects t
 
 `force_advertised_pgxl_ip` overrides only the PGXL IP advertised to the radio/client. Leave it empty to advertise `amplifier_ip`. Use it for loopback-vs-LAN pairing tests, for example comparing `127.0.0.1`, the Windows LAN IP, and a VPN/Tailscale IP.
 
+The advertised PGXL IP must match how the PGXL listener is reachable from
+AetherSDR. For same-host Windows AetherSDR, bind EGB to `127.0.0.1` and
+advertise `127.0.0.1`. For a remote or LAN AetherSDR client, bind EGB to the
+Windows LAN IP and advertise that same LAN IP. Binding the listener to loopback
+while advertising a LAN IP prevents AetherSDR's Flex-triggered PGXL auto-open
+from reaching EGB and causes the delayed manual/fallback connection behaviour.
+
 The configured `handle` is an EGB log/config label. The real Flex amplifier object handle is assigned by the radio and observed by AetherSDR through normal radio status.
 
 `full_pgxl_registration` enables the amplifier create, AMP meter create, AMP interlock create, keepalive, subscription, and periodic ping sequence. Disable `create_meters` or `create_interlock` only for protocol isolation tests.

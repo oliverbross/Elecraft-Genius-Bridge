@@ -293,6 +293,8 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut amplifier_startup_burst_timer = Box::pin(sleep(Duration::from_secs(86_400)));
     let mut amplifier_startup_burst_count = 0_u8;
     let mut amplifier_startup_burst_active = false;
+    let mut requested_reannounce_burst_remaining = 0_u8;
+    let mut requested_reannounce_burst_reason: Option<String> = None;
     let startup_trigger =
         PgxlStartupTriggerStrategy::from_config(settings.pgxl_startup_trigger_strategy.as_str());
     let mut pgxl_connect_assist_retry_timer = Box::pin(sleep(Duration::from_secs(30)));
@@ -701,7 +703,7 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         }
         () = &mut amplifier_requested_reannounce_timer => {
             if post_amplifier_registration_sent && !amplifier_startup_burst_active {
-                let requested_reason = {
+                if let Some(reason) = {
                     let mut guard = state.write().await;
                     if guard.flex_injection.amplifier_reannounce_requested {
                         guard.flex_injection.amplifier_reannounce_requested = false;
@@ -713,8 +715,15 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     } else {
                         None
                     }
-                };
-                if let Some(reason) = requested_reason {
+                } {
+                    requested_reannounce_burst_remaining = if reason == "kpa_state_changed" { 4 } else { 1 };
+                    requested_reannounce_burst_reason = Some(reason);
+                }
+
+                if requested_reannounce_burst_remaining > 0 {
+                    let reason = requested_reannounce_burst_reason
+                        .clone()
+                        .unwrap_or_else(|| "kpa_telemetry_changed".to_string());
                     send_tracked_command(
                         &mut writer,
                         &mut session,
@@ -744,7 +753,10 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     append_flex_log_line("amplifier-status-lines.log", &line);
                     append_evidence_line(
                         "amplifier-reannounce.log",
-                        format!("requested_reannounce reason={reason} {line}"),
+                        format!(
+                            "requested_reannounce reason={reason} burst_remaining={} {line}",
+                            requested_reannounce_burst_remaining.saturating_sub(1)
+                        ),
                     );
                     append_evidence_line("amplifier-status-lines.log", line);
                     {
@@ -761,8 +773,14 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                     info!(
                         event_id = "amplifier_presence_requested_refresh",
                         reason = %reason,
+                        burst_remaining = requested_reannounce_burst_remaining.saturating_sub(1),
                         "Flex amplifier presence refresh requested by KPA500 telemetry change"
                     );
+                    requested_reannounce_burst_remaining =
+                        requested_reannounce_burst_remaining.saturating_sub(1);
+                    if requested_reannounce_burst_remaining == 0 {
+                        requested_reannounce_burst_reason = None;
+                    }
                 }
             }
             amplifier_requested_reannounce_timer
