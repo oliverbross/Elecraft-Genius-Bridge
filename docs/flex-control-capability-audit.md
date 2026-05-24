@@ -109,3 +109,18 @@ Phase 69 adds isolated advertisement variants:
 
 These variants allow live comparison of strict/no-hack, minimal state, and old
 readiness-field behaviour without changing the working default profile.
+
+## Phase 70 Runtime Semantics
+
+EGB now has explicit feature flags for the two missing Flex runtime behaviours:
+
+- `flex_injection.enable_runtime_interlock`
+- `flex_injection.enable_vita_meter_publish`
+
+The interlock loop answers Flex `PTT_REQUESTED` statuses with `interlock ready`
+only when the KPA500 and RF-risk policy allow transmit; otherwise it sends
+`interlock not_ready`. The meter publisher sends VITA-49 AMP meter packets to
+UDP port `4991` using the meter IDs and stream IDs returned by `meter create`.
+
+Both features remain gated so the existing AetherSDR direct PGXL/TGXL baseline
+can be tested unchanged.

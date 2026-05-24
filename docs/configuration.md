@@ -201,6 +201,10 @@ The configured `handle` is an EGB log/config label. The real Flex amplifier obje
 
 Set `flex_injection.trace_amplifier_advertisements: true` while debugging PGXL pairing. EGB writes every emitted amplifier create/status advertisement to `logs/flex/amplifier-advertisements.jsonl` and to the active evidence bundle.
 
+`enable_runtime_interlock` enables the Flex Ethernet AMP interlock runtime loop. When Flex reports `state=PTT_REQUESTED`, EGB sends `interlock ready <id>` only if RF-risk permission, KPA connectivity, OPERATE state, and fault checks all pass; otherwise it sends `interlock not_ready <id>` and logs the reason. This is off by default except in explicit SmartSDR/Flex runtime test profiles.
+
+`enable_vita_meter_publish` enables the experimental VITA-49 AMP meter publisher. EGB sends externally-created AMP meter values to the radio UDP VITA port `4991` using meter IDs and stream IDs returned by `meter create`. This is off by default until live SmartSDR meter display is verified.
+
 `flex_injection.amplifier_startup_state_policy` controls whether PGXL/Flex amplifier advertisement can happen before KPA500 telemetry is real:
 
 - `wait_for_first_kpa_poll`: recommended for real hardware. EGB waits for `^OS;`, `^TM;`, `^VI;`, and `^FL;` before sending the direct-connect amplifier create with live state.

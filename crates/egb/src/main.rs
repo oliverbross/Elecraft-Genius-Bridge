@@ -133,6 +133,12 @@ enum Commands {
         #[arg(long, default_value_t = 5.0)]
         duration_minutes: f64,
     },
+    FlexRuntimeTest {
+        #[arg(long, default_value = "config.smartsdr-pgxl-meter-test.yaml")]
+        config: PathBuf,
+        #[arg(long, default_value_t = 5.0)]
+        duration_minutes: f64,
+    },
     PgxlTriggerStrategyTest {
         #[arg(
             long,
@@ -476,6 +482,14 @@ async fn main() -> Result<()> {
             let cfg = BridgeConfig::load(&config)?;
             init_logging(&cfg.logging.level);
             run_evidence_test("operational-gap-test", cfg, config, duration_minutes).await
+        }
+        Commands::FlexRuntimeTest {
+            config,
+            duration_minutes,
+        } => {
+            let cfg = BridgeConfig::load(&config)?;
+            init_logging(&cfg.logging.level);
+            run_evidence_test("flex-runtime-test", cfg, config, duration_minutes).await
         }
         Commands::PgxlTriggerStrategyTest {
             config,
@@ -1302,6 +1316,8 @@ async fn start_bridge(
             create_meters: cfg.flex_injection.create_meters,
             create_interlock: cfg.flex_injection.create_interlock,
             disable_amp_interlock: cfg.flex_injection.disable_amp_interlock,
+            enable_runtime_interlock: cfg.flex_injection.enable_runtime_interlock,
+            enable_vita_meter_publish: cfg.flex_injection.enable_vita_meter_publish,
             allow_rf_risk: kpa_allow_rf_risk,
             reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
             reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
@@ -3807,6 +3823,8 @@ fn flex_settings_for_markdown(cfg: &BridgeConfig) -> FlexInjectionSettings {
         create_meters: cfg.flex_injection.create_meters,
         create_interlock: cfg.flex_injection.create_interlock,
         disable_amp_interlock: cfg.flex_injection.disable_amp_interlock,
+        enable_runtime_interlock: cfg.flex_injection.enable_runtime_interlock,
+        enable_vita_meter_publish: cfg.flex_injection.enable_vita_meter_publish,
         allow_rf_risk: effective_kpa_allow_rf_risk(cfg),
         reconnect_initial: Duration::from_millis(cfg.flex_injection.reconnect_initial_ms),
         reconnect_max: Duration::from_millis(cfg.flex_injection.reconnect_max_ms),
@@ -4942,10 +4960,16 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
         - Meter publish supported: `{}`\n\
         - Meter publish count: {}\n\
         - Meter publish last result: `{}`\n\n\
+        - Last meter publish ms: `{}`\n\
+        - Last meter values: `{}`\n\n\
         ## Interlock\n\n\
         - Interlock handle: `{}`\n\
         - Interlock created: {}\n\
         - Interlock disabled for test: {}\n\
+        - Runtime interlock enabled: {}\n\
+        - Interlock runtime events: {}\n\
+        - Last interlock runtime action: `{}`\n\
+        - Last interlock runtime result: `{}`\n\
         - Last interlock status: `{}`\n\
         - Last interlock state: `{}`\n\
         - Last interlock reason: `{}`\n\
@@ -4994,9 +5018,24 @@ async fn flex_capability_state_dump_markdown(state: &SharedState) -> String {
             .unwrap_or_else(|| "unknown".to_string()),
         flex.meter_publish_count,
         flex.meter_publish_last_result.as_deref().unwrap_or("none"),
+        flex.last_meter_publish_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        flex.last_meter_values
+            .as_ref()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
         flex.interlock_handle.as_deref().unwrap_or("none"),
         flex.interlock_handle.is_some(),
         flex.interlock_disabled_for_test,
+        flex.enable_runtime_interlock,
+        flex.interlock_runtime_event_count,
+        flex.last_interlock_runtime_action
+            .as_deref()
+            .unwrap_or("none"),
+        flex.last_interlock_runtime_result
+            .as_deref()
+            .unwrap_or("none"),
         flex.last_interlock_status_line.as_deref().unwrap_or("none"),
         flex.last_interlock_state.as_deref().unwrap_or("none"),
         flex.last_interlock_reason.as_deref().unwrap_or("none"),
@@ -6052,6 +6091,8 @@ async fn status_json(state: &SharedState) -> String {
             "meter_publish_count": guard.flex_injection.meter_publish_count,
             "meter_publish_supported": guard.flex_injection.meter_publish_supported,
             "meter_publish_last_result": guard.flex_injection.meter_publish_last_result,
+            "last_meter_publish_ms": guard.flex_injection.last_meter_publish_ms,
+            "last_meter_values": guard.flex_injection.last_meter_values,
             "last_interlock_state": guard.flex_injection.last_interlock_state,
             "last_interlock_reason": guard.flex_injection.last_interlock_reason,
             "last_interlock_tx_allowed": guard.flex_injection.last_interlock_tx_allowed,
@@ -6066,6 +6107,11 @@ async fn status_json(state: &SharedState) -> String {
             "amplifier_operable_eligibility": guard.flex_injection.amplifier_operable_eligibility,
             "meter_availability": guard.flex_injection.meter_availability,
             "external_control_capable_state": guard.flex_injection.external_control_capable_state,
+            "runtime_interlock_enabled": guard.flex_injection.enable_runtime_interlock,
+            "interlock_runtime_event_count": guard.flex_injection.interlock_runtime_event_count,
+            "last_interlock_runtime_action": guard.flex_injection.last_interlock_runtime_action,
+            "last_interlock_runtime_result": guard.flex_injection.last_interlock_runtime_result,
+            "last_interlock_runtime_at_ms": guard.flex_injection.last_interlock_runtime_at_ms,
             "tuner_presence_age_ms": stale_duration_ms(guard.flex_injection.tuner_last_seen_at),
             "amplifier_presence_age_ms": stale_duration_ms(guard.flex_injection.amplifier_last_seen_at),
         },
@@ -7226,6 +7272,7 @@ mod tests {
         assert!(names.contains(&"full-operational-test".to_string()));
         assert!(names.contains(&"full-aethersdr-functional-test".to_string()));
         assert!(names.contains(&"operational-gap-test".to_string()));
+        assert!(names.contains(&"flex-runtime-test".to_string()));
         assert!(names.contains(&"pgxl-trigger-strategy-test".to_string()));
         assert!(names.contains(&"aethersdr-open-trigger-test".to_string()));
         assert!(names.contains(&"band-follow-test".to_string()));

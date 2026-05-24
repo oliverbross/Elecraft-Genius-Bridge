@@ -9,7 +9,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
@@ -33,6 +33,8 @@ pub struct FlexInjectionSettings {
     pub create_meters: bool,
     pub create_interlock: bool,
     pub disable_amp_interlock: bool,
+    pub enable_runtime_interlock: bool,
+    pub enable_vita_meter_publish: bool,
     pub allow_rf_risk: bool,
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
@@ -278,16 +280,24 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
         guard.flex_injection.keepalive_enable_accepted = false;
         guard.flex_injection.sub_amplifier_all_accepted = false;
         guard.flex_injection.interlock_disabled_for_test = settings.disable_amp_interlock;
+        guard.flex_injection.enable_runtime_interlock = settings.enable_runtime_interlock;
         if settings.disable_amp_interlock {
             guard.flex_injection.last_interlock_reason =
                 Some("INTERLOCK_DISABLED_FOR_TEST".to_string());
         }
-        guard.flex_injection.meter_publish_supported = Some(false);
-        guard.flex_injection.meter_publish_last_result = Some(
-            "Flex AMP meter objects are created, but no verified client-side meter value publication command is implemented".to_string(),
-        );
-        guard.flex_injection.meter_availability =
-            Some("meter handles pending; VITA-49 value publication not active".to_string());
+        guard.flex_injection.meter_publish_supported = Some(settings.enable_vita_meter_publish);
+        guard.flex_injection.meter_publish_last_result =
+            Some(if settings.enable_vita_meter_publish {
+                "VITA-49 meter publisher enabled; waiting for meter handles".to_string()
+            } else {
+                "VITA-49 meter publisher disabled by flex_injection.enable_vita_meter_publish=false"
+                    .to_string()
+            });
+        guard.flex_injection.meter_availability = Some(if settings.enable_vita_meter_publish {
+            "meter handles pending; VITA-49 value publication enabled".to_string()
+        } else {
+            "meter handles pending; VITA-49 value publication disabled".to_string()
+        });
         guard.flex_injection.amplifier_operable_eligibility =
             Some("unknown until amplifier/interlock statuses arrive".to_string());
         guard.flex_injection.external_control_capable_state =
@@ -303,6 +313,21 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
     let mut post_amplifier_registration_sent = false;
     let mut next_seq = 1_u32;
     let mut ping_timer = Box::pin(sleep(settings.ping_interval.min(Duration::from_secs(2))));
+    let vita_meter_socket = if settings.enable_vita_meter_publish {
+        Some(
+            UdpSocket::bind(if settings.radio_addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            })
+            .await
+            .context("failed to bind VITA-49 meter UDP socket")?,
+        )
+    } else {
+        None
+    };
+    let mut meter_publish_timer = Box::pin(sleep(Duration::from_secs(1)));
+    let mut vita_packet_counter = 0_u8;
     let mut tuner_refresh_timer = Box::pin(sleep(settings.tuner_refresh_interval));
     let mut amplifier_reannounce_timer = Box::pin(sleep(settings.amplifier_reannounce_interval));
     let mut amplifier_requested_reannounce_timer = Box::pin(sleep(Duration::from_millis(250)));
@@ -352,6 +377,15 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
             }
             if let Some(status) = parse_interlock_status(&line) {
                 observe_interlock_status(&state, &status).await;
+                handle_interlock_runtime_status(
+                    settings,
+                    &state,
+                    &mut writer,
+                    &mut session,
+                    &mut next_seq,
+                    &status,
+                )
+                .await?;
             }
 
             if session.has_handle && !amplifier_create_sent {
@@ -539,6 +573,20 @@ async fn run_session(settings: &FlexInjectionSettings, state: SharedState) -> Re
                 log_amp_snapshot(&state).await;
             }
             ping_timer.as_mut().reset(tokio::time::Instant::now() + settings.ping_interval);
+        }
+        () = &mut meter_publish_timer => {
+            if post_amplifier_registration_sent && settings.enable_vita_meter_publish {
+                if let Some(socket) = vita_meter_socket.as_ref() {
+                    publish_vita_meter_values(
+                        socket,
+                        settings,
+                        &state,
+                        &mut vita_packet_counter,
+                    )
+                    .await;
+                }
+            }
+            meter_publish_timer.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
         }
         () = &mut post_registration_fallback_timer => {
             if amplifier_create_sent
@@ -1305,17 +1353,25 @@ impl FlexSession {
             }
             PendingKind::MeterCreate { name } => {
                 if let Some(handle) = response_object_id(body) {
-                    upsert_meter_handle(state, name, handle).await;
+                    let (meter_id, stream_id) = parse_meter_create_response(body);
+                    upsert_meter_handle(state, name, handle, meter_id, stream_id).await;
                 }
                 let mut guard = state.write().await;
-                guard.flex_injection.meter_publish_supported = Some(false);
-                guard.flex_injection.meter_publish_last_result = Some(
-                    "meter create accepted; live value publication command remains unverified"
-                        .to_string(),
+                guard.flex_injection.meter_publish_supported = Some(
+                    guard
+                        .flex_injection
+                        .meter_publish_supported
+                        .unwrap_or(false),
                 );
                 guard.flex_injection.meter_availability = Some(format!(
-                    "{} meter handles created; value publication not active",
-                    guard.flex_injection.meter_handles.len()
+                    "{} meter handles created; {} have meter_id/stream_id",
+                    guard.flex_injection.meter_handles.len(),
+                    guard
+                        .flex_injection
+                        .meter_handles
+                        .iter()
+                        .filter(|meter| meter.meter_id.is_some() && meter.stream_id.is_some())
+                        .count()
                 ));
             }
             PendingKind::InterlockCreate => {
@@ -1337,6 +1393,11 @@ impl FlexSession {
             PendingKind::KeepaliveEnable => {
                 let mut guard = state.write().await;
                 guard.flex_injection.keepalive_enable_accepted = true;
+            }
+            PendingKind::InterlockRuntime => {
+                let mut guard = state.write().await;
+                guard.flex_injection.last_interlock_runtime_result =
+                    Some(format!("R{seq}|{code}|{body}"));
             }
             PendingKind::AmplifierReannounce => {}
             PendingKind::Ping => {
@@ -1584,7 +1645,272 @@ async fn observe_interlock_status(state: &SharedState, status: &KeyValueStatus) 
     }
 }
 
-async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
+async fn handle_interlock_runtime_status(
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    session: &mut FlexSession,
+    next_seq: &mut u32,
+    status: &KeyValueStatus,
+) -> Result<()> {
+    if !settings.enable_runtime_interlock {
+        return Ok(());
+    }
+    if status.value("state") != Some("PTT_REQUESTED") {
+        return Ok(());
+    }
+    let interlock_id = {
+        let guard = state.read().await;
+        guard.flex_injection.interlock_handle.clone()
+    };
+    let Some(interlock_id) = interlock_id else {
+        record_interlock_runtime_event(
+            state,
+            "missing_interlock_id",
+            "blocked",
+            "PTT_REQUESTED received before interlock handle was known",
+        )
+        .await;
+        return Ok(());
+    };
+    let (allowed, reason) = interlock_runtime_allows_tx(settings, state).await;
+    let action = if allowed { "ready" } else { "not_ready" };
+    let command = format!("interlock {action} {interlock_id}");
+    record_interlock_runtime_event(state, "ptt_requested", action, &reason).await;
+    send_tracked_command(
+        writer,
+        session,
+        state,
+        next_seq,
+        PendingCommand::new("interlock_runtime", command, PendingKind::InterlockRuntime),
+    )
+    .await
+}
+
+async fn interlock_runtime_allows_tx(
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+) -> (bool, String) {
+    let guard = state.read().await;
+    if !settings.allow_rf_risk {
+        return (false, "RF-risk control is disabled".to_string());
+    }
+    if guard.amp.connection_state != ConnectionState::Connected {
+        return (
+            false,
+            format!("KPA500 is {}", guard.amp.connection_state.as_str()),
+        );
+    }
+    if guard.amp.fault.is_some() || guard.amp.state == bridge_core::AmpOperatingState::Fault {
+        return (
+            false,
+            format!(
+                "KPA500 fault is present: {}",
+                guard.amp.fault.as_deref().unwrap_or("unknown")
+            ),
+        );
+    }
+    if guard.amp.state != bridge_core::AmpOperatingState::Operate {
+        return (
+            false,
+            format!("KPA500 is {}, not OPERATE", guard.amp.state.pgxl_state()),
+        );
+    }
+    (
+        true,
+        "KPA500 operate state and RF-risk policy allow TX".to_string(),
+    )
+}
+
+async fn record_interlock_runtime_event(
+    state: &SharedState,
+    event: &str,
+    action: &str,
+    reason: &str,
+) {
+    let timestamp_ms = timestamp_millis();
+    {
+        let mut guard = state.write().await;
+        guard.flex_injection.interlock_runtime_event_count = guard
+            .flex_injection
+            .interlock_runtime_event_count
+            .saturating_add(1);
+        guard.flex_injection.last_interlock_runtime_action = Some(format!("{event}:{action}"));
+        guard.flex_injection.last_interlock_runtime_result = Some(reason.to_string());
+        guard.flex_injection.last_interlock_runtime_at_ms = Some(timestamp_ms);
+    }
+    append_evidence_json(
+        "interlock-runtime-events.jsonl",
+        &serde_json::json!({
+            "timestamp_ms": timestamp_ms,
+            "event": event,
+            "action": action,
+            "reason": reason,
+        }),
+    );
+}
+
+#[derive(Debug, Clone)]
+struct MeterPublishValue {
+    name: String,
+    meter_id: u16,
+    stream_id: u32,
+    value: f32,
+    raw_value: i16,
+}
+
+async fn publish_vita_meter_values(
+    socket: &UdpSocket,
+    settings: &FlexInjectionSettings,
+    state: &SharedState,
+    packet_counter: &mut u8,
+) {
+    let values = meter_publish_values(state).await;
+    if values.is_empty() {
+        let mut guard = state.write().await;
+        guard.flex_injection.meter_publish_supported = Some(true);
+        guard.flex_injection.meter_publish_last_result =
+            Some("waiting for meter IDs and stream IDs from meter create responses".to_string());
+        return;
+    }
+    let target = SocketAddr::new(settings.radio_addr.ip(), 4991);
+    let mut sent_count = 0_u64;
+    let mut last_error = None;
+    let mut grouped: HashMap<u32, Vec<MeterPublishValue>> = HashMap::new();
+    for value in values {
+        grouped.entry(value.stream_id).or_default().push(value);
+    }
+    let mut published_values = serde_json::Map::new();
+    for (stream_id, group) in grouped {
+        let packet = build_vita_meter_packet(stream_id, *packet_counter, &group);
+        *packet_counter = (*packet_counter + 1) & 0x0f;
+        match socket.send_to(&packet, target).await {
+            Ok(_) => {
+                sent_count = sent_count.saturating_add(group.len() as u64);
+                for value in &group {
+                    published_values.insert(
+                        value.name.clone(),
+                        serde_json::json!({
+                            "value": value.value,
+                            "raw_value": value.raw_value,
+                            "meter_id": value.meter_id,
+                            "stream_id": format!("0x{:08X}", value.stream_id),
+                        }),
+                    );
+                }
+            }
+            Err(err) => {
+                last_error = Some(err.to_string());
+            }
+        }
+    }
+    let mut guard = state.write().await;
+    guard.flex_injection.meter_publish_supported = Some(true);
+    if let Some(err) = last_error {
+        guard.flex_injection.meter_publish_last_result =
+            Some(format!("VITA-49 meter publish failed: {err}"));
+    } else {
+        guard.flex_injection.meter_publish_count = guard
+            .flex_injection
+            .meter_publish_count
+            .saturating_add(sent_count);
+        guard.flex_injection.last_meter_publish_ms = Some(timestamp_millis());
+        guard.flex_injection.last_meter_values = Some(serde_json::Value::Object(published_values));
+        guard.flex_injection.meter_publish_last_result = Some(format!(
+            "published {sent_count} AMP meter values to {}:4991",
+            settings.radio_addr.ip()
+        ));
+    }
+}
+
+async fn meter_publish_values(state: &SharedState) -> Vec<MeterPublishValue> {
+    let guard = state.read().await;
+    let amp = guard.amp.clone();
+    guard
+        .flex_injection
+        .meter_handles
+        .iter()
+        .filter_map(|meter| {
+            let meter_id = meter.meter_id?;
+            let stream_id = meter.stream_id?;
+            let value = match meter.name.as_str() {
+                "FWD" => watts_to_dbm(amp.forward_power_watts),
+                "RL" => return_loss_db(amp.swr),
+                "DRV" => -120.0,
+                "ID" => amp.pa_current_amps,
+                "TEMP" => amp.temperature_c,
+                _ => return None,
+            };
+            let raw_value = scaled_meter_value(&meter.name, value);
+            Some(MeterPublishValue {
+                name: meter.name.clone(),
+                meter_id,
+                stream_id,
+                value,
+                raw_value,
+            })
+        })
+        .collect()
+}
+
+fn build_vita_meter_packet(
+    stream_id: u32,
+    packet_counter: u8,
+    values: &[MeterPublishValue],
+) -> Vec<u8> {
+    let payload_words = values.len() as u16;
+    let packet_words = 7_u16.saturating_add(payload_words);
+    let word0 =
+        0x3000_0000_u32 | (u32::from(packet_counter & 0x0f) << 16) | u32::from(packet_words);
+    let mut packet = Vec::with_capacity(usize::from(packet_words) * 4);
+    packet.extend_from_slice(&word0.to_be_bytes());
+    packet.extend_from_slice(&stream_id.to_be_bytes());
+    packet.extend_from_slice(&0x0000_1c2d_u32.to_be_bytes());
+    packet.extend_from_slice(&0x534c_8002_u32.to_be_bytes());
+    packet.extend_from_slice(&0_u32.to_be_bytes());
+    packet.extend_from_slice(&0_u32.to_be_bytes());
+    packet.extend_from_slice(&0_u32.to_be_bytes());
+    for value in values {
+        packet.extend_from_slice(&value.meter_id.to_be_bytes());
+        packet.extend_from_slice(&value.raw_value.to_be_bytes());
+    }
+    packet
+}
+
+fn scaled_meter_value(name: &str, value: f32) -> i16 {
+    let scaled = match name {
+        "FWD" | "RL" | "DRV" => value * 128.0,
+        "ID" => value * 256.0,
+        "TEMP" => value * 64.0,
+        _ => value,
+    };
+    scaled.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+}
+
+fn watts_to_dbm(watts: f32) -> f32 {
+    if watts <= 0.0 || !watts.is_finite() {
+        -120.0
+    } else {
+        10.0 * (watts * 1000.0).log10()
+    }
+}
+
+fn return_loss_db(swr: f32) -> f32 {
+    if swr.is_finite() && swr > 1.0 {
+        let rho = ((swr - 1.0) / (swr + 1.0)).clamp(0.001, 0.999);
+        (-20.0 * rho.log10()).clamp(0.0, 99.9)
+    } else {
+        60.0
+    }
+}
+
+async fn upsert_meter_handle(
+    state: &SharedState,
+    name: &str,
+    handle: &str,
+    meter_id: Option<u16>,
+    stream_id: Option<u32>,
+) {
     let mut guard = state.write().await;
     if let Some(existing) = guard
         .flex_injection
@@ -1593,10 +1919,14 @@ async fn upsert_meter_handle(state: &SharedState, name: &str, handle: &str) {
         .find(|meter| meter.name == name)
     {
         existing.handle = handle.to_string();
+        existing.meter_id = meter_id;
+        existing.stream_id = stream_id;
     } else {
         guard.flex_injection.meter_handles.push(FlexMeterHandle {
             name: name.to_string(),
             handle: handle.to_string(),
+            meter_id,
+            stream_id,
         });
     }
 }
@@ -1911,6 +2241,7 @@ enum PendingKind {
     KeepaliveEnable,
     Subscription,
     AmplifierReannounce,
+    InterlockRuntime,
     AmplifierOperateLab,
     PgxlConnectAssist,
     Ping,
@@ -2927,6 +3258,26 @@ fn response_object_id(body: &str) -> Option<&str> {
     }
 }
 
+fn parse_meter_create_response(body: &str) -> (Option<u16>, Option<u32>) {
+    let first = body.split('|').next().unwrap_or("").trim();
+    let mut parts = first.split(',');
+    let meter_id = parts
+        .next()
+        .and_then(|value| value.trim().parse::<u16>().ok());
+    let stream_id = parts.next().and_then(|value| {
+        let value = value.trim();
+        if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            value.parse::<u32>().ok()
+        }
+    });
+    (meter_id, stream_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3102,6 +3453,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3155,6 +3508,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3205,6 +3560,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3269,6 +3626,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3313,6 +3672,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3353,6 +3714,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3405,6 +3768,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3463,6 +3828,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3508,6 +3875,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3651,6 +4020,82 @@ mod tests {
     }
 
     #[test]
+    fn parses_meter_create_response_ids_and_stream() {
+        assert_eq!(
+            parse_meter_create_response("27,0x88000000"),
+            (Some(27), Some(0x8800_0000))
+        );
+        assert_eq!(parse_meter_create_response("OK"), (None, None));
+    }
+
+    #[test]
+    fn vita_meter_packet_uses_meter_extension_class_and_payload_pairs() {
+        let values = vec![MeterPublishValue {
+            name: "TEMP".to_string(),
+            meter_id: 27,
+            stream_id: 0x8800_0000,
+            value: 36.0,
+            raw_value: scaled_meter_value("TEMP", 36.0),
+        }];
+        let packet = build_vita_meter_packet(0x8800_0000, 3, &values);
+        assert_eq!(packet.len(), 32);
+        assert_eq!(
+            u32::from_be_bytes(packet[4..8].try_into().unwrap()),
+            0x8800_0000
+        );
+        assert_eq!(
+            u32::from_be_bytes(packet[12..16].try_into().unwrap()),
+            0x534c_8002
+        );
+        assert_eq!(u16::from_be_bytes(packet[28..30].try_into().unwrap()), 27);
+        assert_eq!(i16::from_be_bytes(packet[30..32].try_into().unwrap()), 2304);
+    }
+
+    #[tokio::test]
+    async fn interlock_runtime_blocks_without_rf_risk() {
+        let settings = FlexInjectionSettings {
+            radio_addr: "127.0.0.1:4992".parse().unwrap(),
+            amplifier_ip: "192.168.1.50".parse().unwrap(),
+            amplifier_port: 9008,
+            amplifier_model: "PowerGeniusXL".to_string(),
+            serial: "EGB-KPA500".to_string(),
+            handle_label: "amp_1".to_string(),
+            ant_map: "ANT1:PORTA,ANT2:PORTB".to_string(),
+            amplifier_status_profile: "aethersdr_force_direct".to_string(),
+            trace_amplifier_advertisements: false,
+            pgxl_force_operate_advertisement: false,
+            flex_force_operate_via_radio: false,
+            pgxl_connect_assist: false,
+            amplifier_startup_state_policy: "wait_for_first_kpa_poll".to_string(),
+            wait_first_kpa_poll_timeout: Duration::from_millis(10000),
+            full_pgxl_registration: true,
+            create_meters: true,
+            create_interlock: true,
+            disable_amp_interlock: false,
+            enable_runtime_interlock: true,
+            enable_vita_meter_publish: false,
+            allow_rf_risk: false,
+            reconnect_initial: Duration::from_millis(1000),
+            reconnect_max: Duration::from_millis(30000),
+            ping_interval: Duration::from_millis(30000),
+            tuner_presence_refresh: false,
+            tuner_refresh_interval: Duration::from_millis(5000),
+            amplifier_reannounce_interval: Duration::from_millis(5000),
+            pgxl_startup_trigger_strategy: "current".to_string(),
+            aethersdr_open_trigger_variant: "current".to_string(),
+        };
+        let state = bridge_core::state::shared_mock_state();
+        {
+            let mut guard = state.write().await;
+            guard.amp.connection_state = ConnectionState::Connected;
+            guard.amp.state = bridge_core::AmpOperatingState::Operate;
+        }
+        let (allowed, reason) = interlock_runtime_allows_tx(&settings, &state).await;
+        assert!(!allowed);
+        assert!(reason.contains("RF-risk"));
+    }
+
+    #[test]
     fn create_profile_validation_rejects_extra_fields() {
         let official_with_state =
             "amplifier create ip=192.168.0.189 port=9008 model=PowerGeniusXL serial_num=EGB-KPA500 ant=ANT1:PORTA,ANT2:PORTB state=STANDBY";
@@ -3700,6 +4145,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3745,6 +4192,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),
@@ -3781,6 +4230,8 @@ mod tests {
             create_meters: true,
             create_interlock: true,
             disable_amp_interlock: false,
+            enable_runtime_interlock: false,
+            enable_vita_meter_publish: false,
             allow_rf_risk: false,
             reconnect_initial: Duration::from_millis(1000),
             reconnect_max: Duration::from_millis(30000),

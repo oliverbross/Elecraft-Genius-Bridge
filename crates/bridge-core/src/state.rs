@@ -577,6 +577,8 @@ pub struct FlexInjectionState {
     pub meter_publish_count: u64,
     pub meter_publish_supported: Option<bool>,
     pub meter_publish_last_result: Option<String>,
+    pub last_meter_publish_ms: Option<u128>,
+    pub last_meter_values: Option<serde_json::Value>,
     pub interlock_handle: Option<String>,
     pub last_interlock_status_line: Option<String>,
     pub last_interlock_state: Option<String>,
@@ -593,6 +595,11 @@ pub struct FlexInjectionState {
     pub amplifier_operable_eligibility: Option<String>,
     pub meter_availability: Option<String>,
     pub external_control_capable_state: Option<String>,
+    pub enable_runtime_interlock: bool,
+    pub interlock_runtime_event_count: u64,
+    pub last_interlock_runtime_action: Option<String>,
+    pub last_interlock_runtime_result: Option<String>,
+    pub last_interlock_runtime_at_ms: Option<u128>,
     pub last_command: Option<String>,
     pub last_response: Option<String>,
     pub radio_addr: Option<String>,
@@ -679,6 +686,10 @@ pub struct FlexInjectionState {
 pub struct FlexMeterHandle {
     pub name: String,
     pub handle: String,
+    #[serde(default)]
+    pub meter_id: Option<u16>,
+    #[serde(default)]
+    pub stream_id: Option<u32>,
 }
 
 impl DeviceRuntimeStats {
